@@ -16,6 +16,7 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any
 
 from . import cel, values
+from .cel import CelError
 from .errors import HarelError
 from .model import Machine, State
 
@@ -23,6 +24,14 @@ if TYPE_CHECKING:
     from .engine import Host
 
 DELIVERABLE_RESERVED_EVENTS = frozenset({"env", "error", "done"})
+
+_DURATION_UNITS = {"ms": 1, "s": 1000, "m": 60_000, "h": 3_600_000}
+
+
+def _duration_ms(duration: str) -> int:
+    unit = duration[-2:] if duration.endswith("ms") else duration[-1:]
+    n = int(duration[: -len(unit)])
+    return n * _DURATION_UNITS[unit]
 
 
 class Status(StrEnum):
@@ -35,6 +44,8 @@ class Status(StrEnum):
 class Event:
     type: str
     payload: dict[str, Any] | None = None
+    # For a timer firing: the (state_path, after-spec) to run as a transition.
+    after: tuple[str, dict[str, Any]] | None = None
 
 
 class Instance:
@@ -66,9 +77,7 @@ class Instance:
     # --- creation -----------------------------------------------------------
     def _enter_top(self) -> None:
         top = self.machine.top
-        self.config.add(top.path)
-        self.init_esvs(top)
-        self.run_entry(top)
+        self._enter_state(top)
         self.descend(top)
 
     # --- esv lifecycle ------------------------------------------------------
@@ -230,6 +239,8 @@ class Instance:
     def dispatch(self, event: Event) -> bool:
         """Run one RTC step. Returns whether the active-leaf config changed."""
         self.current_event = event
+        if event.after is not None:
+            return self._dispatch_after(event)
         enabled = self._collect_enabled(event)
         if not enabled:
             if event.type in self.effective_defer_set():
@@ -240,18 +251,40 @@ class Instance:
         before_complete = self._complete_composites()
         for owner, transition in enabled:
             self.run_transition(owner, transition, event)
-        newly_complete = self._complete_composites() - before_complete
-        for path in newly_complete:
+        self._completion(before_complete)
+        self.current_event = None
+        return before != self.active_leaf_names()
+
+    def _dispatch_after(self, event: Event) -> bool:
+        """Fire a due `after` timer as a transition owned by its state (§5.9)."""
+        assert event.after is not None
+        state_path, spec = event.after
+        state = self.machine.by_path.get(state_path)
+        self.current_event = event
+        if state is None or state_path not in self.config:
+            self.current_event = None
+            return False  # stale timer (state exited)
+        guard = spec.get("guard")
+        if guard is not None and not cel.evaluate(guard, self.scope(state, event)):
+            self.current_event = None
+            return False
+        before = self.active_leaf_names()
+        before_complete = self._complete_composites()
+        self.run_transition(state, spec, event)
+        self._completion(before_complete)
+        self.current_event = None
+        return before != self.active_leaf_names()
+
+    def _completion(self, before_complete: set[str]) -> None:
+        """Enqueue `done` for newly-complete composites / flag termination."""
+        for path in self._complete_composites() - before_complete:
             if path == "top":
                 # top reached final: a spawned instance terminates (done -> its
                 # parent); the root has no parent and rests in the final state.
                 if self.parent_id is not None:
                     self._pending_terminate = True
             else:
-                # A composite/orthogonal completed -> `done` for its parent state.
                 self.queue.append(Event("done", {"state": self._leaf_name(path)}))
-        self.current_event = None
-        return before != self.active_leaf_names()
 
     def run_transition(
         self, owner: State, transition: dict[str, Any], event: Event
@@ -327,10 +360,14 @@ class Instance:
         )
         for s in to_exit:
             self._record_history(s)
+        exited = {s.path for s in to_exit}
         for s in to_exit:  # deepest first
             self.run_exit(s)
             self.destroy_esvs(s)
             self.config.discard(s.path)
+        # exiting a state cancels its outstanding timers (SPEC §5.9)
+        if exited:
+            self.timers = [t for t in self.timers if t["state_path"] not in exited]
 
     def _exit_set(self, owner: State, lca: State, local: bool) -> list[State]:
         states = [self.machine.by_path[p] for p in self.config]
@@ -370,9 +407,7 @@ class Instance:
             path.append(cur)
             cur = cur.parent
         for s in reversed(path):  # outermost first
-            self.config.add(s.path)
-            self.init_esvs(s)
-            self.run_entry(s)
+            self._enter_state(s)
         self.descend(target)
 
     def descend(self, state: State) -> None:
@@ -382,7 +417,8 @@ class Instance:
             initial = state.raw["initial"]
             self.run_actions(initial.get("action") or [], state, self.current_event)
             tgt = self.machine.resolve_target(state, initial["transition_to"])
-            self._enter_one(tgt)
+            self._enter_state(tgt)
+            self.descend(tgt)
         elif state.type == "orthogonal":
             if self._restore_history(state):
                 return
@@ -390,13 +426,26 @@ class Instance:
                 initial = region["initial"]
                 self.run_actions(initial.get("action") or [], state, self.current_event)
                 tgt = self.machine.resolve_target(state, initial["transition_to"])
-                self._enter_one(tgt)
+                self._enter_state(tgt)
+                self.descend(tgt)
 
-    def _enter_one(self, state: State) -> None:
+    def _enter_state(self, state: State) -> None:
+        """Enter one state: activate, init esvs, run entry, arm `after` timers."""
         self.config.add(state.path)
         self.init_esvs(state)
         self.run_entry(state)
-        self.descend(state)
+        self._arm_timers(state)
+
+    def _arm_timers(self, state: State) -> None:
+        for spec in state.raw.get("after") or []:
+            self.timers.append(
+                {
+                    "fire_at": self.host.now + _duration_ms(spec["duration"]),
+                    "state_path": state.path,
+                    "spec": spec,
+                    "seq": self.host.next_seq(),
+                }
+            )
 
     # --- history (SPEC §5.6) ------------------------------------------------
     def _record_history(self, state: State) -> None:
@@ -439,13 +488,71 @@ class Instance:
             return True
         if kind == "shallow" and data:
             child = self.machine.by_path[data]
-            self._enter_one(child)
+            self._enter_state(child)
+            self.descend(child)
             return True
         return False
 
     # --- defer + RTC step ---------------------------------------------------
     def step(self, event: Event) -> None:
-        if self.dispatch(event):
+        # An RTC step is atomic: if an action faults, abort and roll back (§5.10).
+        snapshot = self._snapshot()
+        try:
+            changed = self.dispatch(event)
+        except (CelError, HarelError) as exc:
+            self._restore(snapshot)
+            self._handle_fault(event, exc)
+            return
+        if changed:
+            self._undefer()
+        if self._pending_terminate:
+            self._pending_terminate = False
+            self.host.terminate(self)
+
+    # --- faults (SPEC §5.10) ------------------------------------------------
+    def _snapshot(self) -> dict[str, Any]:
+        return {
+            "config": set(self.config),
+            "esvs": {p: dict(v) for p, v in self.esv_values.items()},
+            "history": dict(self.history),
+            "deferred": deque(self.deferred),
+            "timers": list(self.timers),
+            "pub": len(self.host.published),
+            "sp": len(self.host.spawned),
+            "instances": set(self.host.instances.keys()),
+        }
+
+    def _restore(self, snap: dict[str, Any]) -> None:
+        self.config = set(snap["config"])
+        self.esv_values = {p: dict(v) for p, v in snap["esvs"].items()}
+        self.history = dict(snap["history"])
+        self.deferred = deque(snap["deferred"])
+        self.timers = list(snap["timers"])
+        del self.host.published[snap["pub"]:]
+        del self.host.spawned[snap["sp"]:]
+        for iid in list(self.host.instances):
+            if iid not in snap["instances"]:
+                del self.host.instances[iid]
+
+    def _handle_fault(self, event: Event, exc: Exception) -> None:
+        self.dead_letter.append({"event": event.type, "error": str(exc)})
+        error_event = Event("error", {"event": event.type, "error": str(exc)})
+        # If some active state handles the reserved `error` event, dispatch it
+        # (the instance recovers); otherwise the instance faults.
+        self.current_event = error_event
+        handled = bool(self._collect_enabled(error_event))
+        self.current_event = None
+        if not handled:
+            self.status = Status.FAULTED
+            return
+        snapshot = self._snapshot()
+        try:
+            changed = self.dispatch(error_event)
+        except (CelError, HarelError):
+            self._restore(snapshot)
+            self.status = Status.FAULTED
+            return
+        if changed:
             self._undefer()
         if self._pending_terminate:
             self._pending_terminate = False
