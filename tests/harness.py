@@ -8,6 +8,7 @@ run all instances to quiescence, then check ``expect``).
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -96,6 +97,60 @@ def cli_cases() -> list[Path]:
     if not cli_dir.exists():
         return []
     return sorted(p for p in cli_dir.iterdir() if p.is_dir())
+
+
+# --- CLI case runner (SPEC §13.6) ------------------------------------------
+def run_cli_case(case_dir: Path) -> None:
+    """Run a CLI case's steps against a fresh temp store; assert exit + output."""
+    import io
+    import tempfile
+    from contextlib import redirect_stdout
+
+    from harel import cli
+
+    spec = _load_yaml(case_dir / "cli.yaml")
+    tmpstore = tempfile.mkdtemp(prefix="harel-cli-")
+    for i, step in enumerate(spec.get("steps", [])):
+        argv = [_resolve_arg(case_dir, a) for a in step["run"]]
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            rc = cli.main(["--store", tmpstore, *argv])
+        _check_cli_expect(case_dir.name, i, rc, buf.getvalue(), step.get("expect") or {})
+
+
+def _resolve_arg(case_dir: Path, arg: str) -> str:
+    # A bare filename that exists in the case dir (e.g. machine.yaml) is resolved.
+    if "/" not in arg and (case_dir / arg).exists():
+        return str(case_dir / arg)
+    return arg
+
+
+def _check_cli_expect(
+    name: str, i: int, rc: int, stdout: str, expect: dict[str, Any]
+) -> None:
+    label = f"cli/{name} step {i}"
+    if "exit" in expect:
+        assert rc == expect["exit"], f"{label}: exit {rc} != {expect['exit']}"
+    if "json" in expect:
+        actual = json.loads(stdout) if stdout.strip() else None
+        _assert_subset(actual, expect["json"], label)
+    elif "stdout" in expect:
+        assert stdout == expect["stdout"], f"{label}: stdout mismatch"
+
+
+def _assert_subset(actual: Any, expected: Any, label: str) -> None:
+    if isinstance(expected, dict):
+        assert isinstance(actual, dict), f"{label}: expected object, got {type(actual)}"
+        for k, v in expected.items():
+            assert k in actual, f"{label}: missing key '{k}'"
+            _assert_subset(actual[k], v, label)
+    elif isinstance(expected, list):
+        assert isinstance(actual, list), f"{label}: expected list"
+        assert len(actual) == len(expected), f"{label}: list length"
+        for a, e in zip(actual, expected, strict=False):
+            _assert_subset(a, e, label)
+    else:
+        assert actual == expected, f"{label}: {actual!r} != {expected!r}"
 
 
 # --- engine case runner -----------------------------------------------------

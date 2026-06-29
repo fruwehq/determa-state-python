@@ -7,9 +7,13 @@ The normative `SPEC.md`, the JSON Schema for machine YAML, and the cross-languag
 **conformance suite** live in the spec repo. This repository implements that spec in
 Python and is correct **iff it passes the conformance suite**.
 
-Status: **in progress** — YAML 1.2 loading + machine validation (SPEC §2/§4) are
-implemented and gated against the full conformance suite. The engine is being
-built up the build order in [issue #3][issue].
+Status: **passing the full conformance suite** — all 22 engine cases
+(`conformance/01`–`22`) plus `conformance/cli/01`. Implements YAML 1.2 loading
++ validation, the full statechart semantics (RTC dispatch, hierarchy, orthogonal
+regions + `done`, shallow/deep history, esvs, CEL guards, structured actions,
+active objects + bus, defer, timers, faults), static contracts, snapshot
+round-trip + safe-point migration, Mermaid `export`, and the §13 CLI. Built up
+the build order in [issue #3][issue].
 
 [issue]: https://github.com/fruwehq/harel-python/issues/3
 

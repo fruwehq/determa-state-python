@@ -25,6 +25,9 @@ dev = [
   "types-jsonschema",
 ]
 
+[project.scripts]
+harel = "harel.cli:main"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/harel"]
 
