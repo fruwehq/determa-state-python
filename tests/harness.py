@@ -30,6 +30,10 @@ SUPPORTED = frozenset(
         "06-payload-typing",
         "07-internal-external",
         "08-local-vs-external",
+        "09-orthogonal",
+        "10-history-deep",
+        "11-history-shallow",
+        "12-guarded-list",
     }
 )
 

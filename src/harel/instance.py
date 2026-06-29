@@ -57,6 +57,7 @@ class Instance:
         self.deferred: deque[Event] = deque()
         self.timers: list[dict[str, Any]] = []
         self.dead_letter: list[dict[str, Any]] = []
+        self.history: dict[str, tuple[str, Any]] = {}
         self.external: dict[str, Any] = dict(external or {})
         self.current_event: Event | None = None
         self._enter_top()
@@ -184,20 +185,34 @@ class Instance:
         return bindings
 
     # --- dispatch -----------------------------------------------------------
-    def find_handler(
-        self, event: Event
-    ) -> tuple[State, dict[str, Any], State] | None:
-        """Search from each active leaf up; first state with a passing handler."""
-        for leaf in self.active_leaves():
-            cur: State | None = leaf
-            while cur is not None:
-                spec = (cur.raw.get("on_events") or {}).get(event.type)
-                if spec is not None:
-                    chosen = self._select(spec, cur, event)
-                    if chosen is not None:
-                        return cur, chosen, leaf
-                cur = cur.parent
+    def _search_up(self, leaf: State, event: Event) -> tuple[State, dict[str, Any]] | None:
+        """Find the first passing handler from ``leaf`` up the parent chain."""
+        cur: State | None = leaf
+        while cur is not None:
+            spec = (cur.raw.get("on_events") or {}).get(event.type)
+            if spec is not None:
+                chosen = self._select(spec, cur, event)
+                if chosen is not None:
+                    return cur, chosen
+            cur = cur.parent
         return None
+
+    def _collect_enabled(self, event: Event) -> list[tuple[State, dict[str, Any]]]:
+        """One enabled transition per active leaf, deduplicated by identity.
+
+        Orthogonal regions are independent: an event is offered to every region
+        in declared order. A handler reached at a shared ancestor (e.g. the
+        orthogonal state's own ``done``) is found via multiple leaves but run
+        once (dedup by transition object identity).
+        """
+        enabled: list[tuple[State, dict[str, Any]]] = []
+        seen: set[int] = set()
+        for leaf in sorted(self.active_leaves(), key=lambda s: s.order):
+            found = self._search_up(leaf, event)
+            if found is not None and id(found[1]) not in seen:
+                seen.add(id(found[1]))
+                enabled.append(found)
+        return enabled
 
     def _select(
         self, spec: Any, owner: State, event: Event
@@ -214,21 +229,24 @@ class Instance:
     def dispatch(self, event: Event) -> bool:
         """Run one RTC step. Returns whether the active-leaf config changed."""
         self.current_event = event
-        found = self.find_handler(event)
-        if found is None:
+        enabled = self._collect_enabled(event)
+        if not enabled:
             if event.type in self.effective_defer_set():
                 self.deferred.append(event)
             self.current_event = None
             return False
-        owner, transition, leaf = found
         before = self.active_leaf_names()
-        self.run_transition(owner, transition, event, leaf)
+        before_complete = self._complete_orthogonals()
+        for owner, transition in enabled:
+            self.run_transition(owner, transition, event)
+        for path in self._complete_orthogonals() - before_complete:
+            # All regions reached final -> a `done` for the parent (SPEC §5.6).
+            self.queue.append(Event("done", {"state": self._leaf_name(path)}))
         self.current_event = None
-        after = self.active_leaf_names()
-        return before != after
+        return before != self.active_leaf_names()
 
     def run_transition(
-        self, owner: State, transition: dict[str, Any], event: Event, leaf: State
+        self, owner: State, transition: dict[str, Any], event: Event
     ) -> None:
         target_ref = transition.get("transition_to")
         actions = transition.get("action") or []
@@ -237,25 +255,88 @@ class Instance:
             self.run_actions(actions, owner, event)
             return
         target = self.machine.resolve_target(owner, target_ref)
-        if transition.get("local"):
+        local = bool(transition.get("local"))
+        if local:
             lca = owner  # the containing composite is not exited/re-entered
         else:
             lca = self.machine.lca(owner, target)
-        self.exit_to(leaf, lca)
+        self.exit_states(owner, lca, local)
         self.run_actions(actions, owner, event)
         self.enter_to(lca, target)
 
+    # --- orthogonal completion ---------------------------------------------
+    def _complete_orthogonals(self) -> set[str]:
+        """Active orthogonal states whose every region's leaf is final."""
+        out: set[str] = set()
+        for path in self.config:
+            s = self.machine.by_path[path]
+            if s.type != "orthogonal":
+                continue
+            regions = s.raw.get("regions") or []
+            if all(self._region_final(s, i) for i in range(len(regions))):
+                out.add(path)
+        return out
+
+    def _region_final(self, ortho: State, region_idx: int) -> bool:
+        leaf = self._region_leaf(ortho, region_idx)
+        return leaf is not None and leaf.type == "final"
+
+    def _region_leaf(self, ortho: State, region_idx: int) -> State | None:
+        for leaf in self.active_leaves():
+            if leaf.region_index == region_idx and self._descendant_or_self(leaf, ortho):
+                return leaf
+        return None
+
+    @staticmethod
+    def _leaf_name(path: str) -> str:
+        return path.rsplit(".", 1)[-1]
+
     # --- entry / exit (PSiCC ordering) -------------------------------------
-    def exit_to(self, leaf: State, lca: State) -> None:
-        chain: list[State] = []
-        cur: State | None = leaf
-        while cur is not None and cur is not lca:
-            chain.append(cur)
-            cur = cur.parent
-        for s in chain:  # innermost first
+    def exit_states(self, owner: State, lca: State, local: bool) -> None:
+        """Exit the source-root subtree (confined to the owner's region), innermost
+        first. For external transitions the exit root is the state just below the
+        LCA on the owner's path; for local transitions it is the owner's proper
+        descendants (the owner itself is not re-entered). History of any exited
+        history-state is recorded first, while the configuration is intact.
+        """
+        to_exit = sorted(
+            self._exit_set(owner, lca, local),
+            key=lambda s: (-s.depth, s.order),
+        )
+        for s in to_exit:
+            self._record_history(s)
+        for s in to_exit:  # deepest first
             self.run_exit(s)
             self.destroy_esvs(s)
             self.config.discard(s.path)
+
+    def _exit_set(self, owner: State, lca: State, local: bool) -> list[State]:
+        states = [self.machine.by_path[p] for p in self.config]
+        if local:
+            return [s for s in states if self._strict_descendant(s, owner)]
+        exit_root = self._source_root(owner, lca)
+        return [s for s in states if self._descendant_or_self(s, exit_root)]
+
+    @staticmethod
+    def _source_root(owner: State, lca: State) -> State:
+        """The state just below ``lca`` on the path to ``owner``."""
+        cur: State = owner
+        while cur.parent is not None and cur.parent is not lca:
+            cur = cur.parent
+        return cur
+
+    @staticmethod
+    def _descendant_or_self(state: State, root: State) -> bool:
+        cur: State | None = state
+        while cur is not None:
+            if cur is root:
+                return True
+            cur = cur.parent
+        return False
+
+    @staticmethod
+    def _strict_descendant(state: State, root: State) -> bool:
+        return state is not root and Instance._descendant_or_self(state, root)
 
     def enter_to(self, lca: State, target: State) -> None:
         path: list[State] = []
@@ -271,15 +352,71 @@ class Instance:
 
     def descend(self, state: State) -> None:
         if state.type == "composite":
+            if self._restore_history(state):
+                return
             initial = state.raw["initial"]
             self.run_actions(initial.get("action") or [], state, self.current_event)
             tgt = self.machine.resolve_target(state, initial["transition_to"])
-            self.config.add(tgt.path)
-            self.init_esvs(tgt)
-            self.run_entry(tgt)
-            self.descend(tgt)
+            self._enter_one(tgt)
         elif state.type == "orthogonal":
-            raise NotImplementedError("orthogonal regions (SPEC §5.6)")
+            if self._restore_history(state):
+                return
+            for region in state.raw.get("regions") or []:
+                initial = region["initial"]
+                self.run_actions(initial.get("action") or [], state, self.current_event)
+                tgt = self.machine.resolve_target(state, initial["transition_to"])
+                self._enter_one(tgt)
+
+    def _enter_one(self, state: State) -> None:
+        self.config.add(state.path)
+        self.init_esvs(state)
+        self.run_entry(state)
+        self.descend(state)
+
+    # --- history (SPEC §5.6) ------------------------------------------------
+    def _record_history(self, state: State) -> None:
+        kind = state.raw.get("history", "none")
+        if kind == "none":
+            return
+        if kind == "deep":
+            sub = [
+                self.machine.by_path[p].path
+                for p in self.config
+                if self._strict_descendant(self.machine.by_path[p], state)
+            ]
+            self.history[state.path] = ("deep", sub)
+        elif kind == "shallow":
+            child = next(
+                (
+                    p
+                    for p in self.config
+                    if self.machine.by_path[p].parent is state
+                ),
+                None,
+            )
+            self.history[state.path] = ("shallow", child)
+
+    def _restore_history(self, state: State) -> bool:
+        """Re-enter a recorded configuration; return False to take the initial."""
+        record = self.history.get(state.path)
+        if record is None:
+            return False
+        kind, data = record
+        if kind == "deep" and data:
+            states = sorted(
+                (self.machine.by_path[p] for p in data),
+                key=lambda s: (s.depth, s.order),
+            )
+            for s in states:  # outermost first
+                self.config.add(s.path)
+                self.init_esvs(s)
+                self.run_entry(s)
+            return True
+        if kind == "shallow" and data:
+            child = self.machine.by_path[data]
+            self._enter_one(child)
+            return True
+        return False
 
     # --- defer + RTC step ---------------------------------------------------
     def step(self, event: Event) -> None:
