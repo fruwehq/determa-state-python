@@ -27,6 +27,7 @@ class State:
     parent: State | None
     type: str
     depth: int
+    order: int  # document/DFS order (stable region + declaration ordering)
     raw: dict[str, Any]
     children: dict[str, State] = field(default_factory=dict)
     declares_esvs: set[str] = field(default_factory=set)
@@ -52,6 +53,7 @@ class Machine:
         self.id = definition.id
         self.version = definition.version
         self.format = definition.format
+        self._counter = 0
         top_raw = definition.top
         self.top = self._build("top", "top", None, 0, top_raw, None)
         self.by_path: dict[str, State] = {}
@@ -68,12 +70,15 @@ class Machine:
         raw: dict[str, Any],
         region_index: int | None,
     ) -> State:
+        order = self._counter
+        self._counter += 1
         state = State(
             name=name,
             path=path,
             parent=parent,
             type=_infer_type(raw),
             depth=depth,
+            order=order,
             raw=raw,
             region_index=region_index,
         )
