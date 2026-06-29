@@ -24,6 +24,8 @@ class Host:
         self.published: list[str] = []  # event names handed to the bus, in order
         self.spawned: list[str] = []  # child defIds, in order
         self._spawn_counters: dict[str, int] = {}
+        self.now: int = 0  # virtual clock, in milliseconds (SPEC §5.9)
+        self._seq: int = 0
 
     # --- registration / creation -------------------------------------------
     def register(self, definition: Definition) -> Machine:
@@ -74,6 +76,34 @@ class Host:
         return True
 
     # --- execution ----------------------------------------------------------
+    def next_seq(self) -> int:
+        self._seq += 1
+        return self._seq
+
+    def advance(self, duration: str) -> None:
+        """Advance the virtual clock, enqueueing due `after` timers (§5.9)."""
+        from .instance import _duration_ms
+
+        self.now += _duration_ms(duration)
+        due: list[tuple[Instance, dict[str, Any]]] = []
+        for inst in self.instances.values():
+            if inst.status is not Status.ACTIVE:
+                continue
+            for timer in inst.timers:
+                if timer["fire_at"] <= self.now:
+                    due.append((inst, timer))
+        due.sort(key=lambda pair: (pair[1]["fire_at"], pair[1]["seq"]))
+        for inst, timer in due:
+            if timer in inst.timers:
+                inst.timers.remove(timer)
+            if (
+                inst.status is Status.ACTIVE
+                and timer["state_path"] in inst.config
+            ):
+                inst.queue.append(
+                    Event("__time__", after=(timer["state_path"], timer["spec"]))
+                )
+
     def run_to_quiescence(self) -> None:
         progress = True
         while progress:

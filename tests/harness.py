@@ -37,6 +37,9 @@ SUPPORTED = frozenset(
         "13-spawn-publish",
         "14-subscription",
         "15-external-env-refresh",
+        "16-timer",
+        "17-fault-handled",
+        "18-fault-unhandled",
     }
 )
 
@@ -112,10 +115,16 @@ def run_engine_case(case: EngineCase) -> None:
 
     for i, step in enumerate(test.get("steps", [])):
         step_label = f"{case.name} step {i}"
-        assert "send" in step, f"{step_label}: only `send` steps supported so far"
         before_pub, before_sp = len(host.published), len(host.spawned)
-        delivered = _do_send(host, step["send"], step_label)
-        host.run_to_quiescence()
+        if "send" in step:
+            delivered = _do_send(host, step["send"], step_label)
+            host.run_to_quiescence()
+        elif "advance" in step:
+            host.advance(step["advance"])
+            delivered = True
+            host.run_to_quiescence()
+        else:
+            raise AssertionError(f"{step_label}: unsupported step {list(step)}")
         _check_expect(
             host,
             step.get("expect") or {},
@@ -172,6 +181,9 @@ def _check_expect(
         assert spawned == expect["spawned"], (
             f"{label}: spawned {spawned} != {expect['spawned']}"
         )
+    if expect.get("dead_letter"):
+        assert inst is not None
+        assert inst.dead_letter, f"{label}: expected a dead-letter record"
     if expect.get("instances"):
         for iid, sub in expect["instances"].items():
             target = host.instances.get(iid)
