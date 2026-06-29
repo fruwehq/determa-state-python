@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from . import values
+from . import cel, values
 from .definition import Definition
 from .instance import DELIVERABLE_RESERVED_EVENTS, Event, Instance, Status
 from .model import Machine
@@ -23,6 +23,7 @@ class Host:
         self.instances: dict[str, Instance] = {}
         self.published: list[str] = []  # event names handed to the bus, in order
         self.spawned: list[str] = []  # child defIds, in order
+        self._spawn_counters: dict[str, int] = {}
 
     # --- registration / creation -------------------------------------------
     def register(self, definition: Definition) -> Machine:
@@ -85,21 +86,125 @@ class Host:
                     inst.step(ev)
                     progress = True
 
-    # --- structured-action hooks (later build steps) -----------------------
-    def publish(
-        self, inst: Instance, spec: dict[str, Any], root: Any, event: Event | None
-    ) -> None:
-        raise NotImplementedError("publish / bus (SPEC §5.7)")
-
+    # --- structured-action hooks (SPEC §6) ----------------------------------
     def spawn_action(
-        self, inst: Instance, spec: dict[str, Any], root: Any, event: Event | None
+        self,
+        parent: Instance,
+        spec: dict[str, Any],
+        root: Any,
+        event: Event | None,
     ) -> None:
-        raise NotImplementedError("spawn (SPEC §5.7)")
+        def_id = spec["def"]
+        machine = self.machines[def_id]
+        n = self._spawn_counters[parent.id] = self._spawn_counters.get(parent.id, 0) + 1
+        child_id = f"{parent.id}/{n}"
+        external: dict[str, Any] | None = None
+        if "payload" in spec:
+            scope = parent.scope(root, event)
+            external = {k: cel.evaluate(v, scope) for k, v in spec["payload"].items()}
+        child = Instance(machine, child_id, parent.id, self, external=external)
+        self.instances[child_id] = child
+        self.spawned.append(def_id)
+        result = spec.get("result")
+        if result:
+            parent.assign_esv(root, result, child_id)
+
+    def publish(
+        self,
+        src: Instance,
+        spec: dict[str, Any],
+        root: Any,
+        event: Event | None,
+    ) -> None:
+        name = spec["event"]
+        scope = src.scope(root, event)
+        payload = {
+            k: cel.evaluate(v, scope) for k, v in (spec.get("payload") or {}).items()
+        }
+        self.published.append(name)
+        if "to" in spec:
+            target = cel.evaluate(spec["to"], scope)
+            ids = target if isinstance(target, list) else [target]
+            for tid in ids:
+                tid = str(tid)
+                tgt = self.instances.get(tid)
+                if tgt is not None and tgt.status is Status.ACTIVE:
+                    tgt.queue.append(Event(name, payload))
+        else:
+            self._undirected(src, name, payload)
+
+    def _undirected(self, src: Instance, name: str, payload: dict[str, Any]) -> None:
+        scope_kind = self._event_scope(src.machine, name)
+        if scope_kind == "internal":
+            src.queue.append(Event(name, payload))
+            return
+        if scope_kind == "local":
+            candidate_ids = self._tree_ids(src.id)
+        else:  # global
+            candidate_ids = list(self.instances.keys())
+        for tid in candidate_ids:
+            t = self.instances.get(tid)
+            if t is None or t.status is not Status.ACTIVE:
+                continue
+            subs = t.machine.definition.raw.get("subscribe") or []
+            if name in subs:
+                t.queue.append(Event(name, payload))
+
+    def _event_scope(self, machine: Machine, name: str) -> str:
+        decl = (machine.definition.raw.get("events") or {}).get(name)
+        if isinstance(decl, dict):
+            scope = decl.get("scope", "internal")
+            return scope if isinstance(scope, str) else "internal"
+        return "internal"
+
+    def _tree_ids(self, root_id: str) -> list[str]:
+        out = [root_id]
+        out.extend(
+            iid
+            for iid, inst in self.instances.items()
+            if iid != root_id and self._under_root(iid, root_id)
+        )
+        return out
+
+    def _under_root(self, iid: str, root_id: str) -> bool:
+        inst = self.instances.get(iid)
+        cur = inst.parent_id if inst else None
+        while cur is not None:
+            if cur == root_id:
+                return True
+            parent = self.instances.get(cur) if cur else None
+            cur = parent.parent_id if parent else None
+        return False
 
     def refresh(
         self, inst: Instance, spec: dict[str, Any], event: Event | None
     ) -> None:
-        raise NotImplementedError("external esvs / refresh (SPEC §5.4)")
+        if event is None or event.type != "env":
+            raise ValueError("refresh is only valid while handling an env event")
+        changed = ((event.payload or {}).get("changed")) or {}
+        only = spec.get("only")
+        names = only if only is not None else list(changed.keys())
+        for nm in names:
+            if nm in changed:
+                inst.refresh_external(nm, changed[nm])
 
     def stop(self, inst: Instance) -> None:
-        raise NotImplementedError("stop / termination (SPEC §5.7)")
+        inst._pending_terminate = True
+
+    # --- termination (SPEC §5.7) -------------------------------------------
+    def terminate(self, inst: Instance) -> None:
+        if inst.status is Status.TERMINATED:
+            return
+        for child in [
+            i
+            for i in self.instances.values()
+            if i.parent_id == inst.id and i.status is Status.ACTIVE
+        ]:
+            self.terminate(child)
+        inst.terminate_exits()
+        if inst.parent_id and inst.parent_id in self.instances:
+            parent = self.instances[inst.parent_id]
+            if parent.status is Status.ACTIVE:
+                parent.queue.append(Event("done", {"instance": inst.id}))
+        inst.status = Status.TERMINATED
+        inst.queue.clear()

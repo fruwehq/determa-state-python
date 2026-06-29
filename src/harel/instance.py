@@ -60,6 +60,7 @@ class Instance:
         self.history: dict[str, tuple[str, Any]] = {}
         self.external: dict[str, Any] = dict(external or {})
         self.current_event: Event | None = None
+        self._pending_terminate = False
         self._enter_top()
 
     # --- creation -----------------------------------------------------------
@@ -236,12 +237,19 @@ class Instance:
             self.current_event = None
             return False
         before = self.active_leaf_names()
-        before_complete = self._complete_orthogonals()
+        before_complete = self._complete_composites()
         for owner, transition in enabled:
             self.run_transition(owner, transition, event)
-        for path in self._complete_orthogonals() - before_complete:
-            # All regions reached final -> a `done` for the parent (SPEC §5.6).
-            self.queue.append(Event("done", {"state": self._leaf_name(path)}))
+        newly_complete = self._complete_composites() - before_complete
+        for path in newly_complete:
+            if path == "top":
+                # top reached final: a spawned instance terminates (done -> its
+                # parent); the root has no parent and rests in the final state.
+                if self.parent_id is not None:
+                    self._pending_terminate = True
+            else:
+                # A composite/orthogonal completed -> `done` for its parent state.
+                self.queue.append(Event("done", {"state": self._leaf_name(path)}))
         self.current_event = None
         return before != self.active_leaf_names()
 
@@ -264,18 +272,32 @@ class Instance:
         self.run_actions(actions, owner, event)
         self.enter_to(lca, target)
 
-    # --- orthogonal completion ---------------------------------------------
-    def _complete_orthogonals(self) -> set[str]:
-        """Active orthogonal states whose every region's leaf is final."""
+    # --- completion ---------------------------------------------------------
+    def _complete_composites(self) -> set[str]:
+        """Active composite/orthogonal states whose region(s) all reached final."""
         out: set[str] = set()
         for path in self.config:
             s = self.machine.by_path[path]
-            if s.type != "orthogonal":
-                continue
-            regions = s.raw.get("regions") or []
-            if all(self._region_final(s, i) for i in range(len(regions))):
+            if self._state_complete(s):
                 out.add(path)
         return out
+
+    def _state_complete(self, state: State) -> bool:
+        if state.type == "orthogonal":
+            regions = state.raw.get("regions") or []
+            return bool(regions) and all(
+                self._region_final(state, i) for i in range(len(regions))
+            )
+        if state.type == "composite":
+            leaf = self._composite_leaf(state)
+            return leaf is not None and leaf.type == "final"
+        return False
+
+    def _composite_leaf(self, composite: State) -> State | None:
+        for leaf in self.active_leaves():
+            if self._descendant_or_self(leaf, composite):
+                return leaf
+        return None
 
     def _region_final(self, ortho: State, region_idx: int) -> bool:
         leaf = self._region_leaf(ortho, region_idx)
@@ -312,8 +334,11 @@ class Instance:
 
     def _exit_set(self, owner: State, lca: State, local: bool) -> list[State]:
         states = [self.machine.by_path[p] for p in self.config]
-        if local:
-            return [s for s in states if self._strict_descendant(s, owner)]
+        # When the transition is local, or its source *is* the LCA (a transition
+        # owned by the root composite targeting one of its children), only the
+        # LCA's proper descendants are exited — the LCA itself stays put.
+        if local or owner is lca:
+            return [s for s in states if self._strict_descendant(s, lca)]
         exit_root = self._source_root(owner, lca)
         return [s for s in states if self._descendant_or_self(s, exit_root)]
 
@@ -422,6 +447,34 @@ class Instance:
     def step(self, event: Event) -> None:
         if self.dispatch(event):
             self._undefer()
+        if self._pending_terminate:
+            self._pending_terminate = False
+            self.host.terminate(self)
+
+    # --- termination (SPEC §5.7) -------------------------------------------
+    def terminate_exits(self) -> None:
+        """Run exit actions up the active tree, innermost first."""
+        states = sorted(
+            (self.machine.by_path[p] for p in self.config),
+            key=lambda s: (-s.depth, s.order),
+        )
+        for s in states:
+            self.run_exit(s)
+            self.destroy_esvs(s)
+        self.config.clear()
+
+    # --- external esvs / refresh (SPEC §5.4) --------------------------------
+    def refresh_external(self, name: str, value: Any) -> None:
+        """Adopt a host change into the in-scope external esv ``name``."""
+        for path in self.config:
+            s = self.machine.by_path[path]
+            decl = (s.raw.get("esvs") or {}).get(name)
+            if decl is not None and decl.get("external"):
+                live = self.esv_values.get(path)
+                if live is not None:
+                    live[name] = value
+                return
+        raise HarelError(f"no external esv '{name}' to refresh")
 
     def _undefer(self) -> None:
         """Edge-triggered: on a config change, reinsert no-longer-deferred events
