@@ -56,6 +56,7 @@ class Instance:
         parent_id: str | None,
         host: Host,
         external: dict[str, Any] | None = None,
+        auto_enter: bool = True,
     ) -> None:
         self.machine = machine
         self.id = id
@@ -72,7 +73,8 @@ class Instance:
         self.external: dict[str, Any] = dict(external or {})
         self.current_event: Event | None = None
         self._pending_terminate = False
-        self._enter_top()
+        if auto_enter:
+            self._enter_top()
 
     # --- creation -----------------------------------------------------------
     def _enter_top(self) -> None:
@@ -559,6 +561,53 @@ class Instance:
             self.host.terminate(self)
 
     # --- termination (SPEC §5.7) -------------------------------------------
+    def to_snapshot(self) -> dict[str, Any]:
+        """Serialize the instance (SPEC §8); JSON/YAML-representable."""
+        return {
+            "def_id": self.machine.id,
+            "def_version": self.machine.version,
+            "id": self.id,
+            "parent_id": self.parent_id,
+            "status": self.status.value,
+            "state_config": sorted(self.config),
+            "esvs": {p: dict(v) for p, v in self.esv_values.items()},
+            "queue": [self._event_to_snap(e) for e in self.queue],
+            "deferred": [self._event_to_snap(e) for e in self.deferred],
+            "timers": [
+                {"fire_at": t["fire_at"], "state_path": t["state_path"], "spec": t["spec"]}
+                for t in self.timers
+            ],
+            "dead_letter": list(self.dead_letter),
+            "history": {p: {"kind": k, "data": d} for p, (k, d) in self.history.items()},
+        }
+
+    def load_snapshot(self, snap: dict[str, Any]) -> None:
+        self.status = Status(snap["status"])
+        self.config = set(snap["state_config"])
+        self.esv_values = {p: dict(v) for p, v in snap["esvs"].items()}
+        self.queue = deque(self._snap_to_event(e) for e in snap["queue"])
+        self.deferred = deque(self._snap_to_event(e) for e in snap["deferred"])
+        self.timers = [dict(t) for t in snap["timers"]]
+        self.dead_letter = list(snap["dead_letter"])
+        self.history = {
+            p: (rec["kind"], rec["data"]) for p, rec in snap["history"].items()
+        }
+
+    @staticmethod
+    def _event_to_snap(event: Event) -> dict[str, Any]:
+        out: dict[str, Any] = {"type": event.type, "payload": event.payload}
+        if event.after is not None:
+            state_path, spec = event.after
+            out["after"] = [state_path, spec]
+        return out
+
+    @staticmethod
+    def _snap_to_event(snap: dict[str, Any]) -> Event:
+        after = None
+        if snap.get("after") is not None:
+            after = (snap["after"][0], snap["after"][1])
+        return Event(snap["type"], snap.get("payload"), after=after)
+
     def terminate_exits(self) -> None:
         """Run exit actions up the active tree, innermost first."""
         states = sorted(

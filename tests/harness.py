@@ -40,6 +40,10 @@ SUPPORTED = frozenset(
         "16-timer",
         "17-fault-handled",
         "18-fault-unhandled",
+        "19-contract-pass",
+        "20-contract-fail",
+        "21-snapshot-roundtrip",
+        "22-migration",
     }
 )
 
@@ -96,23 +100,51 @@ def cli_cases() -> list[Path]:
 
 # --- engine case runner -----------------------------------------------------
 def run_engine_case(case: EngineCase) -> None:
-    """Execute one engine conformance case, asserting every ``expect``.
-
-    Loads the definitions, creates the root (id ``root``) seeded with any
-    top-level ``external`` esvs, then runs each step (``send`` so far) to
-    quiescence and checks the step's expectations (SPEC §9).
-    """
-    from harel import load_definitions
+    """Execute one engine conformance case, asserting every ``expect`` (SPEC §9)."""
+    from harel import collect_errors, load_definition, load_definitions
+    from harel.contracts import load_contract, validate_contracts
 
     test = _load_yaml(case.test_file)
-    external = test.get("external") or {}
     assert case.machine_files, f"{case.name}: no machine files"
-    defs = load_definitions(case.machine_files[0].read_text(encoding="utf-8"))
+
+    if "static" in test:
+        root_raw = load_definitions(case.machine_files[0].read_text(encoding="utf-8"))[0].raw
+        errors = list(collect_errors(root_raw))
+        contracts: dict[str, dict[str, Any]] = {}
+        cdir = case.path / "contracts"
+        if cdir.exists():
+            for cf in sorted(cdir.glob("*.yaml")):
+                c = load_contract(cf.read_text(encoding="utf-8"))
+                contracts[c["id"]] = c
+        errors.extend(validate_contracts(root_raw, contracts))
+        valid = not errors
+        expected = bool(test["static"]["valid"])
+        assert valid is expected, (
+            f"{case.name}: static valid={valid} != {expected} ({errors})"
+        )
+        return
+
+    external = test.get("external") or {}
     host = Host()
-    host.register_all(defs)
-    host.create_root(host.machines[defs[0].id], "root", external=external)
+    files = case.machine_files
+    versioned = bool(files) and all(
+        f.name[:1] == "v" and f.stem[1:].isdigit() for f in files
+    )
+    if versioned:
+        ordered = sorted(files)
+        for f in ordered:
+            host.register(load_definition(f.read_text(encoding="utf-8")))
+        root_id = load_definition(ordered[0].read_text(encoding="utf-8")).id
+        lowest = min(v for (iid, v) in host.versions if iid == root_id)
+        root_machine = host.versions[(root_id, lowest)]
+    else:
+        defs = load_definitions(files[0].read_text(encoding="utf-8"))
+        host.register_all(defs)
+        root_machine = host.machines[defs[0].id]
+    host.create_root(root_machine, "root", external=external)
     host.run_to_quiescence()
 
+    roundtrip = bool(test.get("roundtrip"))
     for i, step in enumerate(test.get("steps", [])):
         step_label = f"{case.name} step {i}"
         before_pub, before_sp = len(host.published), len(host.spawned)
@@ -121,6 +153,10 @@ def run_engine_case(case: EngineCase) -> None:
             host.run_to_quiescence()
         elif "advance" in step:
             host.advance(step["advance"])
+            delivered = True
+            host.run_to_quiescence()
+        elif "upgrade" in step:
+            host.upgrade(int(step["upgrade"]), root_machine.id)
             delivered = True
             host.run_to_quiescence()
         else:
@@ -133,6 +169,8 @@ def run_engine_case(case: EngineCase) -> None:
             published=host.published[before_pub:],
             spawned=host.spawned[before_sp:],
         )
+        if roundtrip:
+            host.restore_all(host.snapshot_all())
 
 
 def _do_send(host: Host, send: dict[str, Any], label: str) -> bool:
