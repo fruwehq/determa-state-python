@@ -142,6 +142,13 @@ class Machine:
             node = node.children[p]
         return node
 
+    def find_by_name(self, name: str) -> State | None:
+        """First state with the given simple name (migration state_map lookup)."""
+        for state in self.by_path.values():
+            if state.name == name:
+                return state
+        return None
+
     # --- static checks ------------------------------------------------------
     def _validate_references(self) -> None:
         errors: list[ErrorRecord] = []

@@ -20,6 +20,7 @@ from .model import Machine
 class Host:
     def __init__(self) -> None:
         self.machines: dict[str, Machine] = {}
+        self.versions: dict[tuple[str, int], Machine] = {}
         self.instances: dict[str, Instance] = {}
         self.published: list[str] = []  # event names handed to the bus, in order
         self.spawned: list[str] = []  # child defIds, in order
@@ -31,6 +32,7 @@ class Host:
     def register(self, definition: Definition) -> Machine:
         machine = Machine(definition)
         self.machines[machine.id] = machine
+        self.versions[(machine.id, machine.version)] = machine
         return machine
 
     def register_all(self, definitions: list[Definition]) -> None:
@@ -115,6 +117,93 @@ class Host:
                     ev = inst.queue.popleft()
                     inst.step(ev)
                     progress = True
+
+    # --- snapshot round-trip (SPEC §8) -------------------------------------
+    def snapshot_all(self) -> list[dict[str, Any]]:
+        return [inst.to_snapshot() for inst in self.instances.values()]
+
+    def restore_all(self, snapshots: list[dict[str, Any]]) -> None:
+        new_instances: dict[str, Instance] = {}
+        for snap in snapshots:
+            machine = self.versions.get(
+                (snap["def_id"], snap["def_version"])
+            ) or self.machines[snap["def_id"]]
+            inst = Instance(
+                machine, snap["id"], snap["parent_id"], self, auto_enter=False
+            )
+            inst.load_snapshot(snap)
+            new_instances[snap["id"]] = inst
+        self.instances = new_instances
+
+    # --- versioning / migration (SPEC §10) ---------------------------------
+    def upgrade(self, target_version: int, root_def_id: str | None = None) -> None:
+        """Register a newer definition version and migrate eligible instances."""
+        if root_def_id is None:
+            root_def_id = next(iter(self.machines)) if self.machines else None
+        if root_def_id is None:
+            return
+        new_machine = self.versions.get((root_def_id, target_version))
+        if new_machine is None:
+            return
+        self.machines[root_def_id] = new_machine
+        for inst in list(self.instances.values()):
+            if (
+                inst.machine.id == root_def_id
+                and inst.machine.version < target_version
+                and inst.status is Status.ACTIVE
+            ):
+                self._try_migrate(inst, new_machine)
+
+    def _try_migrate(self, inst: Instance, new_machine: Machine) -> None:
+        migrations = new_machine.definition.raw.get("migrations") or []
+        mig = next(
+            (
+                m
+                for m in migrations
+                if m.get("from") == inst.machine.version
+                and m.get("to") == new_machine.version
+            ),
+            None,
+        )
+        if mig is None:
+            return
+        # only at a safe point: quiescent (empty queue + deferred)
+        if inst.queue or inst.deferred:
+            return
+        leaves = inst.active_leaves()
+        state_binding = leaves[0].name if len(leaves) == 1 else [lf.name for lf in leaves]
+        when = mig.get("when")
+        if when is not None and not cel.evaluate(when, {"state": state_binding}):
+            return
+        state_map = mig.get("state_map") or {}
+        if any(leaf.name not in state_map for leaf in leaves):
+            return
+        # remap the configuration onto the new machine
+        inst.machine = new_machine
+        inst.config = self._remap_config(new_machine, leaves, state_map)
+        # transform esvs (carried over; actions run against the live scope)
+        esv_actions = mig.get("esvs") or []
+        if esv_actions:
+            inst.run_actions(esv_actions, new_machine.top, None)
+
+    def _remap_config(
+        self,
+        new_machine: Machine,
+        old_leaves: list[Any],
+        state_map: dict[str, str],
+    ) -> set[str]:
+        config: set[str] = set()
+        config.add(new_machine.top.path)
+        for leaf in old_leaves:
+            new_name = state_map[leaf.name]
+            target = new_machine.find_by_name(new_name)
+            if target is None:
+                continue
+            cur: Any = target
+            while cur is not None:
+                config.add(cur.path)
+                cur = cur.parent
+        return config
 
     # --- structured-action hooks (SPEC §6) ----------------------------------
     def spawn_action(
