@@ -25,6 +25,7 @@ from .harness import (
     SUPPORTED,
     cli_cases,
     engine_cases,
+    run_cli_case,
     run_engine_case,
 )
 
@@ -66,3 +67,8 @@ def test_engine_case(case) -> None:  # type: ignore[no-untyped-def]
     if case.name not in SUPPORTED:
         pytest.skip(f"not yet supported: {case.name}")
     run_engine_case(case)
+
+
+@pytest.mark.parametrize("case", cli_cases(), ids=lambda c: f"cli/{c.name}")
+def test_cli_case(case) -> None:  # type: ignore[no-untyped-def]
+    run_cli_case(case)

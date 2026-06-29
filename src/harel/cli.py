@@ -1,0 +1,386 @@
+"""Standard CLI (SPEC §13).
+
+Every implementation exposes the same command surface so operators and tests
+interact with any language's engine identically. State persists in a
+file-backed store; a state-changing command loads the affected instances, runs
+all to quiescence, and persists. Diagnostics go to stderr; the result to stdout.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+from pathlib import Path
+from typing import Any, cast
+
+from . import collect_errors, load_definitions
+from . import export as export_mod
+from .contracts import load_contract, validate_contracts
+from .engine import Host
+from .errors import HarelError
+from .instance import Instance, Status
+from .model import Machine
+from .store import Store, StoreState
+
+# Exit codes (SPEC §13.2).
+EXIT_OK = 0
+EXIT_OTHER = 1
+EXIT_USAGE = 2
+EXIT_VALIDATION = 3
+EXIT_NOT_FOUND = 4
+EXIT_FAULTED = 5
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_parser().parse_args(argv)
+    store_dir = args.store or os.environ.get("HAREL_STORE", "./.harel")
+    try:
+        return int(args.cmd(args, Store(store_dir)))
+    except HarelError as exc:
+        print(str(exc), file=sys.stderr)
+        return EXIT_OTHER
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(prog="harel", description="harel statechart engine")
+    p.add_argument("--store", default=None, help="store directory (default ./.harel)")
+    p.add_argument(
+        "--version", action="version", version=f"harel {_pkg_version()}"
+    )
+    sub = p.add_subparsers(dest="command", required=True)
+
+    # `--json` is accepted per-subcommand (after the positionals).
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", help="machine-readable output")
+
+    def add(cmd: str, **kw: Any) -> argparse.ArgumentParser:
+        return sub.add_parser(cmd, parents=[common], **kw)
+
+    v = add("validate")
+    v.add_argument("machine")
+    v.set_defaults(cmd=cmd_validate)
+
+    e = add("export")
+    e.add_argument("machine")
+    e.add_argument("--format", default="mermaid")
+    e.add_argument("--state", default=None)
+    e.set_defaults(cmd=cmd_export)
+
+    n = add("new")
+    n.add_argument("id")
+    n.add_argument("machine")
+    n.add_argument("--external", action="append", default=[])
+    n.set_defaults(cmd=cmd_new)
+
+    s = add("send")
+    s.add_argument("instance")
+    s.add_argument("event")
+    s.add_argument("--payload", action="append", default=[])
+    s.add_argument("--payload-json", default=None)
+    s.set_defaults(cmd=cmd_send)
+
+    a = add("advance")
+    a.add_argument("duration")
+    a.set_defaults(cmd=cmd_advance)
+
+    env = add("env")
+    env.add_argument("instance")
+    env.add_argument("--changed", required=True)
+    env.set_defaults(cmd=cmd_env)
+
+    st = add("state")
+    st.add_argument("instance")
+    st.set_defaults(cmd=cmd_state)
+
+    add("list").set_defaults(cmd=cmd_list)
+
+    snap = add("snapshot")
+    snap.add_argument("instance")
+    snap.set_defaults(cmd=cmd_snapshot)
+
+    r = add("restore")
+    r.add_argument("snapshot")
+    r.set_defaults(cmd=cmd_restore)
+    return p
+
+
+# --- host (de)serialization -------------------------------------------------
+def _build_host(state: StoreState) -> Host:
+    host = Host()
+    host.now = state.now
+    host._spawn_counters = dict(state.spawn_counters)  # noqa: SLF001
+    for text in state.defs.values():
+        host.register_all(load_definitions(text))
+    host.restore_all(state.instances)
+    return host
+
+
+def _persist(store: Store, state: StoreState, host: Host) -> None:
+    state.instances = host.snapshot_all()
+    state.now = host.now
+    state.spawn_counters = dict(host._spawn_counters)  # noqa: SLF001
+    store.save(state)
+
+
+def _resolve_machine_path(arg: str) -> Path:
+    return Path(arg)
+
+
+# --- commands ---------------------------------------------------------------
+def cmd_validate(args: argparse.Namespace, store: Store) -> int:
+    raw_text = _resolve_machine_path(args.machine).read_text(encoding="utf-8")
+    defs = load_definitions(raw_text)
+    root = defs[0]
+    errors = list(collect_errors(root.raw))
+    cdir = _resolve_machine_path(args.machine).parent / "contracts"
+    if cdir.exists():
+        contracts = {}
+        for cf in sorted(cdir.glob("*.yaml")):
+            c = load_contract(cf.read_text(encoding="utf-8"))
+            contracts[c["id"]] = c
+        errors.extend(validate_contracts(root.raw, contracts))
+    valid = not errors
+    if args.json:
+        print(
+            json.dumps(
+                {
+                    "valid": valid,
+                    "errors": [{"path": e["path"], "message": e["message"]} for e in errors],
+                }
+            )
+        )
+    elif not valid:
+        for e in errors:
+            print(f"{e['path']}: {e['message']}", file=sys.stderr)
+    return EXIT_OK if valid else EXIT_VALIDATION
+
+
+def cmd_new(args: argparse.Namespace, store: Store) -> int:
+    state = store.load()
+    if any(s["id"] == args.id for s in state.instances):
+        print(f"instance '{args.id}' already exists", file=sys.stderr)
+        return EXIT_USAGE
+    text = _resolve_machine_path(args.machine).read_text(encoding="utf-8")
+    defs = load_definitions(text)
+    key = f"{defs[0].id}@{defs[0].version}"
+    state.defs[key] = text
+    host = _build_host(state)
+    external = _parse_kv(args.external, _external_types(host.machines[defs[0].id]))
+    host.create_root(host.machines[defs[0].id], args.id, external=external)
+    host.run_to_quiescence()
+    inst = host.instances[args.id]
+    _print_state(args, host, inst)
+    _persist(store, state, host)
+    return EXIT_OK
+
+
+def cmd_send(args: argparse.Namespace, store: Store) -> int:
+    state = store.load()
+    host = _build_host(state)
+    inst = host.instances.get(args.instance)
+    if inst is None:
+        print(f"no such instance: {args.instance}", file=sys.stderr)
+        return EXIT_NOT_FOUND
+    payload = _build_payload(args, inst.machine)
+    before = len(host.published)
+    if not host.deliver(args.instance, args.event, payload):
+        print(f"rejected: {args.event}", file=sys.stderr)
+        return EXIT_VALIDATION
+    host.run_to_quiescence()
+    if args.json:
+        obj = _state_json(host, host.instances[args.instance])
+        obj["published"] = host.published[before:]
+        print(json.dumps(obj))
+    _persist(store, state, host)
+    inst = host.instances.get(args.instance)
+    if inst is not None and inst.status is Status.FAULTED:
+        return EXIT_FAULTED
+    return EXIT_OK
+
+
+def cmd_advance(args: argparse.Namespace, store: Store) -> int:
+    state = store.load()
+    host = _build_host(state)
+    host.advance(args.duration)
+    host.run_to_quiescence()
+    if args.json:
+        print(json.dumps({"now": host.now}))
+    _persist(store, state, host)
+    return EXIT_OK
+
+
+def cmd_env(args: argparse.Namespace, store: Store) -> int:
+    state = store.load()
+    host = _build_host(state)
+    if args.instance not in host.instances:
+        print(f"no such instance: {args.instance}", file=sys.stderr)
+        return EXIT_NOT_FOUND
+    changed = _parse_csv_kv(args.changed)
+    host.deliver(args.instance, "env", {"changed": changed})
+    host.run_to_quiescence()
+    _print_state(args, host, host.instances[args.instance])
+    _persist(store, state, host)
+    return EXIT_OK
+
+
+def cmd_state(args: argparse.Namespace, store: Store) -> int:
+    state = store.load()
+    host = _build_host(state)
+    inst = host.instances.get(args.instance)
+    if inst is None:
+        print(f"no such instance: {args.instance}", file=sys.stderr)
+        return EXIT_NOT_FOUND
+    _print_state(args, host, inst)
+    return EXIT_OK
+
+
+def cmd_list(args: argparse.Namespace, store: Store) -> int:
+    state = store.load()
+    host = _build_host(state)
+    if args.json:
+        rows = [
+            {
+                "id": i.id,
+                "def": f"{i.machine.id}@{i.machine.version}",
+                "parent": i.parent_id,
+                "status": i.status.value,
+                "config": i.active_leaf_names(),
+            }
+            for i in sorted(host.instances.values(), key=lambda x: x.id)
+        ]
+        print(json.dumps(rows))
+    else:
+        for i in sorted(host.instances.values(), key=lambda x: x.id):
+            print(f"{i.id}\t{i.status.value}\t{i.active_leaf_names()}")
+    return EXIT_OK
+
+
+def cmd_snapshot(args: argparse.Namespace, store: Store) -> int:
+    state = store.load()
+    host = _build_host(state)
+    inst = host.instances.get(args.instance)
+    if inst is None:
+        print(f"no such instance: {args.instance}", file=sys.stderr)
+        return EXIT_NOT_FOUND
+    print(json.dumps(inst.to_snapshot()))
+    return EXIT_OK
+
+
+def cmd_restore(args: argparse.Namespace, store: Store) -> int:
+    state = store.load()
+    snap = json.loads(_resolve_machine_path(args.snapshot).read_text(encoding="utf-8"))
+    host = _build_host(state)
+    machine = host.versions.get((snap["def_id"], snap["def_version"]))
+    if machine is None:
+        print(f"unknown definition: {snap['def_id']}@{snap['def_version']}", file=sys.stderr)
+        return EXIT_NOT_FOUND
+    inst = Instance(machine, snap["id"], snap["parent_id"], host, auto_enter=False)
+    inst.load_snapshot(snap)
+    host.instances[snap["id"]] = inst
+    _persist(store, state, host)
+    return EXIT_OK
+
+
+def cmd_export(args: argparse.Namespace, store: Store) -> int:
+    defs = load_definitions(_resolve_machine_path(args.machine).read_text(encoding="utf-8"))
+    machine = Machine(defs[0])
+    state_config = None
+    if args.state:
+        st = store.load()
+        host = _build_host(st)
+        inst = host.instances.get(args.state)
+        if inst is None:
+            print(f"no such instance: {args.state}", file=sys.stderr)
+            return EXIT_NOT_FOUND
+        state_config = sorted(inst.config)
+    print(export_mod.export(machine, format=args.format, state_config=state_config))
+    return EXIT_OK
+
+
+# --- output helpers ---------------------------------------------------------
+def _state_json(host: Host, inst: Instance) -> dict[str, Any]:
+    return {
+        "instance": inst.id,
+        "def": f"{inst.machine.id}@{inst.machine.version}",
+        "status": inst.status.value,
+        "config": inst.active_leaf_names(),
+        "esvs": inst.resolved_esvs(),
+    }
+
+
+def _print_state(args: argparse.Namespace, host: Host, inst: Instance) -> None:
+    if args.json:
+        print(json.dumps(_state_json(host, inst)))
+
+
+def _build_payload(args: argparse.Namespace, machine: Machine) -> dict[str, Any] | None:
+    if args.payload_json:
+        return cast(dict[str, Any], json.loads(args.payload_json))
+    if not args.payload:
+        return None
+    types = _event_payload_types(machine, args.event)
+    return _parse_kv(args.payload, types)
+
+
+def _event_payload_types(machine: Machine, event: str) -> dict[str, str]:
+    decl = (machine.definition.raw.get("events") or {}).get(event)
+    if not isinstance(decl, dict):
+        return {}
+    return {k: v["type"] for k, v in (decl.get("payload") or {}).items()}
+
+
+def _external_types(machine: Machine) -> dict[str, str]:
+    types: dict[str, str] = {}
+    for var, decl in (machine.top.raw.get("esvs") or {}).items():
+        if decl.get("external"):
+            types[var] = decl["type"]
+    return types
+
+
+def _parse_kv(items: list[str], types: dict[str, str]) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for item in items:
+        if "=" not in item:
+            continue
+        k, v = item.split("=", 1)
+        out[k] = _coerce(v, types.get(k))
+    return out
+
+
+def _parse_csv_kv(items: str) -> dict[str, Any]:
+    out: dict[str, Any] = {}
+    for part in items.split(","):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            out[k] = _coerce(v, None)
+    return out
+
+
+def _coerce(value: str, type_name: str | None) -> Any:
+    if type_name == "int":
+        return int(value)
+    if type_name == "float":
+        return float(value)
+    if type_name == "bool":
+        return value.lower() in {"true", "yes", "1"}
+    if type_name == "list":
+        return json.loads(value)
+    if type_name == "map":
+        return json.loads(value)
+    if type_name is None:
+        for caster in (int, float):
+            try:
+                return caster(value)
+            except ValueError:
+                continue
+        if value.lower() in {"true", "false"}:
+            return value.lower() == "true"
+    return value
+
+
+def _pkg_version() -> str:
+    from . import __version__
+
+    return __version__
