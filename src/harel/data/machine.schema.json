@@ -1,0 +1,202 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://harel.dev/schema/machine.schema.json",
+  "title": "harel machine definition",
+  "description": "Strict structural schema for a harel statechart definition (SPEC.md §4). Validates one YAML/JSON document. Semantics (RTC, scoping, defer, timers, bus) live in SPEC.md and the conformance suite.",
+  "type": "object",
+  "required": ["id", "top"],
+  "additionalProperties": false,
+  "properties": {
+    "format": { "type": "integer", "minimum": 1, "default": 1, "description": "Grammar version. Optional; defaults to 1." },
+    "id": { "$ref": "#/$defs/identifier", "description": "Stable definition id." },
+    "version": { "type": "integer", "minimum": 1, "default": 1, "description": "This definition's version; drives migration (SPEC §10)." },
+    "contracts": { "type": "array", "items": { "$ref": "#/$defs/identifier" } },
+    "subscribe": { "type": "array", "items": { "$ref": "#/$defs/identifier" }, "description": "External event types delivered to this machine by subscription (SPEC §5.7)." },
+    "languages": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "guard": { "type": "string", "default": "cel" },
+        "action": { "type": "string", "default": "harel" }
+      }
+    },
+    "events": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/eventDecl" }
+    },
+    "migrations": { "type": "array", "items": { "$ref": "#/$defs/migration" } },
+    "top": { "$ref": "#/$defs/state", "description": "The outermost state (PSiCC \"top\"); all behavior lives under it." }
+  },
+  "$defs": {
+    "identifier": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
+    "dottedRef": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$" },
+    "cel": { "type": "string", "description": "A CEL expression (string)." },
+    "valueType": { "enum": ["string", "int", "float", "bool", "map", "list"] },
+    "duration": { "type": "string", "pattern": "^[0-9]+(ms|s|m|h)$" },
+
+    "esv": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "description": "An extended-state variable, initialized on entry to its declaring state (SPEC §4.4).",
+      "properties": {
+        "type": { "$ref": "#/$defs/valueType" },
+        "init": { "description": "Initial literal value (must match type). Omit for unset/null." },
+        "external": { "type": "boolean", "default": false, "description": "Seeded from the host at entry; read-only to assign; retained until refreshed (SPEC §5.4)." }
+      }
+    },
+
+    "eventDecl": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "scope": { "enum": ["internal", "local", "global"], "default": "internal" },
+        "payload": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "required": ["type"],
+            "additionalProperties": false,
+            "properties": {
+              "type": { "$ref": "#/$defs/valueType" },
+              "required": { "type": "boolean", "default": false },
+              "default": {}
+            }
+          }
+        }
+      }
+    },
+
+    "action": {
+      "type": "object",
+      "minProperties": 1,
+      "maxProperties": 1,
+      "additionalProperties": false,
+      "properties": {
+        "assign": { "type": "object", "minProperties": 1, "additionalProperties": { "$ref": "#/$defs/cel" } },
+        "publish": {
+          "type": "object",
+          "required": ["event"],
+          "additionalProperties": false,
+          "properties": {
+            "event": { "$ref": "#/$defs/identifier" },
+            "to": { "$ref": "#/$defs/cel" },
+            "payload": { "type": "object", "additionalProperties": { "$ref": "#/$defs/cel" } }
+          }
+        },
+        "refresh": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "only": { "type": "array", "items": { "$ref": "#/$defs/identifier" } }
+          }
+        },
+        "spawn": {
+          "type": "object",
+          "required": ["def"],
+          "additionalProperties": false,
+          "properties": {
+            "def": { "$ref": "#/$defs/identifier" },
+            "payload": { "type": "object", "additionalProperties": { "$ref": "#/$defs/cel" } },
+            "result": { "$ref": "#/$defs/identifier" }
+          }
+        },
+        "stop": { "type": "object", "maxProperties": 0 }
+      }
+    },
+    "actionList": { "type": "array", "items": { "$ref": "#/$defs/action" } },
+
+    "transition": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "transition_to": { "$ref": "#/$defs/dottedRef" },
+        "guard": { "$ref": "#/$defs/cel" },
+        "lang": { "type": "string" },
+        "action": { "$ref": "#/$defs/actionList" },
+        "internal": { "type": "boolean" },
+        "local": { "type": "boolean" }
+      }
+    },
+    "transitionOrList": {
+      "oneOf": [
+        { "$ref": "#/$defs/transition" },
+        { "type": "array", "items": { "$ref": "#/$defs/transition" }, "minItems": 1 }
+      ]
+    },
+
+    "initialTransition": {
+      "type": "object",
+      "required": ["transition_to"],
+      "additionalProperties": false,
+      "properties": {
+        "transition_to": { "$ref": "#/$defs/dottedRef" },
+        "guard": { "$ref": "#/$defs/cel" },
+        "action": { "$ref": "#/$defs/actionList" }
+      }
+    },
+
+    "after": {
+      "type": "object",
+      "required": ["duration"],
+      "additionalProperties": false,
+      "properties": {
+        "duration": { "$ref": "#/$defs/duration" },
+        "transition_to": { "$ref": "#/$defs/dottedRef" },
+        "guard": { "$ref": "#/$defs/cel" },
+        "action": { "$ref": "#/$defs/actionList" }
+      }
+    },
+
+    "region": {
+      "type": "object",
+      "required": ["initial", "states"],
+      "additionalProperties": false,
+      "properties": {
+        "initial": { "$ref": "#/$defs/initialTransition" },
+        "states": { "type": "object", "minProperties": 1, "additionalProperties": { "$ref": "#/$defs/state" } }
+      }
+    },
+
+    "state": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "type": { "enum": ["simple", "composite", "orthogonal", "final"], "default": "simple" },
+        "esvs": { "type": "object", "additionalProperties": { "$ref": "#/$defs/esv" } },
+        "entry": { "$ref": "#/$defs/actionList" },
+        "exit": { "$ref": "#/$defs/actionList" },
+        "initial": { "$ref": "#/$defs/initialTransition" },
+        "states": { "type": "object", "additionalProperties": { "$ref": "#/$defs/state" } },
+        "regions": { "type": "array", "minItems": 2, "items": { "$ref": "#/$defs/region" } },
+        "on_events": { "type": "object", "additionalProperties": { "$ref": "#/$defs/transitionOrList" } },
+        "after": { "type": "array", "items": { "$ref": "#/$defs/after" } },
+        "defer": { "type": "array", "items": { "$ref": "#/$defs/identifier" } },
+        "history": { "enum": ["none", "shallow", "deep"], "default": "none" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "type": { "const": "composite" } }, "required": ["type"] },
+          "then": { "required": ["initial", "states"] }
+        },
+        {
+          "if": { "properties": { "type": { "const": "orthogonal" } }, "required": ["type"] },
+          "then": { "required": ["regions"] }
+        }
+      ]
+    },
+
+    "migration": {
+      "type": "object",
+      "required": ["from", "to"],
+      "additionalProperties": false,
+      "properties": {
+        "from": { "type": "integer", "minimum": 1 },
+        "to": { "type": "integer", "minimum": 1 },
+        "when": { "$ref": "#/$defs/cel" },
+        "state_map": { "type": "object", "additionalProperties": { "$ref": "#/$defs/dottedRef" } },
+        "esvs": { "$ref": "#/$defs/actionList" }
+      }
+    }
+  }
+}

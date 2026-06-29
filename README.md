@@ -7,7 +7,19 @@ The normative `SPEC.md`, the JSON Schema for machine YAML, and the cross-languag
 **conformance suite** live in the spec repo. This repository implements that spec in
 Python and is correct **iff it passes the conformance suite**.
 
-Status: **scaffold** — the engine is not yet implemented.
+Status: **in progress** — YAML 1.2 loading + machine validation (SPEC §2/§4) are
+implemented and gated against the full conformance suite. The engine is being
+built up the build order in [issue #3][issue].
+
+[issue]: https://github.com/fruwehq/harel-python/issues/3
+
+## Conformance suite
+
+The normative `SPEC.md`, JSON Schema, and cross-language **conformance suite**
+are consumed as a pinned git submodule at [`vendor/harel`](vendor/harel)
+(single source of truth — no copy-paste drift). The harness lives in `tests/`
+and discovers `conformance/*/` from there. This repository is correct **iff it
+passes the suite**.
 
 ## Scope (per the spec)
 - Load and validate machine YAML against `schema/machine.schema.json`, parsed under
@@ -33,9 +45,10 @@ Status: **scaffold** — the engine is not yet implemented.
 
 ## Develop
 ```
+git submodule update --init      # fetch the conformance suite
 python -m venv .venv && . .venv/bin/activate
 pip install -e '.[dev]'
-pytest
+ruff check . && mypy src/harel && pytest
 ```
 
 ## License
