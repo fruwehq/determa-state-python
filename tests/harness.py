@@ -34,6 +34,9 @@ SUPPORTED = frozenset(
         "10-history-deep",
         "11-history-shallow",
         "12-guarded-list",
+        "13-spawn-publish",
+        "14-subscription",
+        "15-external-env-refresh",
     }
 )
 
