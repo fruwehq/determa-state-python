@@ -8,7 +8,7 @@ The normative `SPEC.md`, the JSON Schema for machine YAML, and the cross-languag
 Python and is correct **iff it passes the conformance suite**.
 
 Status: **passing the full conformance suite** — all 22 engine cases
-(`conformance/01`–`22`) plus `conformance/cli/01`. Implements YAML 1.2 loading
+(`conformance/01`–`22`) plus `conformance/cli/01`–`02`. Implements YAML 1.2 loading
 + validation, the full statechart semantics (RTC dispatch, hierarchy, orthogonal
 regions + `done`, shallow/deep history, esvs, CEL guards, structured actions,
 active objects + bus, defer, timers, faults), static contracts, snapshot
@@ -42,6 +42,37 @@ passes the suite**.
   `state_config`) to **Mermaid** `stateDiagram-v2` (SPEC §12), behind a pluggable
   exporter interface so more formats (PlantUML, SCXML, …) can be added later.
 - A test harness that runs the upstream conformance cases against this engine.
+
+## Use as a library
+The CLI (`harel …`) is a thin wrapper over a programmatic API; an engine can be
+embedded in a host program **without** the CLI or the file-backed store (SPEC §2):
+
+```python
+import harel
+
+defs = harel.load_definitions(open("gate.yaml").read())
+harel.validate(defs[0].raw)                     # raises ValidationError if invalid
+
+host = harel.Host()
+host.register_all(defs)
+inst = host.create_root(host.machines["gate"], "g1", external={"fare": 50})
+host.run_to_quiescence()
+
+host.deliver("g1", "coin", {"amount": 100})     # typed event; False if rejected
+host.run_to_quiescence()
+assert inst.active_leaf_names() == ["unlocked"]
+assert inst.resolved_esvs()["fare"] == 50
+assert inst.status is harel.Status.ACTIVE
+
+host.advance("30s")                             # virtual clock
+snaps = host.snapshot_all()                     # persist / round-trip (§8)
+host.restore_all(snaps)
+```
+
+The public surface is everything exported from the top-level `harel` package
+(`harel.__all__`): `Host`, `Instance`, `Definition`, `Machine`, `Status`, `Event`,
+`load_definitions` / `load_definition`, `validate` / `collect_errors`, and the
+error types. See [`tests/test_library_api.py`](tests/test_library_api.py).
 
 ## Layout
 - `src/harel/` — the package.
