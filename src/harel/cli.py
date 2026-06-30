@@ -24,7 +24,7 @@ from .engine import Host
 from .errors import HarelError
 from .instance import Instance, Status
 from .model import Machine
-from .store import Store, StoreState
+from .store import Store, StoreState, open_store
 
 # Exit codes (SPEC §13.2).
 EXIT_OK = 0
@@ -39,7 +39,7 @@ def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
     store_dir = args.store or os.environ.get("HAREL_STORE", "./.harel")
     try:
-        return int(args.cmd(args, Store(store_dir)))
+        return int(args.cmd(args, open_store(store_dir)))
     except HarelError as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_OTHER
@@ -47,7 +47,11 @@ def main(argv: list[str] | None = None) -> int:
 
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="harel", description="harel statechart engine")
-    p.add_argument("--store", default=None, help="store directory (default ./.harel)")
+    p.add_argument(
+        "--store",
+        default=None,
+        help="store spec: file:<dir> | mem: | sqlite:<path> (default ./.harel)",
+    )
     p.add_argument(
         "--version", action="version", version=f"harel {_pkg_version()}"
     )
