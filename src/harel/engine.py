@@ -9,7 +9,7 @@ records published/spawned events for the conformance harness.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, cast
 
 from . import cel, values
 from .definition import Definition
@@ -26,6 +26,7 @@ class Host:
         self.spawned: list[str] = []  # child defIds, in order
         self._spawn_counters: dict[str, int] = {}
         self.now: int = 0  # virtual clock, in milliseconds (SPEC §5.9)
+        self.mode: str = "auto"  # processing mode, auto|manual (SPEC §14)
         self._seq: int = 0
 
     # --- registration / creation -------------------------------------------
@@ -70,6 +71,15 @@ class Host:
         payload: dict[str, Any] | None = None,
     ) -> bool:
         """Validate and enqueue an event; return False if rejected (§4.3)."""
+        return self.inject(instance_id, event_type, payload)
+
+    def inject(
+        self,
+        instance_id: str,
+        event_type: str,
+        payload: dict[str, Any] | None = None,
+    ) -> bool:
+        """Validate and enqueue without processing, in either mode (SPEC §14)."""
         inst = self.instances[instance_id]
         ok, _reason = self.validate_event(inst.machine, event_type, payload)
         if not ok:
@@ -78,6 +88,65 @@ class Host:
         return True
 
     # --- execution ----------------------------------------------------------
+    def maybe_run(self) -> None:
+        """Run all instances to quiescence in auto mode only (SPEC §14)."""
+        if self.mode == "auto":
+            self.run_to_quiescence()
+
+    def step(self, instance: Instance | str, n: int = 1) -> list[dict[str, Any]]:
+        """Process exactly ``n`` RTC steps of one instance (SPEC §14).
+
+        Returns one per-step record per step taken:
+        ``{ event, transition, entered, exited, published, spawned, faulted }``.
+        Stops early if the instance faults or its queue drains.
+        """
+        inst = instance if isinstance(instance, Instance) else self.instances[instance]
+        records: list[dict[str, Any]] = []
+        for _ in range(n):
+            if inst.status is not Status.ACTIVE or not inst.queue:
+                break
+            ev = inst.queue.popleft()
+            before = set(inst.active_leaf_names())
+            pub_before = len(self.published)
+            sp_before = len(self.spawned)
+            inst._last_target = None  # noqa: SLF001
+            inst.step(ev)
+            after = set(inst.active_leaf_names())
+            faulted = cast(Status, inst.status) is Status.FAULTED
+            records.append(
+                {
+                    "event": ev.type,
+                    "transition": inst._last_target,  # noqa: SLF001
+                    "entered": sorted(after - before),
+                    "exited": sorted(before - after),
+                    "published": list(self.published[pub_before:]),
+                    "spawned": list(self.spawned[sp_before:]),
+                    "faulted": faulted,
+                }
+            )
+        return records
+
+    def inspect(self, instance: Instance | str) -> dict[str, Any]:
+        """Full internal state for debugging, beyond ``state`` (SPEC §14)."""
+        inst = instance if isinstance(instance, Instance) else self.instances[instance]
+        out: dict[str, Any] = {
+            "status": inst.status.value,
+            "config": inst.active_leaf_names(),
+            "esvs": inst.resolved_esvs(),
+            "queue": [Instance._event_to_snap(e) for e in inst.queue],
+            "deferred": [Instance._event_to_snap(e) for e in inst.deferred],
+            "timers": [
+                {"fire_at": t["fire_at"], "state_path": t["state_path"], "spec": t["spec"]}
+                for t in inst.timers
+            ],
+            "history": {
+                p: {"kind": k, "data": d} for p, (k, d) in inst.history.items()
+            },
+        }
+        if inst.dead_letter:
+            out["dead_letter"] = list(inst.dead_letter)
+        return out
+
     def next_seq(self) -> int:
         self._seq += 1
         return self._seq

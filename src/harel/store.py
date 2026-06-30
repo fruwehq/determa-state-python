@@ -21,6 +21,7 @@ class StoreState:
     instances: list[dict[str, Any]] = field(default_factory=list)
     now: int = 0
     spawn_counters: dict[str, int] = field(default_factory=dict)
+    mode: str = "auto"  # processing mode, auto|manual (SPEC §14)
 
 
 class Store:
@@ -45,6 +46,7 @@ class Store:
             instances=instances,
             now=int(meta.get("now", 0)),
             spawn_counters=dict(meta.get("spawn_counters") or {}),
+            mode=str(meta.get("mode", "auto")),
         )
 
     def save(self, state: StoreState) -> None:
@@ -57,7 +59,12 @@ class Store:
         )
         (self.path / "meta.json").write_text(
             json.dumps(
-                {"now": state.now, "spawn_counters": state.spawn_counters}, indent=2
+                {
+                    "now": state.now,
+                    "spawn_counters": state.spawn_counters,
+                    "mode": state.mode,
+                },
+                indent=2,
             ),
             encoding="utf-8",
         )

@@ -109,6 +109,26 @@ def _build_parser() -> argparse.ArgumentParser:
     run = add("run")
     run.add_argument("source", nargs="?", default="-", help="'-' for stdin, or an NDJSON file")
     run.set_defaults(cmd=cmd_run)
+
+    md = add("mode")
+    md.add_argument("mode", nargs="?", choices=["auto", "manual"])
+    md.set_defaults(cmd=cmd_mode)
+
+    ij = add("inject")
+    ij.add_argument("instance")
+    ij.add_argument("event")
+    ij.add_argument("--payload", action="append", default=[])
+    ij.add_argument("--payload-json", default=None)
+    ij.set_defaults(cmd=cmd_inject)
+
+    sp = add("step")
+    sp.add_argument("instance")
+    sp.add_argument("--steps", type=int, default=1)
+    sp.set_defaults(cmd=cmd_step)
+
+    ip = add("inspect")
+    ip.add_argument("instance")
+    ip.set_defaults(cmd=cmd_inspect)
     return p
 
 
@@ -116,6 +136,7 @@ def _build_parser() -> argparse.ArgumentParser:
 def _build_host(state: StoreState) -> Host:
     host = Host()
     host.now = state.now
+    host.mode = state.mode
     host._spawn_counters = dict(state.spawn_counters)  # noqa: SLF001
     for text in state.defs.values():
         host.register_all(load_definitions(text))
@@ -126,6 +147,7 @@ def _build_host(state: StoreState) -> Host:
 def _persist(store: Store, state: StoreState, host: Host) -> None:
     state.instances = host.snapshot_all()
     state.now = host.now
+    state.mode = host.mode
     state.spawn_counters = dict(host._spawn_counters)  # noqa: SLF001
     store.save(state)
 
@@ -194,7 +216,7 @@ def cmd_send(args: argparse.Namespace, store: Store) -> int:
     if not host.deliver(args.instance, args.event, payload):
         print(f"rejected: {args.event}", file=sys.stderr)
         return EXIT_VALIDATION
-    host.run_to_quiescence()
+    host.maybe_run()
     if args.json:
         obj = _state_json(host, host.instances[args.instance])
         obj["published"] = host.published[before:]
@@ -210,7 +232,7 @@ def cmd_advance(args: argparse.Namespace, store: Store) -> int:
     state = store.load()
     host = _build_host(state)
     host.advance(args.duration)
-    host.run_to_quiescence()
+    host.maybe_run()
     if args.json:
         print(json.dumps({"now": host.now}))
     _persist(store, state, host)
@@ -225,7 +247,7 @@ def cmd_env(args: argparse.Namespace, store: Store) -> int:
         return EXIT_NOT_FOUND
     changed = _parse_csv_kv(args.changed)
     host.deliver(args.instance, "env", {"changed": changed})
-    host.run_to_quiescence()
+    host.maybe_run()
     _print_state(args, host, host.instances[args.instance])
     _persist(store, state, host)
     return EXIT_OK
@@ -303,6 +325,76 @@ def cmd_export(args: argparse.Namespace, store: Store) -> int:
         state_config = sorted(inst.config)
     print(export_mod.export(machine, format=args.format, state_config=state_config))
     return EXIT_OK
+
+
+# --- introspection & stepping (SPEC §14) ------------------------------------
+def cmd_mode(args: argparse.Namespace, store: Store) -> int:
+    state = store.load()
+    if args.mode is not None:
+        state.mode = args.mode
+        store.save(state)
+    if args.json:
+        print(json.dumps({"mode": state.mode}))
+    else:
+        print(state.mode)
+    return EXIT_OK
+
+
+def cmd_inject(args: argparse.Namespace, store: Store) -> int:
+    state = store.load()
+    host = _build_host(state)
+    inst = host.instances.get(args.instance)
+    if inst is None:
+        print(f"no such instance: {args.instance}", file=sys.stderr)
+        return EXIT_NOT_FOUND
+    payload = _build_payload(args, inst.machine)
+    if not host.inject(args.instance, args.event, payload):
+        print(f"rejected: {args.event}", file=sys.stderr)
+        return EXIT_VALIDATION
+    _print_state(args, host, inst)
+    _persist(store, state, host)
+    return EXIT_OK
+
+
+def cmd_step(args: argparse.Namespace, store: Store) -> int:
+    state = store.load()
+    host = _build_host(state)
+    inst = host.instances.get(args.instance)
+    if inst is None:
+        print(f"no such instance: {args.instance}", file=sys.stderr)
+        return EXIT_NOT_FOUND
+    records = host.step(inst, args.steps)
+    if args.json:
+        obj = _state_json(host, inst)
+        obj["steps"] = records
+        print(json.dumps(obj))
+    _persist(store, state, host)
+    if inst.status is Status.FAULTED:
+        return EXIT_FAULTED
+    return EXIT_OK
+
+
+def cmd_inspect(args: argparse.Namespace, store: Store) -> int:
+    state = store.load()
+    host = _build_host(state)
+    inst = host.instances.get(args.instance)
+    if inst is None:
+        print(f"no such instance: {args.instance}", file=sys.stderr)
+        return EXIT_NOT_FOUND
+    if args.json:
+        obj = {"instance": inst.id, **host.inspect(inst)}
+        print(json.dumps(obj))
+    else:
+        _print_inspect(inst, host.inspect(inst))
+    return EXIT_OK
+
+
+def _print_inspect(inst: Instance, info: dict[str, Any]) -> None:
+    print(
+        f"{inst.id}\t{info['status']}\t{info['config']}\t"
+        f"queue={len(info['queue'])} deferred={len(info['deferred'])} "
+        f"timers={len(info['timers'])}"
+    )
 
 
 # --- batch / streaming mode (SPEC §13.7) ------------------------------------
