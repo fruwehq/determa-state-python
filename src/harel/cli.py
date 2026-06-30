@@ -9,9 +9,11 @@ all to quiescence, and persists. Diagnostics go to stderr; the result to stdout.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import sys
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from typing import Any, cast
 
@@ -103,6 +105,10 @@ def _build_parser() -> argparse.ArgumentParser:
     r = add("restore")
     r.add_argument("snapshot")
     r.set_defaults(cmd=cmd_restore)
+
+    run = add("run")
+    run.add_argument("source", nargs="?", default="-", help="'-' for stdin, or an NDJSON file")
+    run.set_defaults(cmd=cmd_run)
     return p
 
 
@@ -297,6 +303,76 @@ def cmd_export(args: argparse.Namespace, store: Store) -> int:
         state_config = sorted(inst.config)
     print(export_mod.export(machine, format=args.format, state_config=state_config))
     return EXIT_OK
+
+
+# --- batch / streaming mode (SPEC §13.7) ------------------------------------
+def cmd_run(args: argparse.Namespace, store: Store) -> int:
+    """Drive many commands from NDJSON stdin against one store + virtual clock.
+
+    Each input line is a JSON array of argv tokens (one §13.3 command). For each
+    line, exactly one NDJSON result object is written to stdout in input order:
+    ``{ "ok": bool, "exit": int, "result": <value>, "error": {"message": str}? }``.
+    A failing line does not abort the stream; the process exit code is the first
+    non-zero line exit, else 0.
+    """
+    if args.source in (None, "-"):
+        lines = sys.stdin.read().splitlines()
+    else:
+        lines = Path(args.source).read_text(encoding="utf-8").splitlines()
+    parser = _build_parser()
+    first_nonzero = 0
+    for raw in lines:
+        line = raw.strip()
+        if not line:
+            continue
+        exit_code, result, error = _run_one(parser, store, line)
+        record: dict[str, Any] = {"ok": exit_code == 0, "exit": exit_code, "result": result}
+        if error is not None:
+            record["error"] = {"message": error}
+        print(json.dumps(record), flush=True)
+        if exit_code != 0 and first_nonzero == 0:
+            first_nonzero = exit_code
+    return first_nonzero
+
+
+def _run_one(
+    parser: argparse.ArgumentParser, store: Store, line: str
+) -> tuple[int, Any, str | None]:
+    """Execute one batch line; return (exit_code, result_value, error_message)."""
+    try:
+        argv = json.loads(line)
+        if not isinstance(argv, list) or not all(isinstance(t, str) for t in argv):
+            raise ValueError("each line must be a JSON array of strings")
+    except (ValueError, json.JSONDecodeError) as exc:
+        return EXIT_USAGE, None, str(exc)
+
+    out, err = io.StringIO(), io.StringIO()
+    try:
+        with redirect_stdout(out), redirect_stderr(err):
+            sub = parser.parse_args([*argv, "--json"])
+            if getattr(sub, "command", None) == "run":
+                return EXIT_USAGE, None, "nested 'run' is not allowed in batch mode"
+            rc = int(sub.cmd(sub, store))
+    except SystemExit as exc:  # argparse usage error
+        code = exc.code if isinstance(exc.code, int) else EXIT_USAGE
+        return code, None, (err.getvalue().strip() or "usage error")
+    except HarelError as exc:
+        return EXIT_OTHER, None, str(exc)
+
+    result = _parse_captured(out.getvalue())
+    message = (err.getvalue().strip() or None) if rc != 0 else None
+    return rc, result, message
+
+
+def _parse_captured(text: str) -> Any:
+    """A command's captured stdout as JSON when it is JSON, else the raw string/None."""
+    s = text.strip()
+    if not s:
+        return None
+    try:
+        return json.loads(s)
+    except json.JSONDecodeError:
+        return s
 
 
 # --- output helpers ---------------------------------------------------------
