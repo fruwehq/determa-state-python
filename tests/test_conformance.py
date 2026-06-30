@@ -59,7 +59,7 @@ def test_bundled_schema_matches_submodule() -> None:
 
 def test_suite_present() -> None:
     assert len(engine_cases()) == 22, "expected 22 engine cases"
-    assert len(cli_cases()) == 1, "expected 1 CLI case"
+    assert len(cli_cases()) == 2, "expected 2 CLI cases"
 
 
 @pytest.mark.parametrize("case", engine_cases(), ids=lambda c: c.name)

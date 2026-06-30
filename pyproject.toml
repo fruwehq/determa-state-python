@@ -37,6 +37,7 @@ packages = ["src/harel"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+extend-exclude = ["vendor"]  # the harel spec repo is a vendored submodule, not ours to lint
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "W", "C4"]
