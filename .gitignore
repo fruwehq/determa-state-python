@@ -12,3 +12,4 @@ venv/
 .coverage
 .DS_Store
 .harel/
+.cache/

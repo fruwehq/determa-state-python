@@ -1,14 +1,16 @@
 """Conformance-suite harness helpers.
 
-The suite is consumed from the ``vendor/harel`` git submodule (SPEC §9). These
-helpers locate the suite, enumerate cases, and run engine cases against this
-implementation (create the root as id ``root``, per step ``send``/``advance``,
-run all instances to quiescence, then check ``expect``).
+The language-agnostic suite (SPEC §9) lives in ``fruwehq/harel-conformance`` and is
+fetched at the matching release tag by ``conftest.py`` (no git submodule). These helpers
+locate the fetched suite, enumerate cases, and run engine cases against this
+implementation (create the root as id ``root``, per step ``send``/``advance``, run all
+instances to quiescence, then check ``expect``).
 """
 
 from __future__ import annotations
 
 import importlib.util
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,10 +20,19 @@ from typing import Any
 from harel import Host
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-# The spec repo (fruwehq/harel) is pinned only for the schema-drift check; the
-# language-agnostic conformance suite lives in fruwehq/harel-conformance.
-SPEC_DIR = REPO_ROOT / "vendor" / "harel"
-CONFORMANCE_DIR = REPO_ROOT / "vendor" / "harel-conformance" / "conformance"
+
+
+def conformance_root() -> Path:
+    """Root of the fetched ``harel-conformance`` checkout.
+
+    ``HAREL_CONFORMANCE_DIR`` overrides with a local checkout (offline/dev); otherwise
+    the cache populated by ``conftest.py`` is used.
+    """
+    env = os.environ.get("HAREL_CONFORMANCE_DIR")
+    return Path(env) if env else REPO_ROOT / ".cache" / "harel-conformance"
+
+
+CONFORMANCE_DIR = conformance_root() / "conformance"
 
 # Cases the engine is known to pass. Others are skipped until their features
 # land; extend this set as build-order steps are completed.
@@ -78,6 +89,8 @@ def _machine_files(case_dir: Path) -> list[Path]:
 
 def engine_cases() -> list[EngineCase]:
     """All engine conformance cases (``conformance/01``–``22``), sorted."""
+    if not CONFORMANCE_DIR.exists():
+        return []
     cases: list[EngineCase] = []
     for case_dir in sorted(p for p in CONFORMANCE_DIR.iterdir() if p.is_dir()):
         machine_files = _machine_files(case_dir)
@@ -108,8 +121,8 @@ def run_cli_case(case_dir: Path) -> None:
     """Run a CLI case **black-box** via the spec repo's reference runner (§13.6).
 
     Invokes this package as a subprocess (``python -m harel``), so packaging and
-    entry-point regressions are caught — not an in-process import. Delegating to
-    ``vendor/harel/conformance/run_cli.py`` also avoids harness drift.
+    entry-point regressions are caught — not an in-process import. Delegating to the
+    suite's ``conformance/run_cli.py`` also avoids harness drift.
     """
     runner = _load_cli_runner()
     rc = runner.main(

@@ -7,6 +7,9 @@ The normative `SPEC.md`, the JSON Schema for machine YAML, and the cross-languag
 **conformance suite** live in the spec repo. This repository implements that spec in
 Python and is correct **iff it passes the conformance suite**.
 
+Implements the **harel spec v0.0.1** (early alpha; all fruwehq harel repos share one
+[synchronized version](https://github.com/fruwehq/harel)).
+
 Status: **passing the full conformance suite** — all 22 engine cases
 (`conformance/01`–`22`) plus `conformance/cli/01`–`02`. Implements YAML 1.2 loading
 + validation, the full statechart semantics (RTC dispatch, hierarchy, orthogonal
@@ -19,13 +22,19 @@ the build order in [issue #3][issue].
 
 ## Conformance suite
 
-The cross-language **conformance suite** is consumed as a pinned git submodule at
-[`vendor/harel-conformance`](vendor/harel-conformance) (single source of truth — no
-copy-paste drift); the harness in `tests/` discovers `conformance/*/` from there. The
-normative `SPEC.md` and JSON Schema live in
-[`fruwehq/harel`](https://github.com/fruwehq/harel), pinned at
-[`vendor/harel`](vendor/harel) solely for the schema-drift check. This repository is
-correct **iff it passes the suite**.
+The cross-language **conformance suite** is the single source of truth for correctness;
+this repository is correct **iff it passes it**. The suite lives in
+[`fruwehq/harel-conformance`](https://github.com/fruwehq/harel-conformance); the test
+harness **fetches it at the matching release tag** (`v0.0.1`) into a gitignored
+`.cache/` — no git submodule. The normative `SPEC.md` and JSON Schema live in
+[`fruwehq/harel`](https://github.com/fruwehq/harel); the schema-drift test fetches the
+schema at the same tag.
+
+For **offline** work, point the harness at a local checkout:
+```
+export HAREL_CONFORMANCE_DIR=/path/to/harel-conformance   # the suite
+export HAREL_SPEC_DIR=/path/to/harel                        # the schema (optional)
+```
 
 ## Scope (per the spec)
 - Load and validate machine YAML against `schema/machine.schema.json`, parsed under
@@ -82,10 +91,9 @@ error types. See [`tests/test_library_api.py`](tests/test_library_api.py).
 
 ## Develop
 ```
-git submodule update --init      # fetch the conformance suite + schema (two submodules)
 python -m venv .venv && . .venv/bin/activate
 pip install -e '.[dev]'
-ruff check . && mypy src/harel && pytest
+ruff check . && mypy src/harel && pytest   # the suite is fetched into .cache/ on first run
 ```
 
 ## License
