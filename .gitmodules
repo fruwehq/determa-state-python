@@ -1,3 +1,6 @@
 [submodule "vendor/harel"]
 	path = vendor/harel
 	url = https://github.com/fruwehq/harel.git
+[submodule "vendor/harel-conformance"]
+	path = vendor/harel-conformance
+	url = https://github.com/fruwehq/harel-conformance.git

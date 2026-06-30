@@ -21,7 +21,7 @@ from harel import load_definitions
 from harel.validator import schema as bundled_schema
 
 from .harness import (
-    SUITE_DIR,
+    SPEC_DIR,
     SUPPORTED,
     cli_cases,
     engine_cases,
@@ -52,8 +52,8 @@ def test_machine_file_loads_and_validates(path: Path) -> None:
 
 def test_bundled_schema_matches_submodule() -> None:
     """The engine's bundled schema must equal the spec repo's schema (no drift)."""
-    upstream = SUITE_DIR / "schema" / "machine.schema.json"
-    assert upstream.exists(), "harel submodule not initialized"
+    upstream = SPEC_DIR / "schema" / "machine.schema.json"
+    assert upstream.exists(), "harel (spec) submodule not initialized"
     assert json.loads(upstream.read_text(encoding="utf-8")) == bundled_schema()
 
 

@@ -18,8 +18,10 @@ from typing import Any
 from harel import Host
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-SUITE_DIR = REPO_ROOT / "vendor" / "harel"
-CONFORMANCE_DIR = SUITE_DIR / "conformance"
+# The spec repo (fruwehq/harel) is pinned only for the schema-drift check; the
+# language-agnostic conformance suite lives in fruwehq/harel-conformance.
+SPEC_DIR = REPO_ROOT / "vendor" / "harel"
+CONFORMANCE_DIR = REPO_ROOT / "vendor" / "harel-conformance" / "conformance"
 
 # Cases the engine is known to pass. Others are skipped until their features
 # land; extend this set as build-order steps are completed.
@@ -123,7 +125,7 @@ def run_cli_case(case_dir: Path) -> None:
 
 
 def _load_cli_runner() -> ModuleType:
-    path = SUITE_DIR / "conformance" / "run_cli.py"
+    path = CONFORMANCE_DIR / "run_cli.py"
     spec = importlib.util.spec_from_file_location("harel_cli_runner", path)
     assert spec is not None and spec.loader is not None, f"runner not found: {path}"
     mod = importlib.util.module_from_spec(spec)

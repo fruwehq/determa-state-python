@@ -19,11 +19,13 @@ the build order in [issue #3][issue].
 
 ## Conformance suite
 
-The normative `SPEC.md`, JSON Schema, and cross-language **conformance suite**
-are consumed as a pinned git submodule at [`vendor/harel`](vendor/harel)
-(single source of truth — no copy-paste drift). The harness lives in `tests/`
-and discovers `conformance/*/` from there. This repository is correct **iff it
-passes the suite**.
+The cross-language **conformance suite** is consumed as a pinned git submodule at
+[`vendor/harel-conformance`](vendor/harel-conformance) (single source of truth — no
+copy-paste drift); the harness in `tests/` discovers `conformance/*/` from there. The
+normative `SPEC.md` and JSON Schema live in
+[`fruwehq/harel`](https://github.com/fruwehq/harel), pinned at
+[`vendor/harel`](vendor/harel) solely for the schema-drift check. This repository is
+correct **iff it passes the suite**.
 
 ## Scope (per the spec)
 - Load and validate machine YAML against `schema/machine.schema.json`, parsed under
@@ -80,7 +82,7 @@ error types. See [`tests/test_library_api.py`](tests/test_library_api.py).
 
 ## Develop
 ```
-git submodule update --init      # fetch the conformance suite
+git submodule update --init      # fetch the conformance suite + schema (two submodules)
 python -m venv .venv && . .venv/bin/activate
 pip install -e '.[dev]'
 ruff check . && mypy src/harel && pytest
