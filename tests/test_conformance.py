@@ -86,7 +86,7 @@ def test_suite_present() -> None:
     if not CONFORMANCE_DIR.exists():
         pytest.skip("conformance suite not fetched (offline; set HAREL_CONFORMANCE_DIR)")
     assert len(engine_cases()) == 22, "expected 22 engine cases"
-    assert len(cli_cases()) == 2, "expected 2 CLI cases"
+    assert len(cli_cases()) == 3, "expected 3 CLI cases"
 
 
 @pytest.mark.parametrize("case", engine_cases(), ids=lambda c: c.name)

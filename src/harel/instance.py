@@ -73,6 +73,7 @@ class Instance:
         self.external: dict[str, Any] = dict(external or {})
         self.current_event: Event | None = None
         self._pending_terminate = False
+        self._last_target: str | None = None  # target of the last transition (§14)
         if auto_enter:
             self._enter_top()
 
@@ -295,9 +296,11 @@ class Instance:
         actions = transition.get("action") or []
         if target_ref is None:
             # internal transition: actions only, no exit/entry (SPEC §5.5)
+            self._last_target = None
             self.run_actions(actions, owner, event)
             return
         target = self.machine.resolve_target(owner, target_ref)
+        self._last_target = target.name
         local = bool(transition.get("local"))
         if local:
             lca = owner  # the containing composite is not exited/re-entered
