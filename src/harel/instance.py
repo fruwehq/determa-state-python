@@ -10,6 +10,7 @@ re-init on re-entry) and hierarchical scoping (inner shadows outer) live here.
 
 from __future__ import annotations
 
+import logging
 from collections import deque
 from dataclasses import dataclass
 from enum import StrEnum
@@ -19,6 +20,8 @@ from . import cel, values
 from .cel import CelError
 from .errors import HarelError
 from .model import Machine, State
+
+log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from .engine import Host
@@ -541,6 +544,7 @@ class Instance:
 
     def _handle_fault(self, event: Event, exc: Exception) -> None:
         self.dead_letter.append({"event": event.type, "error": str(exc)})
+        log.warning("dead-letter instance=%s event=%s: %s", self.id, event.type, exc)
         error_event = Event("error", {"event": event.type, "error": str(exc)})
         # If some active state handles the reserved `error` event, dispatch it
         # (the instance recovers); otherwise the instance faults.
@@ -548,6 +552,7 @@ class Instance:
         handled = bool(self._collect_enabled(error_event))
         self.current_event = None
         if not handled:
+            log.warning("instance %s faulted: no handler for the error event", self.id)
             self.status = Status.FAULTED
             return
         snapshot = self._snapshot()
@@ -555,6 +560,7 @@ class Instance:
             changed = self.dispatch(error_event)
         except (CelError, HarelError):
             self._restore(snapshot)
+            log.warning("instance %s faulted: error handler itself faulted", self.id)
             self.status = Status.FAULTED
             return
         if changed:

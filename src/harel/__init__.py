@@ -7,6 +7,8 @@ implements that spec; it is correct iff it passes the conformance suite.
 
 from __future__ import annotations
 
+import logging
+
 from . import yaml12
 from .cel import CelError
 from .definition import Definition, load_definition, load_definitions
@@ -42,3 +44,7 @@ __all__ = [
 ]
 
 __version__ = "0.0.1"
+
+# Diagnostic logging under the ``harel`` logger; silent unless the host app
+# configures logging (e.g. ``logging.basicConfig(level=logging.DEBUG)``).
+logging.getLogger("harel").addHandler(logging.NullHandler())

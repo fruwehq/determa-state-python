@@ -96,6 +96,16 @@ import sys, harel
 host = harel.Host(observer=harel.JsonlObserver(sys.stdout))  # one JSON line per step
 ```
 
+The Observer is *domain* observability (what the machine did). For *operational*
+diagnostics the engine also emits **standard-library logging** under the `harel` logger
+(dispatch/transition at `DEBUG`, faults/dead-letter at `WARNING`). It is silent by
+default (a `NullHandler` is attached); enable it from the host app:
+
+```python
+import logging
+logging.basicConfig(level=logging.DEBUG)   # or logging.getLogger("harel").setLevel(...)
+```
+
 ## Layout
 - `src/harel/` — the package.
 - `tests/` — unit tests and the conformance harness.
