@@ -11,6 +11,7 @@ otherwise ``simple`` (or ``final`` if declared).
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -18,6 +19,49 @@ from .definition import Definition
 from .errors import ErrorRecord, ValidationError
 
 TYPE_ORDER = ("simple", "composite", "orthogonal", "final")
+
+
+def inline_submachines(
+    node: dict[str, Any], registry: dict[str, dict[str, Any]], stack: frozenset[str] = frozenset()
+) -> dict[str, Any]:
+    """Resolve ``submachine`` references into an inlined state tree (SPEC §5.6.1).
+
+    A state with ``submachine: <id>`` becomes a composite whose single child is the
+    referenced definition's ``top`` (recursively inlined), marked as an esv-scope
+    boundary and carrying the ``with:`` seeding. ``registry`` maps definition id -> its
+    raw ``top``. Raises on an unknown or cyclic reference.
+    """
+    if not isinstance(node, dict):
+        return node
+    if "submachine" in node:
+        sub_id = node["submachine"]
+        if sub_id not in registry:
+            raise ValidationError(
+                [ErrorRecord(path="/submachine", message=f"unknown submachine '{sub_id}'")]
+            )
+        if sub_id in stack:
+            raise ValidationError(
+                [ErrorRecord(path="/submachine", message=f"cyclic submachine '{sub_id}'")]
+            )
+        child = copy.deepcopy(inline_submachines(registry[sub_id], registry, stack | {sub_id}))
+        child["_sm_root"] = True
+        child["_sm_with"] = dict(node.get("with") or {})
+        out = {k: v for k, v in node.items() if k not in ("submachine", "with")}
+        out["states"] = {sub_id: child}
+        out["initial"] = {"transition_to": sub_id}
+        return out
+    def _inline_states(states: dict[str, Any]) -> dict[str, Any]:
+        return {k: inline_submachines(v, registry, stack) for k, v in states.items()}
+
+    out = dict(node)
+    if isinstance(node.get("states"), dict):
+        out["states"] = _inline_states(node["states"])
+    if isinstance(node.get("regions"), list):
+        out["regions"] = [
+            {**r, "states": _inline_states(r.get("states") or {})} if isinstance(r, dict) else r
+            for r in node["regions"]
+        ]
+    return out
 
 
 @dataclass
@@ -32,6 +76,8 @@ class State:
     children: dict[str, State] = field(default_factory=dict)
     declares_esvs: set[str] = field(default_factory=set)
     region_index: int | None = None  # 0-based region for orthogonal substates
+    is_sm_boundary: bool = False  # root of an inlined submachine (esv-scope boundary, §5.6.1)
+    sm_with: dict[str, Any] = field(default_factory=dict)  # `with:` seeding for a submachine root
 
 
 def _infer_type(raw: dict[str, Any]) -> str:
@@ -50,13 +96,13 @@ def _infer_type(raw: dict[str, Any]) -> str:
 class Machine:
     """A resolved machine definition (navigable state tree + lookups)."""
 
-    def __init__(self, definition: Definition) -> None:
+    def __init__(self, definition: Definition, top_override: dict[str, Any] | None = None) -> None:
         self.definition = definition
         self.id = definition.id
         self.version = definition.version
         self.format = definition.format
         self._counter = 0
-        top_raw = definition.top
+        top_raw = top_override if top_override is not None else definition.top
         self.top = self._build("top", "top", None, 0, top_raw, None)
         self.by_path: dict[str, State] = {}
         self._index(self.top)
@@ -86,6 +132,9 @@ class Machine:
         )
         esvs = raw.get("esvs") or {}
         state.declares_esvs = set(esvs.keys())
+        state.is_sm_boundary = bool(raw.get("_sm_root"))
+        if isinstance(raw.get("_sm_with"), dict):
+            state.sm_with = raw["_sm_with"]
         for cname, cdef in (raw.get("states") or {}).items():
             state.children[cname] = self._build(
                 cname, f"{path}.{cname}", state, depth + 1, cdef, region_index

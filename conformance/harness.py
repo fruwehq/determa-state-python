@@ -66,6 +66,8 @@ SUPPORTED = frozenset(
         "26-unreachable",
         "27-dead-branch",
         "28-reachable-ok",
+        "29-submachine",
+        "30-submachine-interrupt",
     }
 )
 

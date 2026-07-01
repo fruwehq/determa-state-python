@@ -91,10 +91,19 @@ class Instance:
         esvs = state.raw.get("esvs")
         if not esvs:
             return
+        # A submachine root seeds its `external` esvs from `with:` (CEL over the parent
+        # scope), not from the root instance's external map (§5.6.1).
+        seeded: dict[str, Any] = {}
+        if state.is_sm_boundary and state.sm_with and state.parent is not None:
+            parent_scope = self.scope(state.parent, self.current_event)
+            seeded = {k: cel.evaluate(v, parent_scope) for k, v in state.sm_with.items()}
         live: dict[str, Any] = {}
         for var, decl in esvs.items():
             if decl.get("external"):
-                live[var] = self.external.get(var, decl.get("init"))
+                if var in seeded:
+                    live[var] = seeded[var]
+                else:
+                    live[var] = self.external.get(var, decl.get("init"))
             elif "init" in decl:
                 live[var] = decl["init"]
             else:
@@ -105,7 +114,16 @@ class Instance:
         self.esv_values.pop(state.path, None)
 
     def _scope_chain(self, root: State) -> list[State]:
-        return [root, *self.machine.proper_ancestors(root)]
+        # A submachine has an isolated esv scope (§5.6.1): the chain stops at the
+        # submachine root — the parent's esvs are not visible inside it.
+        chain = [root]
+        cur = root
+        while not cur.is_sm_boundary and cur.parent is not None:
+            cur = cur.parent
+            chain.append(cur)
+            if cur.is_sm_boundary:
+                break
+        return chain
 
     def scope(self, root: State, event: Event | None) -> dict[str, Any]:
         """Resolved in-scope bindings for a guard/action (inner shadows outer)."""
@@ -136,6 +154,8 @@ class Instance:
                     raise HarelError(f"'{name}' must be {decl['type']}")
                 live[name] = value
                 return
+            if cur.is_sm_boundary:  # do not assign across the submachine isolation boundary
+                break
             cur = cur.parent
         raise HarelError(f"no in-scope esv '{name}' to assign")
 
