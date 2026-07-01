@@ -85,6 +85,17 @@ The public surface is everything exported from the top-level `harel` package
 `load_definitions` / `load_definition`, `validate` / `collect_errors`, and the
 error types. See [`tests/test_library_api.py`](tests/test_library_api.py).
 
+### Observing transitions (SPEC §8)
+Pass an **observer** — a passive callback invoked once per RTC step (automatic *or*
+manual) with `{ instance, event, transition, entered, exited, published, spawned,
+faulted }`. Built-ins: `JsonlObserver(stream)` (a drop-in transition log) and
+`CollectingObserver` (records to a list).
+
+```python
+import sys, harel
+host = harel.Host(observer=harel.JsonlObserver(sys.stdout))  # one JSON line per step
+```
+
 ## Layout
 - `src/harel/` — the package.
 - `tests/` — unit tests and the conformance harness.
