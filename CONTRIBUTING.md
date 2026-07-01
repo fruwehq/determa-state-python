@@ -70,14 +70,25 @@ reuses it. To force a refresh, delete `.cache/`.
 
 ## Versioning
 
-The version source of truth is **`pyproject.toml`** (`version = "0.0.1"`); the package
-exports it as `harel.__version__`. The package version **is** the implemented harel spec
-version.
+The version source of truth is **`pyproject.toml`** (`version = …`); the package derives
+`harel.__version__` from the installed distribution metadata (no second copy to keep in
+sync). The package version **is** the implemented harel spec version.
 
 > harel, harel-conformance, and harel-python share one synchronized SemVer version
 > (currently pre-1.0 `0.0.x`). A release tags all three `vX.Y.Z` in lockstep; an
 > implementation declares "implements harel spec vX.Y.Z" and pins the conformance suite
 > at that tag.
+
+### Releasing `vX.Y.Z` (lockstep)
+1. Land all spec / conformance / implementation changes on the three `main` branches.
+2. Bump the version in **`pyproject.toml`** (here) and the `VERSION` files in `harel` and
+   `harel-conformance`.
+3. Tag `vX.Y.Z` on **harel** and **harel-conformance** (`gh api -X POST
+   repos/fruwehq/<repo>/git/refs -f ref=refs/tags/vX.Y.Z -f sha=$(gh api
+   repos/fruwehq/<repo>/commits/main --jq .sha)`), so this package pins the matching
+   conformance tag instead of falling back to `main`.
+4. Tag **harel-python** `vX.Y.Z` only to publish to PyPI — it triggers `release.yml`
+   (Trusted Publishing).
 
 ## License
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 
 from . import yaml12
+from .__about__ import __version__
 from .cel import CelError
 from .definition import Definition, load_definition, load_definitions
 from .engine import Host
@@ -42,8 +43,6 @@ __all__ = [
     "yaml12",
     "__version__",
 ]
-
-__version__ = "0.0.2"
 
 # Diagnostic logging under the ``harel`` logger; silent unless the host app
 # configures logging (e.g. ``logging.basicConfig(level=logging.DEBUG)``).
