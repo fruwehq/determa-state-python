@@ -108,14 +108,22 @@ logging.basicConfig(level=logging.DEBUG)   # or logging.getLogger("harel").setLe
 
 ## Layout
 - `src/harel/` — the package.
-- `tests/` — unit tests and the conformance harness.
+- `tests/` — the implementation's own **unit tests** (hermetic, offline).
+- `conformance/` — the harness that runs the external **conformance suite** black-box
+  against this implementation (kept separate from the unit tests).
 
 ## Develop
 ```
 python -m venv .venv && . .venv/bin/activate
 pip install -e '.[dev]'
-ruff check . && mypy src/harel && pytest   # the suite is fetched into .cache/ on first run
+
+make check        # ruff + mypy + unit tests (hermetic, offline) — the PR gate
+make conformance  # download & run the language-agnostic conformance suite
 ```
+Equivalently: `pytest` runs the unit tests only; `pytest conformance` runs the
+conformance suite (it fetches `harel-conformance` into `.cache/` on first run — set
+`HAREL_CONFORMANCE_DIR` to use a local checkout offline). The two are **separate**:
+unit tests never touch the network; conformance is opt-in.
 
 ## License
 MIT — see [LICENSE](LICENSE).

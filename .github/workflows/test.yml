@@ -7,6 +7,8 @@ on:
     branches: [main]
 
 jobs:
+  # Unit tests: the implementation's own suite — hermetic, offline, fast.
+  # This is the blocking gate (`test (ubuntu-24.04)`).
   test:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -25,5 +27,21 @@ jobs:
         run: ruff check .
       - name: Mypy
         run: mypy src/harel
-      - name: Pytest
+      - name: Unit tests
         run: pytest -q
+
+  # Conformance: the language-agnostic suite from fruwehq/harel-conformance, run
+  # black-box against this implementation. Separate job: it downloads an external
+  # repo, so a failure here means "diverges from the spec suite", not "our code broke".
+  conformance:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install
+        run: pip install -e '.[dev]'
+      - name: Conformance suite
+        run: pytest conformance -q
