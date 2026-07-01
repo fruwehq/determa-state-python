@@ -73,6 +73,7 @@ class State:
     depth: int
     order: int  # document/DFS order (stable region + declaration ordering)
     raw: dict[str, Any]
+    meta: dict[str, Any] = field(default_factory=dict)
     children: dict[str, State] = field(default_factory=dict)
     declares_esvs: set[str] = field(default_factory=set)
     region_index: int | None = None  # 0-based region for orthogonal substates
@@ -101,6 +102,7 @@ class Machine:
         self.id = definition.id
         self.version = definition.version
         self.format = definition.format
+        self.meta = dict(definition.raw.get("meta") or {})
         self._counter = 0
         top_raw = top_override if top_override is not None else definition.top
         self.top = self._build("top", "top", None, 0, top_raw, None)
@@ -128,6 +130,7 @@ class Machine:
             depth=depth,
             order=order,
             raw=raw,
+            meta=dict(raw.get("meta") or {}),
             region_index=region_index,
         )
         esvs = raw.get("esvs") or {}
