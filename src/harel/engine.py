@@ -9,22 +9,25 @@ records published/spawned events for the conformance harness.
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any
 
 from . import cel, values
 from .definition import Definition
 from .instance import DELIVERABLE_RESERVED_EVENTS, Event, Instance, Status
 from .model import Machine
+from .observer import Observer
 
 
 class Host:
-    def __init__(self) -> None:
+    def __init__(self, observer: Observer | None = None) -> None:
         self.machines: dict[str, Machine] = {}
         self.versions: dict[tuple[str, int], Machine] = {}
         self.instances: dict[str, Instance] = {}
         self.published: list[str] = []  # event names handed to the bus, in order
         self.spawned: list[str] = []  # child defIds, in order
         self._spawn_counters: dict[str, int] = {}
+        # Passive per-step observer (SPEC §8); None = no-op.
+        self.observer: Observer | None = observer
         self.now: int = 0  # virtual clock, in milliseconds (SPEC §5.9)
         self.mode: str = "auto"  # processing mode, auto|manual (SPEC §14)
         self._seq: int = 0
@@ -105,26 +108,31 @@ class Host:
         for _ in range(n):
             if inst.status is not Status.ACTIVE or not inst.queue:
                 break
-            ev = inst.queue.popleft()
-            before = set(inst.active_leaf_names())
-            pub_before = len(self.published)
-            sp_before = len(self.spawned)
-            inst._last_target = None  # noqa: SLF001
-            inst.step(ev)
-            after = set(inst.active_leaf_names())
-            faulted = cast(Status, inst.status) is Status.FAULTED
-            records.append(
-                {
-                    "event": ev.type,
-                    "transition": inst._last_target,  # noqa: SLF001
-                    "entered": sorted(after - before),
-                    "exited": sorted(before - after),
-                    "published": list(self.published[pub_before:]),
-                    "spawned": list(self.spawned[sp_before:]),
-                    "faulted": faulted,
-                }
-            )
+            records.append(self._run_one_step(inst))
         return records
+
+    def _run_one_step(self, inst: Instance) -> dict[str, Any]:
+        """Dequeue and process one event; build the per-step record and notify the
+        observer (SPEC §8/§14). The caller guarantees ``inst.queue`` is non-empty."""
+        ev = inst.queue.popleft()
+        before = set(inst.active_leaf_names())
+        pub_before = len(self.published)
+        sp_before = len(self.spawned)
+        inst._last_target = None  # noqa: SLF001
+        inst.step(ev)
+        after = set(inst.active_leaf_names())
+        record = {
+            "event": ev.type,
+            "transition": inst._last_target,  # noqa: SLF001
+            "entered": sorted(after - before),
+            "exited": sorted(before - after),
+            "published": list(self.published[pub_before:]),
+            "spawned": list(self.spawned[sp_before:]),
+            "faulted": inst.status is Status.FAULTED,
+        }
+        if self.observer is not None:
+            self.observer({"instance": inst.id, **record})
+        return record
 
     def inspect(self, instance: Instance | str) -> dict[str, Any]:
         """Full internal state for debugging, beyond ``state`` (SPEC §14)."""
@@ -183,8 +191,7 @@ class Host:
                 if inst.status is not Status.ACTIVE:
                     continue
                 while inst.queue:
-                    ev = inst.queue.popleft()
-                    inst.step(ev)
+                    self._run_one_step(inst)
                     progress = True
 
     # --- snapshot round-trip (SPEC §8) -------------------------------------

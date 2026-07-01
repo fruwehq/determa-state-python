@@ -14,6 +14,7 @@ from .engine import Host
 from .errors import ErrorRecord, HarelError, SchemaError, ValidationError
 from .instance import Event, Instance, Status
 from .model import Machine, State
+from .observer import CollectingObserver, JsonlObserver, Observer
 from .validator import collect_errors, validate
 
 __all__ = [
@@ -24,6 +25,9 @@ __all__ = [
     "Host",
     "Instance",
     "Machine",
+    "Observer",
+    "JsonlObserver",
+    "CollectingObserver",
     "SchemaError",
     "State",
     "Status",
