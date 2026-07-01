@@ -11,9 +11,10 @@ Implements the **harel spec v0.0.1** (early alpha; all fruwehq harel repos share
 [synchronized version](https://github.com/fruwehq/harel)).
 
 Status: **passing the full conformance suite** — all 22 engine cases
-(`conformance/01`–`22`) plus `conformance/cli/01`–`02`. Implements YAML 1.2 loading
+(`conformance/01`–`25`) plus `conformance/cli/01`–`03`. Implements YAML 1.2 loading
 + validation, the full statechart semantics (RTC dispatch, hierarchy, orthogonal
-regions + `done`, shallow/deep history, esvs, CEL guards, structured actions,
+regions + `done`, shallow/deep history, choice pseudostates, esvs, CEL guards,
+structured actions,
 active objects + bus, defer, timers, faults), static contracts, snapshot
 round-trip + safe-point migration, Mermaid `export`, and the §13 CLI. Built up
 the build order in [issue #3][issue].

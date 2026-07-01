@@ -43,7 +43,7 @@ __all__ = [
     "__version__",
 ]
 
-__version__ = "0.0.1"
+__version__ = "0.0.2"
 
 # Diagnostic logging under the ``harel`` logger; silent unless the host app
 # configures logging (e.g. ``logging.basicConfig(level=logging.DEBUG)``).

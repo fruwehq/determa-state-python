@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "harel-python"
-version = "0.0.1"
+version = "0.0.2"
 description = "Python reference implementation of the harel statechart engine"
 readme = "README.md"
 requires-python = ">=3.11"

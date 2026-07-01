@@ -55,8 +55,15 @@ def _spec_schema() -> dict | None:
 
 
 def _each_machine_file() -> list[pytest.Param]:
+    import yaml
+
     params: list[pytest.Param] = []
     for case in engine_cases():
+        # A `static: { valid: false }` case may hold a deliberately invalid machine
+        # (it must NOT load cleanly), so exclude it from the "loads and validates" gate.
+        test = yaml.safe_load(case.test_file.read_text(encoding="utf-8")) or {}
+        if test.get("static", {}).get("valid") is False:
+            continue
         for mf in case.machine_files:
             params.append(pytest.param(mf, id=f"{case.name}:{mf.name}"))
     for case in cli_cases():
@@ -85,7 +92,7 @@ def test_bundled_schema_matches_spec() -> None:
 def test_suite_present() -> None:
     if not CONFORMANCE_DIR.exists():
         pytest.skip("conformance suite not fetched (offline; set HAREL_CONFORMANCE_DIR)")
-    assert len(engine_cases()) == 22, "expected 22 engine cases"
+    assert len(engine_cases()) == 25, "expected 25 engine cases"
     assert len(cli_cases()) == 3, "expected 3 CLI cases"
 
 

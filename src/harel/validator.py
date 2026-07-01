@@ -94,6 +94,24 @@ def _reserved_name_errors(doc: dict[str, Any]) -> list[ErrorRecord]:
     return errors
 
 
+def _check_choice(path: str, branches: list[Any], errors: list[ErrorRecord]) -> None:
+    """A choice MUST have exactly one default (unguarded) branch, and it MUST be last
+    (SPEC §5.5.1)."""
+    defaults = [i for i, br in enumerate(branches) if isinstance(br, dict) and "guard" not in br]
+    if not defaults:
+        errors.append(
+            ErrorRecord(path=f"{path}/choice", message="choice has no default (else) branch")
+        )
+    elif len(defaults) > 1:
+        errors.append(
+            ErrorRecord(path=f"{path}/choice", message="choice has more than one default branch")
+        )
+    elif defaults[0] != len(branches) - 1:
+        errors.append(
+            ErrorRecord(path=f"{path}/choice", message="the default (else) branch must be last")
+        )
+
+
 def _forbid(
     name: object, reserved: frozenset[str], path: str, errors: list[ErrorRecord]
 ) -> None:
@@ -112,6 +130,9 @@ def _walk_state(path: str, state: Any, errors: list[ErrorRecord]) -> None:
     """
     if not isinstance(state, dict):
         return
+    choice = state.get("choice")
+    if isinstance(choice, list):
+        _check_choice(path, choice, errors)
     esvs = state.get("esvs")
     if isinstance(esvs, dict):
         for name in esvs:

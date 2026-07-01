@@ -60,6 +60,9 @@ SUPPORTED = frozenset(
         "20-contract-fail",
         "21-snapshot-roundtrip",
         "22-migration",
+        "23-choice",
+        "24-choice-chain",
+        "25-choice-invalid",
     }
 )
 
@@ -156,7 +159,15 @@ def run_engine_case(case: EngineCase) -> None:
     assert case.machine_files, f"{case.name}: no machine files"
 
     if "static" in test:
-        root_raw = load_definitions(case.machine_files[0].read_text(encoding="utf-8"))[0].raw
+        from harel import ValidationError
+
+        expected = bool(test["static"]["valid"])
+        try:
+            root_raw = load_definitions(case.machine_files[0].read_text(encoding="utf-8"))[0].raw
+        except ValidationError:
+            # invalid at load time (schema / structural / choice rules)
+            assert expected is False, f"{case.name}: expected valid but load failed"
+            return
         errors = list(collect_errors(root_raw))
         contracts: dict[str, dict[str, Any]] = {}
         cdir = case.path / "contracts"
@@ -166,7 +177,6 @@ def run_engine_case(case: EngineCase) -> None:
                 contracts[c["id"]] = c
         errors.extend(validate_contracts(root_raw, contracts))
         valid = not errors
-        expected = bool(test["static"]["valid"])
         assert valid is expected, (
             f"{case.name}: static valid={valid} != {expected} ({errors})"
         )

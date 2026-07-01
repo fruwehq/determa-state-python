@@ -38,6 +38,8 @@ def _infer_type(raw: dict[str, Any]) -> str:
     declared = raw.get("type")
     if isinstance(declared, str):
         return declared
+    if "choice" in raw:
+        return "choice"  # a transient pseudostate (SPEC §5.5.1)
     if "regions" in raw:
         return "orthogonal"
     if "states" in raw:
@@ -164,6 +166,9 @@ class Machine:
             for after in state.raw.get("after") or []:
                 if "transition_to" in after:
                     refs.append((after["transition_to"], f"{state.path}/after"))
+            for i, br in enumerate(state.raw.get("choice") or []):
+                if "transition_to" in br:
+                    refs.append((br["transition_to"], f"{state.path}/choice/{i}"))
             for ref, where in refs:
                 try:
                     self.resolve_target(state, ref)
@@ -174,8 +179,43 @@ class Machine:
                             message=f"unresolved target '{ref}' from '{state.name}'",
                         )
                     )
+        errors.extend(self._choice_cycle_errors())
         if errors:
             raise ValidationError(errors)
+
+    def _choice_cycle_errors(self) -> list[ErrorRecord]:
+        """Choices reachable via `transition_to` MUST be acyclic (§5.5.1)."""
+        errors: list[ErrorRecord] = []
+        for state in self.by_path.values():
+            if state.type != "choice":
+                continue
+            seen: set[str] = set()
+            node: State | None = state
+            while node is not None and node.type == "choice":
+                if node.path in seen:
+                    errors.append(
+                        ErrorRecord(
+                            path=f"/top/{state.path}/choice",
+                            message=f"cyclic choice reachable from '{state.name}'",
+                        )
+                    )
+                    break
+                seen.add(node.path)
+                # follow the default (else) branch — a cycle on any branch shows here
+                # because every branch target is itself checked as a choice root.
+                branches = node.raw.get("choice") or []
+                nxt = None
+                for br in branches:
+                    if "transition_to" in br:
+                        try:
+                            cand = self.resolve_target(node, br["transition_to"])
+                        except KeyError:
+                            continue
+                        if cand.type == "choice":
+                            nxt = cand
+                            break
+                node = nxt
+        return errors
 
 
 def _as_transition_list(spec: Any) -> list[dict[str, Any]]:
