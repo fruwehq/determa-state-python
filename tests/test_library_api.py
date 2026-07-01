@@ -27,6 +27,25 @@ top:
         push: { transition_to: locked }
 """
 
+META_GATE = """\
+id: meta_gate
+meta:
+  host: guardrail
+events:
+  go: {}
+top:
+  meta:
+    owner: root
+  initial: { transition_to: a }
+  states:
+    a:
+      meta:
+        tools: [one, two]
+      on_events:
+        go: { transition_to: b }
+    b: {}
+"""
+
 
 def test_minimum_capability_set_via_public_api() -> None:
     # 1. load + validate a definition (raises ValidationError if invalid).
@@ -91,3 +110,26 @@ def test_public_surface_is_exported() -> None:
     assert expected <= set(harel.__all__)
     for name in expected:
         assert hasattr(harel, name), f"harel.{name} not exported"
+
+
+def test_meta_is_validation_only_model_data_not_runtime_state() -> None:
+    defs = harel.load_definitions(META_GATE)
+    assert harel.collect_errors(defs[0].raw) == []
+
+    host = harel.Host()
+    host.register_all(defs)
+    machine = host.machines["meta_gate"]
+    inst = host.create_root(machine, "m1")
+    host.run_to_quiescence()
+
+    assert machine.meta == {"host": "guardrail"}
+    assert machine.top.meta == {"owner": "root"}
+    assert machine.by_path["top.a"].meta == {"tools": ["one", "two"]}
+    assert inst.active_leaf_names() == ["a"]
+
+    snap = inst.to_snapshot()
+    assert "meta" not in snap
+
+    assert host.deliver("m1", "go") is True
+    host.run_to_quiescence()
+    assert inst.active_leaf_names() == ["b"]

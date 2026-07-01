@@ -75,3 +75,27 @@ def test_unresolved_reference_raises_at_build() -> None:
                 "  states:\n    s: { on_events: { go: { transition_to: nowhere } } }\n"
             )
         )
+
+
+def test_meta_is_exposed_on_machine_and_states() -> None:
+    machine = Machine(
+        load_definition(
+            """\
+id: m
+meta:
+  owner: ui
+top:
+  meta:
+    role: root
+  initial: { transition_to: s }
+  states:
+    s:
+      meta:
+        tools: [search, respond]
+"""
+        )
+    )
+
+    assert machine.meta == {"owner": "ui"}
+    assert machine.top.meta == {"role": "root"}
+    assert machine.by_path["top.s"].meta == {"tools": ["search", "respond"]}

@@ -24,6 +24,7 @@
       "type": "object",
       "additionalProperties": { "$ref": "#/$defs/eventDecl" }
     },
+    "meta": { "type": "object" },
     "migrations": { "type": "array", "items": { "$ref": "#/$defs/migration" } },
     "top": { "$ref": "#/$defs/state", "description": "The outermost state (PSiCC \"top\"); all behavior lives under it." }
   },
@@ -174,6 +175,7 @@
       "additionalProperties": false,
       "properties": {
         "type": { "enum": ["simple", "composite", "orthogonal", "final"], "default": "simple" },
+        "meta": { "type": "object" },
         "esvs": { "type": "object", "additionalProperties": { "$ref": "#/$defs/esv" } },
         "entry": { "$ref": "#/$defs/actionList" },
         "exit": { "$ref": "#/$defs/actionList" },
