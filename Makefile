@@ -1,4 +1,4 @@
-.PHONY: test conformance lint typecheck check all
+.PHONY: test conformance lint typecheck check all sync-schema
 
 # Unit tests — the implementation's own suite. Hermetic and offline.
 test:
@@ -10,6 +10,11 @@ test:
 # Offline / against a local checkout:  HAREL_CONFORMANCE_DIR=/path/to/harel-conformance make conformance
 conformance:
 	pytest conformance -q
+
+# Refresh the bundled JSON Schema from fruwehq/harel at the matching version tag
+# (or HAREL_SPEC_DIR=/path/to/harel). The schema-drift test guards that they match.
+sync-schema:
+	python scripts/sync_schema.py
 
 lint:
 	ruff check .
