@@ -41,9 +41,33 @@ def _to_cel(value: Any) -> Any:
     return value
 
 
+def _from_cel(value: Any) -> Any:
+    """Normalize a celpy result to a canonical native/JSON Python value (SPEC §5.1).
+
+    No guard-language wrapper type (``celpy.celtypes.*``) may cross the engine boundary,
+    so every CEL result is coerced to its native equivalent here — the single choke point
+    for esv assignments, published payloads, and spawn args.
+    """
+    if isinstance(value, celtypes.BoolType):  # subclasses int — check before IntType
+        return bool(value)
+    if isinstance(value, (celtypes.IntType, celtypes.UintType)):
+        return int(value)
+    if isinstance(value, celtypes.DoubleType):
+        return float(value)
+    if isinstance(value, celtypes.StringType):
+        return str(value)
+    if isinstance(value, celtypes.BytesType):
+        return bytes(value)
+    if isinstance(value, dict):  # MapType (and native dict): normalize keys + values
+        return {_from_cel(k): _from_cel(v) for k, v in value.items()}
+    if isinstance(value, list):  # ListType (and native list)
+        return [_from_cel(v) for v in value]
+    return value
+
+
 def evaluate(expr: str, bindings: dict[str, Any]) -> Any:
-    """Evaluate a CEL expression against ``bindings`` (esvs + event/id/parent)."""
+    """Evaluate a CEL expression, returning a canonical native/JSON value (§5.1)."""
     try:
-        return _program(expr).evaluate(_to_cel(bindings))
+        return _from_cel(_program(expr).evaluate(_to_cel(bindings)))
     except celpy.CELEvalError as exc:  # type: ignore[attr-defined]
         raise CelError(str(exc)) from exc
