@@ -9,6 +9,7 @@ records published/spawned events for the conformance harness.
 
 from __future__ import annotations
 
+import logging
 from typing import Any
 
 from . import cel, values
@@ -16,6 +17,8 @@ from .definition import Definition
 from .instance import DELIVERABLE_RESERVED_EVENTS, Event, Instance, Status
 from .model import Machine
 from .observer import Observer
+
+log = logging.getLogger(__name__)
 
 
 class Host:
@@ -132,6 +135,10 @@ class Host:
         }
         if self.observer is not None:
             self.observer({"instance": inst.id, **record})
+        log.debug(
+            "dispatch instance=%s event=%s transition=%s entered=%s exited=%s",
+            inst.id, record["event"], record["transition"], record["entered"], record["exited"],
+        )
         return record
 
     def inspect(self, instance: Instance | str) -> dict[str, Any]:
@@ -181,6 +188,10 @@ class Host:
             ):
                 inst.queue.append(
                     Event("__time__", after=(timer["state_path"], timer["spec"]))
+                )
+                log.debug(
+                    "timer fired instance=%s state=%s after=%s",
+                    inst.id, timer["state_path"], timer["spec"],
                 )
 
     def run_to_quiescence(self) -> None:
@@ -300,6 +311,7 @@ class Host:
         child = Instance(machine, child_id, parent.id, self, external=external)
         self.instances[child_id] = child
         self.spawned.append(def_id)
+        log.debug("spawn parent=%s child=%s def=%s", parent.id, child_id, def_id)
         result = spec.get("result")
         if result:
             parent.assign_esv(root, result, child_id)
@@ -317,6 +329,7 @@ class Host:
             k: cel.evaluate(v, scope) for k, v in (spec.get("payload") or {}).items()
         }
         self.published.append(name)
+        log.debug("publish event=%s from=%s", name, src.id)
         if "to" in spec:
             target = cel.evaluate(spec["to"], scope)
             ids = target if isinstance(target, list) else [target]
