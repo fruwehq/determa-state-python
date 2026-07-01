@@ -68,6 +68,7 @@ SUPPORTED = frozenset(
         "28-reachable-ok",
         "29-submachine",
         "30-submachine-interrupt",
+        "31-enabled-events",
     }
 )
 
@@ -269,6 +270,11 @@ def _check_expect(
             assert actual.get(name) == val, (
                 f"{label}: esv {name}={actual.get(name)!r} != {val!r}"
             )
+    if "enabled" in expect:
+        assert inst is not None, f"{label}: instance {instance_id} missing"
+        assert host.enabled_events(inst) == sorted(expect["enabled"]), (
+            f"{label}: enabled {host.enabled_events(inst)} != {sorted(expect['enabled'])}"
+        )
     if "status" in expect:
         assert inst is not None
         assert inst.status.value == expect["status"], (

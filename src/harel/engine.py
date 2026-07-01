@@ -158,6 +158,7 @@ class Host:
             "status": inst.status.value,
             "config": inst.active_leaf_names(),
             "esvs": inst.resolved_esvs(),
+            "enabled": inst.enabled_events(),
             "queue": [Instance._event_to_snap(e) for e in inst.queue],
             "deferred": [Instance._event_to_snap(e) for e in inst.deferred],
             "timers": [
@@ -171,6 +172,11 @@ class Host:
         if inst.dead_letter:
             out["dead_letter"] = list(inst.dead_letter)
         return out
+
+    def enabled_events(self, instance: Instance | str) -> list[str]:
+        """Sorted declared event types the active configuration can handle (§14)."""
+        inst = instance if isinstance(instance, Instance) else self.instances[instance]
+        return inst.enabled_events()
 
     def next_seq(self) -> int:
         self._seq += 1

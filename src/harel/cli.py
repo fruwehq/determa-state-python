@@ -130,6 +130,10 @@ def _build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--steps", type=int, default=1)
     sp.set_defaults(cmd=cmd_step)
 
+    en = add("enabled")
+    en.add_argument("instance")
+    en.set_defaults(cmd=cmd_enabled)
+
     ip = add("inspect")
     ip.add_argument("instance")
     ip.set_defaults(cmd=cmd_inspect)
@@ -375,6 +379,22 @@ def cmd_step(args: argparse.Namespace, store: Store) -> int:
     _persist(store, state, host)
     if inst.status is Status.FAULTED:
         return EXIT_FAULTED
+    return EXIT_OK
+
+
+def cmd_enabled(args: argparse.Namespace, store: Store) -> int:
+    state = store.load()
+    host = _build_host(state)
+    inst = host.instances.get(args.instance)
+    if inst is None:
+        print(f"no such instance: {args.instance}", file=sys.stderr)
+        return EXIT_NOT_FOUND
+    enabled = host.enabled_events(inst)
+    if args.json:
+        print(json.dumps({"instance": inst.id, "enabled": enabled}))
+    else:
+        for event_type in enabled:
+            print(event_type)
     return EXIT_OK
 
 
