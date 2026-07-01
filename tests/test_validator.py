@@ -26,10 +26,9 @@ top:
 SKELETON_STATES = """
 id: m
 top:
-  initial: {{ transition_to: s }}
+  initial: {{ transition_to: {name} }}
   states:
     {name}: {{}}
-    s: {{}}
 """
 
 SKELETON_ESVS = """

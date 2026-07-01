@@ -19,7 +19,7 @@ top:
       initial: { transition_to: a }
       states:
         a: { on_events: { go: { transition_to: b } } }
-        b: {}
+        b: { on_events: { go: { transition_to: d } } }
     d: {}
 """
 
