@@ -7,13 +7,13 @@ The normative `SPEC.md`, the JSON Schema for machine YAML, and the cross-languag
 **conformance suite** live in the spec repo. This repository implements that spec in
 Python and is correct **iff it passes the conformance suite**.
 
-Implements the **harel spec v0.0.1** (early alpha; all fruwehq harel repos share one
+Implements the **harel spec v0.0.3** (early alpha; all fruwehq harel repos share one
 [synchronized version](https://github.com/fruwehq/harel)).
 
-Status: **passing the full conformance suite** — all 22 engine cases
-(`conformance/01`–`25`) plus `conformance/cli/01`–`03`. Implements YAML 1.2 loading
+Status: **passing the full conformance suite** — all 30 engine cases
+(`conformance/01`–`30`) plus `conformance/cli/01`–`03`. Implements YAML 1.2 loading
 + validation, the full statechart semantics (RTC dispatch, hierarchy, orthogonal
-regions + `done`, shallow/deep history, choice pseudostates, esvs, CEL guards,
+regions + `done`, shallow/deep history, choice pseudostates, submachine states, esvs, CEL guards,
 structured actions,
 active objects + bus, defer, timers, faults), static contracts, snapshot
 round-trip + safe-point migration, Mermaid `export`, and the §13 CLI. Built up

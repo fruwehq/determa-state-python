@@ -184,7 +184,9 @@
         "after": { "type": "array", "items": { "$ref": "#/$defs/after" } },
         "defer": { "type": "array", "items": { "$ref": "#/$defs/identifier" } },
         "history": { "enum": ["none", "shallow", "deep"], "default": "none" },
-        "choice": { "type": "array", "minItems": 2, "items": { "$ref": "#/$defs/choiceBranch" } }
+        "choice": { "type": "array", "minItems": 2, "items": { "$ref": "#/$defs/choiceBranch" } },
+        "submachine": { "$ref": "#/$defs/identifier" },
+        "with": { "type": "object", "additionalProperties": { "$ref": "#/$defs/cel" } }
       },
       "allOf": [
         {

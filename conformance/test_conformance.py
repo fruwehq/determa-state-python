@@ -92,7 +92,7 @@ def test_bundled_schema_matches_spec() -> None:
 def test_suite_present() -> None:
     if not CONFORMANCE_DIR.exists():
         pytest.skip("conformance suite not fetched (offline; set HAREL_CONFORMANCE_DIR)")
-    assert len(engine_cases()) == 28, "expected 28 engine cases"
+    assert len(engine_cases()) == 30, "expected 30 engine cases"
     assert len(cli_cases()) == 3, "expected 3 CLI cases"
 
 

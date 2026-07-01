@@ -15,7 +15,7 @@ from typing import Any
 from . import cel, values
 from .definition import Definition
 from .instance import DELIVERABLE_RESERVED_EVENTS, Event, Instance, Status
-from .model import Machine
+from .model import Machine, inline_submachines
 from .observer import Observer
 
 log = logging.getLogger(__name__)
@@ -37,14 +37,24 @@ class Host:
 
     # --- registration / creation -------------------------------------------
     def register(self, definition: Definition) -> Machine:
-        machine = Machine(definition)
+        registry = {mid: m.definition.top for mid, m in self.machines.items()}
+        registry[definition.id] = definition.top
+        return self._register(definition, registry)
+
+    def register_all(self, definitions: list[Definition]) -> None:
+        # Two-phase so submachine references can resolve in any order within the batch.
+        registry = {mid: m.definition.top for mid, m in self.machines.items()}
+        for d in definitions:
+            registry[d.id] = d.top
+        for d in definitions:
+            self._register(d, registry)
+
+    def _register(self, definition: Definition, registry: dict[str, Any]) -> Machine:
+        top = inline_submachines(definition.top, registry)
+        machine = Machine(definition, top_override=top)
         self.machines[machine.id] = machine
         self.versions[(machine.id, machine.version)] = machine
         return machine
-
-    def register_all(self, definitions: list[Definition]) -> None:
-        for d in definitions:
-            self.register(d)
 
     def create_root(
         self,
