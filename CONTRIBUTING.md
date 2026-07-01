@@ -19,20 +19,32 @@ Python ≥ 3.11. The package is import-named `harel`, distribution-named `harel-
 
 ## The gate
 
-Before pushing, run all three and keep them clean:
+Before pushing, run all three and keep them clean (`make check` does exactly this):
 
 ```sh
 ruff check .
 mypy src
-pytest
+pytest            # unit tests only — hermetic, offline
 ```
 
 CI runs `test (ubuntu-24.04)` on every PR and is **required** — a PR merges only once it
-is green.
+is green. This job runs the **unit tests only**.
 
-## The conformance suite
+## Unit tests vs. conformance — kept separate
 
-The suite is **not** a submodule. `tests/conftest.py` clones
+This implementation has its **own unit tests** (`tests/`), which are hermetic and offline
+— `pytest` (or `make test`) runs only these, and they never touch the network. That is the
+required PR gate.
+
+**Conformance is separate.** The language-agnostic suite is downloaded and run black-box
+against the built CLI/engine, in its own directory (`conformance/`) and its own CI job
+(`conformance`, non-blocking by default). Run it locally with:
+
+```sh
+make conformance   # == pytest conformance
+```
+
+The suite is **not** a submodule. `conformance/conftest.py` clones
 `fruwehq/harel-conformance` at the release tag matching this package's version (falling
 back to `main` while the tag does not yet exist) into a gitignored `.cache/` directory and
 reuses it. To force a refresh, delete `.cache/`.
