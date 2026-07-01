@@ -303,6 +303,17 @@ class Instance:
             self.run_actions(actions, owner, event)
             return
         target = self.machine.resolve_target(owner, target_ref)
+        if target.type == "choice":
+            # Dynamic branching (§5.5.1): run the triggering action, then resolve the
+            # choice chain in the SOURCE scope (branch guards see the just-assigned
+            # esvs), then execute as an external transition to the real target.
+            self.run_actions(actions, owner, event)
+            target = self._resolve_choice(target, owner, event)
+            self._last_target = target.name
+            lca = self.machine.lca(owner, target)
+            self.exit_states(owner, lca, False)
+            self.enter_to(lca, target)
+            return
         self._last_target = target.name
         local = bool(transition.get("local"))
         if local:
@@ -312,6 +323,29 @@ class Instance:
         self.exit_states(owner, lca, local)
         self.run_actions(actions, owner, event)
         self.enter_to(lca, target)
+
+    def _resolve_choice(self, node: State, owner: State, event: Event) -> State:
+        """Resolve a choice pseudostate chain to a real target state (SPEC §5.5.1).
+
+        Branches are tried in order (first passing guard, or the unguarded default);
+        the chosen branch's action runs in the source scope; chained choices repeat.
+        """
+        seen: set[str] = set()
+        while node.type == "choice":
+            if node.path in seen:
+                raise HarelError(f"cyclic choice '{node.name}'")
+            seen.add(node.path)
+            chosen: dict[str, Any] | None = None
+            for br in node.raw.get("choice") or []:
+                guard = br.get("guard")
+                if guard is None or cel.evaluate(guard, self.scope(owner, event)):
+                    chosen = br
+                    break
+            if chosen is None:
+                raise HarelError(f"choice '{node.name}' has no matching branch")
+            self.run_actions(chosen.get("action") or [], owner, event)
+            node = self.machine.resolve_target(node, chosen["transition_to"])
+        return node
 
     # --- completion ---------------------------------------------------------
     def _complete_composites(self) -> set[str]:

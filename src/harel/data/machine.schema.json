@@ -136,6 +136,17 @@
       }
     },
 
+    "choiceBranch": {
+      "type": "object",
+      "required": ["transition_to"],
+      "additionalProperties": false,
+      "properties": {
+        "transition_to": { "$ref": "#/$defs/dottedRef" },
+        "guard": { "$ref": "#/$defs/cel" },
+        "action": { "$ref": "#/$defs/actionList" }
+      }
+    },
+
     "after": {
       "type": "object",
       "required": ["duration"],
@@ -172,7 +183,8 @@
         "on_events": { "type": "object", "additionalProperties": { "$ref": "#/$defs/transitionOrList" } },
         "after": { "type": "array", "items": { "$ref": "#/$defs/after" } },
         "defer": { "type": "array", "items": { "$ref": "#/$defs/identifier" } },
-        "history": { "enum": ["none", "shallow", "deep"], "default": "none" }
+        "history": { "enum": ["none", "shallow", "deep"], "default": "none" },
+        "choice": { "type": "array", "minItems": 2, "items": { "$ref": "#/$defs/choiceBranch" } }
       },
       "allOf": [
         {
