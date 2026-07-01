@@ -63,6 +63,9 @@ SUPPORTED = frozenset(
         "23-choice",
         "24-choice-chain",
         "25-choice-invalid",
+        "26-unreachable",
+        "27-dead-branch",
+        "28-reachable-ok",
     }
 )
 
