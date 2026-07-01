@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     from .engine import Host
 
 DELIVERABLE_RESERVED_EVENTS = frozenset({"env", "error", "done"})
+RESERVED_LIFECYCLE_EVENTS = frozenset({"entry", "exit", "initial", "done", "error", "env"})
 
 _DURATION_UNITS = {"ms": 1, "s": 1000, "m": 60_000, "h": 3_600_000}
 
@@ -208,6 +209,22 @@ class Instance:
         for path in self.config:
             out.update(self.machine.by_path[path].raw.get("defer") or [])
         return out
+
+    def enabled_events(self) -> list[str]:
+        """Declared event types handled by the current active configuration (§14)."""
+        declared = set(self.machine.definition.raw.get("events") or {})
+        enabled: set[str] = set()
+        for leaf in self.active_leaves():
+            cur: State | None = leaf
+            while cur is not None:
+                for event_type in cur.raw.get("on_events") or {}:
+                    if (
+                        event_type in declared
+                        and event_type not in RESERVED_LIFECYCLE_EVENTS
+                    ):
+                        enabled.add(event_type)
+                cur = cur.parent
+        return sorted(enabled)
 
     def resolved_esvs(self) -> dict[str, Any]:
         """In-scope esv values resolved from the active leaf (as a guard reads)."""

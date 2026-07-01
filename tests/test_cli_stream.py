@@ -64,6 +64,25 @@ def test_stream_happy_path(tmp_path, monkeypatch, capsys):
     assert results[2]["result"]["config"] == ["unlocked"]
 
 
+def test_stream_enabled_command(tmp_path, monkeypatch, capsys):
+    machine = tmp_path / "m.yaml"
+    machine.write_text(TURNSTILE)
+    rc, results = _run_batch(
+        tmp_path,
+        [
+            ["new", "t1", str(machine)],
+            ["enabled", "t1"],
+            ["send", "t1", "coin", "--payload", "amount=100"],
+            ["enabled", "t1"],
+        ],
+        monkeypatch,
+        capsys,
+    )
+    assert rc == 0
+    assert results[1]["result"] == {"instance": "t1", "enabled": ["coin"]}
+    assert results[3]["result"] == {"instance": "t1", "enabled": ["push"]}
+
+
 def test_stream_failure_does_not_abort(tmp_path, monkeypatch, capsys):
     machine = tmp_path / "m.yaml"
     machine.write_text(TURNSTILE)

@@ -21,17 +21,22 @@ id: turnstile
 events:
   coin: { payload: { amount: { type: int, required: true } } }
   push: {}
+  reset: {}
 top:
   esvs:
     fare: { type: int, init: 50 }
+  on_events:
+    reset: { transition_to: locked }
   initial: { transition_to: locked }
   states:
     locked:
       on_events:
         coin: { transition_to: unlocked, guard: "event.payload.amount >= fare" }
+        env: { transition_to: locked }
     unlocked:
       on_events:
         push: { transition_to: locked }
+        error: { transition_to: unlocked }
 """
 
 
@@ -103,10 +108,27 @@ def test_inspect_exposes_full_internal_state() -> None:
     assert info["status"] == "active"
     assert info["config"] == ["locked"]
     assert info["esvs"] == {"fare": 50}
+    assert info["enabled"] == ["coin", "reset"]
     assert [e["type"] for e in info["queue"]] == ["coin"]
     assert info["deferred"] == []
     assert info["timers"] == []
     assert info["history"] == {}
+
+
+def test_enabled_events_are_declared_structural_and_lifecycle_filtered() -> None:
+    host = _host()
+    inst = host.instances["t1"]
+    assert inst.enabled_events() == ["coin", "reset"]
+    assert host.enabled_events("t1") == ["coin", "reset"]
+
+    # Guard failure does not remove the structural handler.
+    assert host.deliver("t1", "coin", {"amount": 0}) is True
+    host.run_to_quiescence()
+    assert host.enabled_events(inst) == ["coin", "reset"]
+
+    assert host.deliver("t1", "coin", {"amount": 100}) is True
+    host.run_to_quiescence()
+    assert host.enabled_events("t1") == ["push", "reset"]
 
 
 def test_manual_mode_send_enqueues_via_maybe_run() -> None:
@@ -201,9 +223,25 @@ def test_cli_inspect_full_shape(tmp_path, monkeypatch, capsys):
     info = json.loads(out)
     assert info["instance"] == "t1"
     assert info["config"] == ["locked"]
+    assert info["enabled"] == ["coin", "reset"]
     assert info["queue"] == [{"type": "coin", "payload": {"amount": 100}}]
     assert info["deferred"] == []
     assert info["timers"] == []
+
+
+def test_cli_enabled_reports_current_events(tmp_path, monkeypatch, capsys):
+    machine = tmp_path / "m.yaml"
+    machine.write_text(TURNSTILE)
+    _run(tmp_path, ["new", "t1", str(machine)], monkeypatch, capsys)
+
+    rc, out = _run(tmp_path, ["enabled", "t1", "--json"], monkeypatch, capsys)
+    assert rc == 0
+    assert json.loads(out) == {"instance": "t1", "enabled": ["coin", "reset"]}
+
+    _run(tmp_path, ["send", "t1", "coin", "--payload", "amount=100"], monkeypatch, capsys)
+    rc, out = _run(tmp_path, ["enabled", "t1"], monkeypatch, capsys)
+    assert rc == 0
+    assert out.splitlines() == ["push", "reset"]
 
 
 def test_cli_send_in_manual_mode_enqueues_only(tmp_path, monkeypatch, capsys):
