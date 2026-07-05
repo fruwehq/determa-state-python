@@ -26,11 +26,11 @@ jobs:
       - name: Ruff
         run: ruff check .
       - name: Mypy
-        run: mypy src/harel
+        run: mypy src/determa
       - name: Unit tests
         run: pytest -q
 
-  # Conformance: the language-agnostic suite from fruwehq/harel-conformance, run
+  # Conformance: the language-agnostic suite from fruwehq/determa-state-conformance, run
   # black-box against this implementation. Separate job: it downloads an external
   # repo, so a failure here means "diverges from the spec suite", not "our code broke".
   conformance:
