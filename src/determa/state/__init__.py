@@ -1,7 +1,7 @@
-"""harel — Python reference implementation of the harel statechart engine.
+"""Determa State — Python reference implementation of the Determa State statechart engine.
 
 The normative SPEC.md, machine JSON Schema, and cross-language conformance
-suite live in the spec repo (https://github.com/fruwehq/harel). This package
+suite live in the spec repo (https://github.com/fruwehq/determa-state-spec). This package
 implements that spec; it is correct iff it passes the conformance suite.
 """
 
@@ -14,7 +14,7 @@ from .__about__ import __version__
 from .cel import CelError
 from .definition import Definition, load_definition, load_definitions
 from .engine import Host
-from .errors import ErrorRecord, HarelError, SchemaError, ValidationError
+from .errors import DetermaError, ErrorRecord, SchemaError, ValidationError
 from .instance import Event, Instance, Status
 from .model import Machine, State
 from .observer import CollectingObserver, JsonlObserver, Observer
@@ -24,7 +24,7 @@ __all__ = [
     "Definition",
     "ErrorRecord",
     "Event",
-    "HarelError",
+    "DetermaError",
     "Host",
     "Instance",
     "Machine",
@@ -44,6 +44,6 @@ __all__ = [
     "__version__",
 ]
 
-# Diagnostic logging under the ``harel`` logger; silent unless the host app
+# Diagnostic logging under the ``determa.state`` logger; silent unless the host app
 # configures logging (e.g. ``logging.basicConfig(level=logging.DEBUG)``).
-logging.getLogger("harel").addHandler(logging.NullHandler())
+logging.getLogger("determa.state").addHandler(logging.NullHandler())

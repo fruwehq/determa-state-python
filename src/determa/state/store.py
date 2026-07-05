@@ -4,7 +4,7 @@ A store holds the registered definitions, instance snapshots, the virtual clock,
 and the processing mode (§14). It is selected by a ``--store <spec>`` scheme:
 
 - ``file:<dir>`` (or a bare ``<dir>``) — JSON snapshot files under a directory.
-  **Default** (``./.harel``).
+  **Default** (``./.determa``).
 - ``mem:`` — in-memory, ephemeral; only meaningful within a single process
   (e.g. one ``run`` batch/streaming session, §13.7, or a test).
 - ``sqlite:<path>`` — a single-file SQLite database.
@@ -122,7 +122,7 @@ class SqliteStore(Store):
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(str(self.path))
         self._conn.execute(
-            "CREATE TABLE IF NOT EXISTS harel_state ("
+            "CREATE TABLE IF NOT EXISTS determa_state ("
             "  key TEXT PRIMARY KEY,"
             "  value TEXT NOT NULL"
             ")"
@@ -131,13 +131,13 @@ class SqliteStore(Store):
 
     def _get(self, key: str) -> str | None:
         row = self._conn.execute(
-            "SELECT value FROM harel_state WHERE key = ?", (key,)
+            "SELECT value FROM determa_state WHERE key = ?", (key,)
         ).fetchone()
         return row[0] if row is not None else None
 
     def _set(self, key: str, value: str) -> None:
         self._conn.execute(
-            "INSERT INTO harel_state (key, value) VALUES (?, ?) "
+            "INSERT INTO determa_state (key, value) VALUES (?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             (key, value),
         )

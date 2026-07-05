@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-import harel.cli as cli
+import determa.state.cli as cli
 
 TURNSTILE = """\
 id: turnstile

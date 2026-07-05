@@ -1,6 +1,6 @@
 """YAML 1.2 core-schema loading (SPEC §2).
 
-harel YAML MUST be parsed under the **YAML 1.2 core schema**, where only
+Determa State YAML MUST be parsed under the **YAML 1.2 core schema**, where only
 ``true``/``false`` (and capitalisations) are booleans. PyYAML defaults to YAML
 1.1, in which ``yes``/``no``/``on``/``off``/``y``/``n`` are also booleans and
 leading-zero / sexagesimal integers are parsed oddly. This module provides a

@@ -1,6 +1,6 @@
 """Runtime type checks: esv value types and event-payload validation (SPEC §4.3).
 
-``matches`` checks a Python value against a harel value type. ``payload_errors``
+``matches`` checks a Python value against a Determa State value type. ``payload_errors``
 validates a delivered payload against an event declaration (required fields
 present and typed, no extras) — used at delivery time (§4.3: invalid payloads
 are rejected, not enqueued).

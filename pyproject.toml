@@ -3,14 +3,14 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [project]
-name = "harel-python"
+name = "determa-state"
 dynamic = ["version"]
-description = "Python reference implementation of the harel statechart engine"
+description = "Determa State — Python reference implementation of the Determa statechart engine"
 readme = "README.md"
 requires-python = ">=3.11"
 license = { file = "LICENSE" }
 authors = [{ name = "Christian-Manuel Butzke" }]
-keywords = ["statechart", "state-machine", "harel", "fsm", "hsm", "uml", "scxml"]
+keywords = ["statechart", "state-machine", "determa", "fsm", "hsm", "uml", "scxml"]
 classifiers = [
   "Development Status :: 4 - Beta",
   "Intended Audience :: Developers",
@@ -29,10 +29,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/fruwehq/harel-python"
-Repository = "https://github.com/fruwehq/harel-python"
-Specification = "https://github.com/fruwehq/harel"
-Issues = "https://github.com/fruwehq/harel-python/issues"
+Homepage = "https://github.com/fruwehq/determa-state-python"
+Repository = "https://github.com/fruwehq/determa-state-python"
+Specification = "https://github.com/fruwehq/determa-state-spec"
+Issues = "https://github.com/fruwehq/determa-state-python/issues"
 
 [project.optional-dependencies]
 dev = [
@@ -44,21 +44,21 @@ dev = [
 ]
 
 [project.scripts]
-harel = "harel.cli:main"
+determa-state = "determa.state.cli:main"
 
 [tool.hatch.version]
-path = "src/harel/__about__.py"
+path = "src/determa/state/__about__.py"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/harel"]
+packages = ["src/determa"]
 
 [tool.hatch.build.targets.wheel.force-include]
-"src/harel/data/machine.schema.json" = "harel/data/machine.schema.json"
+"src/determa/state/data/machine.schema.json" = "determa/state/data/machine.schema.json"
 
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-extend-exclude = ["vendor"]  # the harel spec repo is a vendored submodule, not ours to lint
+extend-exclude = ["vendor"]  # the Determa State spec repo is a vendored submodule, not ours to lint
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "W", "C4"]
@@ -67,7 +67,7 @@ select = ["E", "F", "I", "UP", "B", "W", "C4"]
 python_version = "3.11"
 strict = true
 warn_unused_ignores = true
-files = ["src/harel"]
+files = ["src/determa"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

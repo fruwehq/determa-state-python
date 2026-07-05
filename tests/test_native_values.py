@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 
-from harel import Host, load_definitions
+from determa.state import Host, load_definitions
 
 TYPES = """\
 id: types

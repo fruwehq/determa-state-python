@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from harel import load_definition
-from harel.export import export
-from harel.model import Machine
+from determa.state import load_definition
+from determa.state.export import export
+from determa.state.model import Machine
 
 TURNSTILE = """
 id: turnstile

@@ -13,8 +13,8 @@ from pathlib import Path
 
 import pytest
 
-import harel
-import harel.cli as cli
+import determa.state as ds
+import determa.state.cli as cli
 
 TURNSTILE = """\
 id: turnstile
@@ -40,9 +40,9 @@ top:
 """
 
 
-def _host() -> harel.Host:
-    host = harel.Host()
-    host.register_all(harel.load_definitions(TURNSTILE))
+def _host() -> ds.Host:
+    host = ds.Host()
+    host.register_all(ds.load_definitions(TURNSTILE))
     host.create_root(host.machines["turnstile"], "t1")
     host.run_to_quiescence()
     return host

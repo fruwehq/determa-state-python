@@ -21,7 +21,7 @@ from . import collect_errors, load_definitions
 from . import export as export_mod
 from .contracts import load_contract, validate_contracts
 from .engine import Host
-from .errors import HarelError
+from .errors import DetermaError
 from .instance import Instance, Status
 from .model import Machine
 from .store import Store, StoreState, open_store
@@ -37,23 +37,23 @@ EXIT_FAULTED = 5
 
 def main(argv: list[str] | None = None) -> int:
     args = _build_parser().parse_args(argv)
-    store_dir = args.store or os.environ.get("HAREL_STORE", "./.harel")
+    store_dir = args.store or os.environ.get("DETERMA_STORE", "./.determa")
     try:
         return int(args.cmd(args, open_store(store_dir)))
-    except HarelError as exc:
+    except DetermaError as exc:
         print(str(exc), file=sys.stderr)
         return EXIT_OTHER
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="harel", description="harel statechart engine")
+    p = argparse.ArgumentParser(prog="determa-state", description="Determa State statechart engine")
     p.add_argument(
         "--store",
         default=None,
-        help="store spec: file:<dir> | mem: | sqlite:<path> (default ./.harel)",
+        help="store spec: file:<dir> | mem: | sqlite:<path> (default ./.determa)",
     )
     p.add_argument(
-        "--version", action="version", version=f"harel {_pkg_version()}"
+        "--version", action="version", version=f"determa-state {_pkg_version()}"
     )
     sub = p.add_subparsers(dest="command", required=True)
 
@@ -472,7 +472,7 @@ def _run_one(
     except SystemExit as exc:  # argparse usage error
         code = exc.code if isinstance(exc.code, int) else EXIT_USAGE
         return code, None, (err.getvalue().strip() or "usage error")
-    except HarelError as exc:
+    except DetermaError as exc:
         return EXIT_OTHER, None, str(exc)
 
     result = _parse_captured(out.getvalue())

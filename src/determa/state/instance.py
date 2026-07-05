@@ -18,7 +18,7 @@ from typing import TYPE_CHECKING, Any
 
 from . import cel, values
 from .cel import CelError
-from .errors import HarelError
+from .errors import DetermaError
 from .model import Machine, State
 
 log = logging.getLogger(__name__)
@@ -147,18 +147,18 @@ class Instance:
             if name in cur.declares_esvs:
                 live = self.esv_values.get(cur.path)
                 if live is None:
-                    raise HarelError(f"esv '{name}' not live")
+                    raise DetermaError(f"esv '{name}' not live")
                 decl = cur.raw["esvs"][name]
                 if decl.get("external"):
-                    raise HarelError(f"external esv '{name}' is read-only")
+                    raise DetermaError(f"external esv '{name}' is read-only")
                 if not values.matches(value, decl["type"]):
-                    raise HarelError(f"'{name}' must be {decl['type']}")
+                    raise DetermaError(f"'{name}' must be {decl['type']}")
                 live[name] = value
                 return
             if cur.is_sm_boundary:  # do not assign across the submachine isolation boundary
                 break
             cur = cur.parent
-        raise HarelError(f"no in-scope esv '{name}' to assign")
+        raise DetermaError(f"no in-scope esv '{name}' to assign")
 
     # --- actions ------------------------------------------------------------
     def run_actions(self, actions: list[dict[str, Any]], root: State, event: Event | None) -> None:
@@ -184,7 +184,7 @@ class Instance:
         if "stop" in action:
             self.host.stop(self)
             return
-        raise HarelError(f"unknown action: {action}")
+        raise DetermaError(f"unknown action: {action}")
 
     def run_entry(self, state: State) -> None:
         self.run_actions(state.raw.get("entry") or [], state, self.current_event)
@@ -370,7 +370,7 @@ class Instance:
         seen: set[str] = set()
         while node.type == "choice":
             if node.path in seen:
-                raise HarelError(f"cyclic choice '{node.name}'")
+                raise DetermaError(f"cyclic choice '{node.name}'")
             seen.add(node.path)
             chosen: dict[str, Any] | None = None
             for br in node.raw.get("choice") or []:
@@ -379,7 +379,7 @@ class Instance:
                     chosen = br
                     break
             if chosen is None:
-                raise HarelError(f"choice '{node.name}' has no matching branch")
+                raise DetermaError(f"choice '{node.name}' has no matching branch")
             self.run_actions(chosen.get("action") or [], owner, event)
             node = self.machine.resolve_target(node, chosen["transition_to"])
         return node
@@ -578,7 +578,7 @@ class Instance:
         snapshot = self._snapshot()
         try:
             changed = self.dispatch(event)
-        except (CelError, HarelError) as exc:
+        except (CelError, DetermaError) as exc:
             self._restore(snapshot)
             self._handle_fault(event, exc)
             return
@@ -629,7 +629,7 @@ class Instance:
         snapshot = self._snapshot()
         try:
             changed = self.dispatch(error_event)
-        except (CelError, HarelError):
+        except (CelError, DetermaError):
             self._restore(snapshot)
             log.warning("instance %s faulted: error handler itself faulted", self.id)
             self.status = Status.FAULTED
@@ -710,7 +710,7 @@ class Instance:
                 if live is not None:
                     live[name] = value
                 return
-        raise HarelError(f"no external esv '{name}' to refresh")
+        raise DetermaError(f"no external esv '{name}' to refresh")
 
     def _undefer(self) -> None:
         """Edge-triggered: on a config change, reinsert no-longer-deferred events

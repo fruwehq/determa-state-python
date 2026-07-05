@@ -20,9 +20,9 @@ from pathlib import Path
 
 import pytest
 
-import harel
-from harel import load_definitions
-from harel.validator import schema as bundled_schema
+import determa.state as ds
+from determa.state import load_definitions
+from determa.state.validator import schema as bundled_schema
 
 from .harness import (
     CONFORMANCE_DIR,
@@ -35,17 +35,17 @@ from .harness import (
 
 
 def _spec_schema() -> dict | None:
-    """The normative schema from fruwehq/harel at the matching tag (or a local override).
+    """The normative schema from fruwehq/determa-state-spec at the matching tag (or an override).
 
-    Returns ``None`` when offline and no ``HAREL_SPEC_DIR`` override is set, so the
+    Returns ``None`` when offline and no ``DETERMA_SPEC_DIR`` override is set, so the
     drift test can skip rather than fail.
     """
-    override = os.environ.get("HAREL_SPEC_DIR")
+    override = os.environ.get("DETERMA_SPEC_DIR")
     if override:
         p = Path(override) / "schema" / "machine.schema.json"
         return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
-    for ref in (f"v{harel.__version__}", "main"):
-        url = f"https://raw.githubusercontent.com/fruwehq/harel/{ref}/schema/machine.schema.json"
+    for ref in (f"v{ds.__version__}", "main"):
+        url = f"https://raw.githubusercontent.com/fruwehq/determa-state-spec/{ref}/schema/machine.schema.json"
         try:
             with urllib.request.urlopen(url, timeout=10) as resp:  # noqa: S310 (fixed host)
                 return json.loads(resp.read())
@@ -85,13 +85,15 @@ def test_bundled_schema_matches_spec() -> None:
     """The engine's bundled schema must equal the spec repo's schema (no drift)."""
     upstream = _spec_schema()
     if upstream is None:
-        pytest.skip("spec schema unavailable (offline; set HAREL_SPEC_DIR to a harel checkout)")
+        pytest.skip(
+            "spec schema unavailable (offline; set DETERMA_SPEC_DIR to a local checkout)"
+        )
     assert upstream == bundled_schema()
 
 
 def test_suite_present() -> None:
     if not CONFORMANCE_DIR.exists():
-        pytest.skip("conformance suite not fetched (offline; set HAREL_CONFORMANCE_DIR)")
+        pytest.skip("conformance suite not fetched (offline; set DETERMA_CONFORMANCE_DIR)")
     assert len(engine_cases()) == 31, "expected 31 engine cases"
     assert len(cli_cases()) == 3, "expected 3 CLI cases"
 

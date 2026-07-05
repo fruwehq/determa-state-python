@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from harel import ValidationError, collect_errors, load_definition, validate, yaml12
-from harel.validator import ALL_RESERVED, RESERVED_EVENTS, RESERVED_NAMES
+from determa.state import ValidationError, collect_errors, load_definition, validate, yaml12
+from determa.state.validator import ALL_RESERVED, RESERVED_EVENTS, RESERVED_NAMES
 
 VALID = """
 id: m

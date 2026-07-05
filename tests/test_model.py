@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from harel import load_definition
-from harel.model import Machine
+from determa.state import load_definition
+from determa.state.model import Machine
 
 # top -> c (composite, initial a) -> a, b
 NESTED = """
@@ -66,7 +66,7 @@ def test_resolve_searches_upward_to_sibling(machine: Machine) -> None:
 
 
 def test_unresolved_reference_raises_at_build() -> None:
-    from harel import ValidationError
+    from determa.state import ValidationError
 
     with pytest.raises(ValidationError):
         Machine(

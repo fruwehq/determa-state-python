@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://harel.dev/schema/machine.schema.json",
-  "title": "harel machine definition",
-  "description": "Strict structural schema for a harel statechart definition (SPEC.md §4). Validates one YAML/JSON document. Semantics (RTC, scoping, defer, timers, bus) live in SPEC.md and the conformance suite.",
+  "$id": "https://determa.dev/state/schema/machine.schema.json",
+  "title": "Determa State machine definition",
+  "description": "Strict structural schema for a Determa State statechart definition (SPEC.md §4). Validates one YAML/JSON document. Semantics (RTC, scoping, defer, timers, bus) live in SPEC.md and the conformance suite.",
   "type": "object",
   "required": ["id", "top"],
   "additionalProperties": false,
@@ -17,7 +17,7 @@
       "additionalProperties": false,
       "properties": {
         "guard": { "type": "string", "default": "cel" },
-        "action": { "type": "string", "default": "harel" }
+        "action": { "type": "string", "default": "determa" }
       }
     },
     "events": {

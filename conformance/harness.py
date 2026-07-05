@@ -1,6 +1,6 @@
 """Conformance-suite harness helpers.
 
-The language-agnostic suite (SPEC §9) lives in ``fruwehq/harel-conformance`` and is
+The language-agnostic suite (SPEC §9) lives in ``fruwehq/determa-state-conformance`` and is
 fetched at the matching release tag by ``conftest.py`` (no git submodule). These helpers
 locate the fetched suite, enumerate cases, and run engine cases against this
 implementation (create the root as id ``root``, per step ``send``/``advance``, run all
@@ -17,19 +17,19 @@ from pathlib import Path
 from types import ModuleType
 from typing import Any
 
-from harel import Host
+from determa.state import Host
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 
 def conformance_root() -> Path:
-    """Root of the fetched ``harel-conformance`` checkout.
+    """Root of the fetched ``determa-state-conformance`` checkout.
 
-    ``HAREL_CONFORMANCE_DIR`` overrides with a local checkout (offline/dev); otherwise
+    ``DETERMA_CONFORMANCE_DIR`` overrides with a local checkout (offline/dev); otherwise
     the cache populated by ``conftest.py`` is used.
     """
-    env = os.environ.get("HAREL_CONFORMANCE_DIR")
-    return Path(env) if env else REPO_ROOT / ".cache" / "harel-conformance"
+    env = os.environ.get("DETERMA_CONFORMANCE_DIR")
+    return Path(env) if env else REPO_ROOT / ".cache" / "determa-state-conformance"
 
 
 CONFORMANCE_DIR = conformance_root() / "conformance"
@@ -129,7 +129,7 @@ def cli_cases() -> list[Path]:
 def run_cli_case(case_dir: Path) -> None:
     """Run a CLI case **black-box** via the spec repo's reference runner (§13.6).
 
-    Invokes this package as a subprocess (``python -m harel``), so packaging and
+    Invokes this package as a subprocess (``python -m determa.state``), so packaging and
     entry-point regressions are caught — not an in-process import. Delegating to the
     suite's ``conformance/run_cli.py`` also avoids harness drift.
     """
@@ -137,7 +137,7 @@ def run_cli_case(case_dir: Path) -> None:
     rc = runner.main(
         [
             "--cmd",
-            f"{sys.executable} -m harel",
+            f"{sys.executable} -m determa.state",
             "--conformance-dir",
             str(CONFORMANCE_DIR / "cli"),
             case_dir.name,
@@ -148,7 +148,7 @@ def run_cli_case(case_dir: Path) -> None:
 
 def _load_cli_runner() -> ModuleType:
     path = CONFORMANCE_DIR / "run_cli.py"
-    spec = importlib.util.spec_from_file_location("harel_cli_runner", path)
+    spec = importlib.util.spec_from_file_location("determa_cli_runner", path)
     assert spec is not None and spec.loader is not None, f"runner not found: {path}"
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -158,14 +158,14 @@ def _load_cli_runner() -> ModuleType:
 # --- engine case runner -----------------------------------------------------
 def run_engine_case(case: EngineCase) -> None:
     """Execute one engine conformance case, asserting every ``expect`` (SPEC §9)."""
-    from harel import collect_errors, load_definition, load_definitions
-    from harel.contracts import load_contract, validate_contracts
+    from determa.state import collect_errors, load_definition, load_definitions
+    from determa.state.contracts import load_contract, validate_contracts
 
     test = _load_yaml(case.test_file)
     assert case.machine_files, f"{case.name}: no machine files"
 
     if "static" in test:
-        from harel import ValidationError
+        from determa.state import ValidationError
 
         expected = bool(test["static"]["valid"])
         try:

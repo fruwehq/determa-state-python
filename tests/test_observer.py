@@ -5,8 +5,8 @@ from __future__ import annotations
 import io
 import json
 
-import harel
-from harel import CollectingObserver, Host, JsonlObserver
+import determa.state as ds
+from determa.state import CollectingObserver, Host, JsonlObserver
 
 TURNSTILE = """\
 id: turnstile
@@ -29,7 +29,7 @@ top:
 
 def _host(observer=None) -> Host:
     host = Host(observer=observer)
-    host.register_all(harel.load_definitions(TURNSTILE))
+    host.register_all(ds.load_definitions(TURNSTILE))
     host.create_root(host.machines["turnstile"], "t1")
     host.run_to_quiescence()
     return host

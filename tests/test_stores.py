@@ -12,9 +12,9 @@ import json
 
 import pytest
 
-import harel
-import harel.cli as cli
-from harel.store import FileStore, MemoryStore, SqliteStore, StoreState, open_store
+import determa.state as ds
+import determa.state.cli as cli
+from determa.state.store import FileStore, MemoryStore, SqliteStore, StoreState, open_store
 
 TURNSTILE = """\
 id: turnstile
@@ -50,8 +50,8 @@ def test_open_store_bare_path_is_file_for_backcompat(tmp_path) -> None:
 
 # --- round-trip parity across backends --------------------------------------
 def _state() -> StoreState:
-    host = harel.Host()
-    host.register_all(harel.load_definitions(TURNSTILE))
+    host = ds.Host()
+    host.register_all(ds.load_definitions(TURNSTILE))
     host.create_root(host.machines["turnstile"], "t1")
     host.run_to_quiescence()
     return StoreState(

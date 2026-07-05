@@ -10,7 +10,7 @@ import math
 
 import pytest
 
-from harel import yaml12
+from determa.state import yaml12
 
 CASES = {
     # booleans — ONLY true/false (and capitalisations) are bool in 1.2 core.
