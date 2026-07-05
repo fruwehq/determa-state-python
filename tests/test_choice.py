@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import pytest
 
-from harel import Host, collect_errors, load_definitions
-from harel.errors import ValidationError
-from harel.model import Machine
+from determa.state import Host, collect_errors, load_definitions
+from determa.state.errors import ValidationError
+from determa.state.model import Machine
 
 ATM = """\
 id: atm

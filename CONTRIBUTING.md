@@ -1,11 +1,11 @@
-# Contributing to harel-python
+# Contributing to Determa State (Python)
 
-**harel-python** is the Python reference implementation of the
-[harel](https://github.com/fruwehq/harel) statechart engine. It is correct **iff** it
-passes the language-agnostic [conformance suite](https://github.com/fruwehq/harel-conformance).
-The prose specification lives in [`fruwehq/harel`](https://github.com/fruwehq/harel)
+**determa-state** is the Python reference implementation of the
+[Determa State](https://github.com/fruwehq/determa-state-spec) statechart engine. It is correct **iff** it
+passes the language-agnostic [conformance suite](https://github.com/fruwehq/determa-state-conformance).
+The prose specification lives in [`fruwehq/determa-state-spec`](https://github.com/fruwehq/determa-state-spec)
 (`SPEC.md`, the JSON Schema, and examples); the executable correctness target lives in
-[`fruwehq/harel-conformance`](https://github.com/fruwehq/harel-conformance).
+[`fruwehq/determa-state-conformance`](https://github.com/fruwehq/determa-state-conformance).
 
 ## Dev setup
 
@@ -15,7 +15,7 @@ source .venv/bin/activate     # or `.venv\Scripts\activate` on Windows
 pip install -e '.[dev]'
 ```
 
-Python ≥ 3.11. The package is import-named `harel`, distribution-named `harel-python`.
+Python ≥ 3.11. The package is import-named `determa.state`, distribution-named `determa-state`.
 
 ## The gate
 
@@ -45,15 +45,15 @@ make conformance   # == pytest conformance
 ```
 
 The suite is **not** a submodule. `conformance/conftest.py` clones
-`fruwehq/harel-conformance` at the release tag matching this package's version (falling
+`fruwehq/determa-state-conformance` at the release tag matching this package's version (falling
 back to `main` while the tag does not yet exist) into a gitignored `.cache/` directory and
 reuses it. To force a refresh, delete `.cache/`.
 
 - **Offline / local edits:** point the tests at a local checkout with
-  `HAREL_CONFORMANCE_DIR=/path/to/harel-conformance` (and `HAREL_SPEC_DIR=/path/to/harel`
+  `DETERMA_CONFORMANCE_DIR=/path/to/determa-state-conformance` (and `DETERMA_SPEC_DIR=/path/to/determa-state-spec`
   for the schema-parity test). If the suite cannot be obtained and no override is set, the
   conformance tests **skip** rather than error.
-- **Black-box CLI conformance** runs the implementation's `harel` (via `python -m harel`)
+- **Black-box CLI conformance** runs the implementation's `determa-state` (via `python -m determa.state`)
   as a **subprocess** against `conformance/run_cli.py`, so packaging/entry-point regressions
   are caught (SPEC §13.6).
 
@@ -65,29 +65,29 @@ reuses it. To force a refresh, delete `.cache/`.
 4. **No AI/assistant attribution anywhere** — not in commits, PR bodies, comments, or
    docs (no `Co-Authored-By:`, no "Generated with…"). Commits and PRs read as the
    author's own work.
-5. One issue → one PR. A behavior change usually pairs with a `harel` spec edit and a
-   `harel-conformance` case; link them from the PR.
+5. One issue → one PR. A behavior change usually pairs with a `determa-state-spec` edit and a
+   `determa-state-conformance` case; link them from the PR.
 
 ## Versioning
 
 The version source of truth is **`pyproject.toml`** (`version = …`); the package derives
-`harel.__version__` from the installed distribution metadata (no second copy to keep in
-sync). The package version **is** the implemented harel spec version.
+`determa.state.__version__` from the installed distribution metadata (no second copy to keep in
+sync). The package version **is** the implemented Determa State spec version.
 
-> harel, harel-conformance, and harel-python share one synchronized SemVer version
+> determa-state-spec, determa-state-conformance, and determa-state share one synchronized SemVer version
 > (currently pre-1.0 `0.0.x`). A release tags all three `vX.Y.Z` in lockstep; an
-> implementation declares "implements harel spec vX.Y.Z" and pins the conformance suite
+> implementation declares "implements Determa State spec vX.Y.Z" and pins the conformance suite
 > at that tag.
 
 ### Releasing `vX.Y.Z` (lockstep)
 1. Land all spec / conformance / implementation changes on the three `main` branches.
-2. Bump the version in **`pyproject.toml`** (here) and the `VERSION` files in `harel` and
-   `harel-conformance`.
-3. Tag `vX.Y.Z` on **harel** and **harel-conformance** (`gh api -X POST
+2. Bump the version in **`pyproject.toml`** (here) and the `VERSION` files in `determa-state-spec` and
+   `determa-state-conformance`.
+3. Tag `vX.Y.Z` on **determa-state-spec** and **determa-state-conformance** (`gh api -X POST
    repos/fruwehq/<repo>/git/refs -f ref=refs/tags/vX.Y.Z -f sha=$(gh api
    repos/fruwehq/<repo>/commits/main --jq .sha)`), so this package pins the matching
    conformance tag instead of falling back to `main`.
-4. Tag **harel-python** `vX.Y.Z` only to publish to PyPI — it triggers `release.yml`
+4. Tag **determa-state** `vX.Y.Z` only to publish to PyPI — it triggers `release.yml`
    (Trusted Publishing).
 
 ## License

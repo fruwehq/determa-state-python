@@ -1,17 +1,17 @@
-# harel-python
+# determa-state
 
-Reference implementation (**Python**) of the [**harel**](https://github.com/fruwehq/harel)
+Reference implementation (**Python**) of the [**Determa State**](https://github.com/fruwehq/determa-state-spec)
 statechart engine.
 
 The normative `SPEC.md`, the JSON Schema for machine YAML, and the cross-language
 **conformance suite** live in the spec repo. This repository implements that spec in
 Python and is correct **iff it passes the conformance suite**.
 
-Implements the **harel spec v0.0.3** (early alpha; all fruwehq harel repos share one
-[synchronized version](https://github.com/fruwehq/harel)).
+Implements the **Determa State spec v0.0.5** (early alpha; all Determa State repos share one
+[synchronized version](https://github.com/fruwehq/determa-state-spec)).
 
-Status: **passing the full conformance suite** — all 30 engine cases
-(`conformance/01`–`30`) plus `conformance/cli/01`–`03`. Implements YAML 1.2 loading
+Status: **passing the full conformance suite** — all 31 engine cases
+(`conformance/01`–`31`) plus `conformance/cli/01`–`03`. Implements YAML 1.2 loading
 + validation, the full statechart semantics (RTC dispatch, hierarchy, orthogonal
 regions + `done`, shallow/deep history, choice pseudostates, submachine states, esvs, CEL guards,
 structured actions,
@@ -19,22 +19,22 @@ active objects + bus, defer, timers, faults), static contracts, snapshot
 round-trip + safe-point migration, Mermaid `export`, and the §13 CLI. Built up
 the build order in [issue #3][issue].
 
-[issue]: https://github.com/fruwehq/harel-python/issues/3
+[issue]: https://github.com/fruwehq/determa-state-python/issues/3
 
 ## Conformance suite
 
 The cross-language **conformance suite** is the single source of truth for correctness;
 this repository is correct **iff it passes it**. The suite lives in
-[`fruwehq/harel-conformance`](https://github.com/fruwehq/harel-conformance); the test
-harness **fetches it at the matching release tag** (`v0.0.1`) into a gitignored
+[`fruwehq/determa-state-conformance`](https://github.com/fruwehq/determa-state-conformance); the test
+harness **fetches it at the matching release tag** (`v0.0.5`) into a gitignored
 `.cache/` — no git submodule. The normative `SPEC.md` and JSON Schema live in
-[`fruwehq/harel`](https://github.com/fruwehq/harel); the schema-drift test fetches the
+[`fruwehq/determa-state-spec`](https://github.com/fruwehq/determa-state-spec); the schema-drift test fetches the
 schema at the same tag.
 
 For **offline** work, point the harness at a local checkout:
 ```
-export HAREL_CONFORMANCE_DIR=/path/to/harel-conformance   # the suite
-export HAREL_SPEC_DIR=/path/to/harel                        # the schema (optional)
+export DETERMA_CONFORMANCE_DIR=/path/to/determa-state-conformance   # the suite
+export DETERMA_SPEC_DIR=/path/to/determa-state-spec                        # the schema (optional)
 ```
 
 ## Scope (per the spec)
@@ -56,16 +56,16 @@ export HAREL_SPEC_DIR=/path/to/harel                        # the schema (option
 - A test harness that runs the upstream conformance cases against this engine.
 
 ## Use as a library
-The CLI (`harel …`) is a thin wrapper over a programmatic API; an engine can be
+The CLI (`determa-state …`) is a thin wrapper over a programmatic API; an engine can be
 embedded in a host program **without** the CLI or the file-backed store (SPEC §2):
 
 ```python
-import harel
+import determa.state as ds
 
-defs = harel.load_definitions(open("gate.yaml").read())
-harel.validate(defs[0].raw)                     # raises ValidationError if invalid
+defs = ds.load_definitions(open("gate.yaml").read())
+ds.validate(defs[0].raw)                     # raises ValidationError if invalid
 
-host = harel.Host()
+host = ds.Host()
 host.register_all(defs)
 inst = host.create_root(host.machines["gate"], "g1", external={"fare": 50})
 host.run_to_quiescence()
@@ -74,15 +74,15 @@ host.deliver("g1", "coin", {"amount": 100})     # typed event; False if rejected
 host.run_to_quiescence()
 assert inst.active_leaf_names() == ["unlocked"]
 assert inst.resolved_esvs()["fare"] == 50
-assert inst.status is harel.Status.ACTIVE
+assert inst.status is ds.Status.ACTIVE
 
 host.advance("30s")                             # virtual clock
 snaps = host.snapshot_all()                     # persist / round-trip (§8)
 host.restore_all(snaps)
 ```
 
-The public surface is everything exported from the top-level `harel` package
-(`harel.__all__`): `Host`, `Instance`, `Definition`, `Machine`, `Status`, `Event`,
+The public surface is everything exported from the `determa.state` package
+(`determa.state.__all__`): `Host`, `Instance`, `Definition`, `Machine`, `Status`, `Event`,
 `load_definitions` / `load_definition`, `validate` / `collect_errors`, and the
 error types. See [`tests/test_library_api.py`](tests/test_library_api.py).
 
@@ -93,22 +93,23 @@ faulted }`. Built-ins: `JsonlObserver(stream)` (a drop-in transition log) and
 `CollectingObserver` (records to a list).
 
 ```python
-import sys, harel
-host = harel.Host(observer=harel.JsonlObserver(sys.stdout))  # one JSON line per step
+import sys
+import determa.state as ds
+host = ds.Host(observer=ds.JsonlObserver(sys.stdout))  # one JSON line per step
 ```
 
 The Observer is *domain* observability (what the machine did). For *operational*
-diagnostics the engine also emits **standard-library logging** under the `harel` logger
+diagnostics the engine also emits **standard-library logging** under the `determa.state` logger
 (dispatch/transition at `DEBUG`, faults/dead-letter at `WARNING`). It is silent by
 default (a `NullHandler` is attached); enable it from the host app:
 
 ```python
 import logging
-logging.basicConfig(level=logging.DEBUG)   # or logging.getLogger("harel").setLevel(...)
+logging.basicConfig(level=logging.DEBUG)   # or logging.getLogger("determa.state").setLevel(...)
 ```
 
 ## Layout
-- `src/harel/` — the package.
+- `src/determa/state/` — the package.
 - `tests/` — the implementation's own **unit tests** (hermetic, offline).
 - `conformance/` — the harness that runs the external **conformance suite** black-box
   against this implementation (kept separate from the unit tests).
@@ -122,8 +123,8 @@ make check        # ruff + mypy + unit tests (hermetic, offline) — the PR gate
 make conformance  # download & run the language-agnostic conformance suite
 ```
 Equivalently: `pytest` runs the unit tests only; `pytest conformance` runs the
-conformance suite (it fetches `harel-conformance` into `.cache/` on first run — set
-`HAREL_CONFORMANCE_DIR` to use a local checkout offline). The two are **separate**:
+conformance suite (it fetches `determa-state-conformance` into `.cache/` on first run — set
+`DETERMA_CONFORMANCE_DIR` to use a local checkout offline). The two are **separate**:
 unit tests never touch the network; conformance is opt-in.
 
 ## License

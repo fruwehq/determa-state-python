@@ -1,13 +1,13 @@
 """The public library API (SPEC §2 "Library API").
 
-Drives a machine end-to-end through ``harel``'s public surface **only** — no
-``harel.cli`` and no file-backed store — exercising every capability the spec
+Drives a machine end-to-end through the ``determa.state`` public surface **only** — no
+``determa.state.cli`` and no file-backed store — exercising every capability the spec
 requires an embeddable API to provide.
 """
 
 from __future__ import annotations
 
-import harel
+import determa.state as ds
 
 GATE = """\
 id: gate
@@ -49,19 +49,19 @@ top:
 
 def test_minimum_capability_set_via_public_api() -> None:
     # 1. load + validate a definition (raises ValidationError if invalid).
-    defs = harel.load_definitions(GATE)
+    defs = ds.load_definitions(GATE)
     for d in defs:
-        harel.validate(d.raw)
-    assert harel.collect_errors(defs[0].raw) == []
+        ds.validate(d.raw)
+    assert ds.collect_errors(defs[0].raw) == []
 
     # 2. register definitions + create a root instance with an id and external esvs.
-    host = harel.Host()
+    host = ds.Host()
     host.register_all(defs)
     inst = host.create_root(host.machines["gate"], "g1", external={"fare": 50})
     host.run_to_quiescence()
 
     # 3. read status, active configuration, and esvs.
-    assert inst.status is harel.Status.ACTIVE
+    assert inst.status is ds.Status.ACTIVE
     assert inst.active_leaf_names() == ["locked"]
     assert inst.resolved_esvs()["fare"] == 50
 
@@ -96,7 +96,7 @@ def test_public_surface_is_exported() -> None:
         "State",
         "Status",
         "Event",
-        "HarelError",
+        "DetermaError",
         "SchemaError",
         "ValidationError",
         "ErrorRecord",
@@ -107,16 +107,16 @@ def test_public_surface_is_exported() -> None:
         "collect_errors",
         "__version__",
     }
-    assert expected <= set(harel.__all__)
+    assert expected <= set(ds.__all__)
     for name in expected:
-        assert hasattr(harel, name), f"harel.{name} not exported"
+        assert hasattr(ds, name), f"determa.state.{name} not exported"
 
 
 def test_meta_is_validation_only_model_data_not_runtime_state() -> None:
-    defs = harel.load_definitions(META_GATE)
-    assert harel.collect_errors(defs[0].raw) == []
+    defs = ds.load_definitions(META_GATE)
+    assert ds.collect_errors(defs[0].raw) == []
 
-    host = harel.Host()
+    host = ds.Host()
     host.register_all(defs)
     machine = host.machines["meta_gate"]
     inst = host.create_root(machine, "m1")

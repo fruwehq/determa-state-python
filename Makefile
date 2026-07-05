@@ -4,15 +4,15 @@
 test:
 	pytest -q
 
-# Conformance — the language-agnostic suite from fruwehq/harel-conformance, run
+# Conformance — the language-agnostic suite from fruwehq/determa-state-conformance, run
 # black-box against this implementation. Downloads the suite (pinned to the release
 # tag matching this package's version) into .cache/ on first run.
-# Offline / against a local checkout:  HAREL_CONFORMANCE_DIR=/path/to/harel-conformance make conformance
+# Offline / against a local checkout:  DETERMA_CONFORMANCE_DIR=/path/to/determa-state-conformance make conformance
 conformance:
 	pytest conformance -q
 
-# Refresh the bundled JSON Schema from fruwehq/harel at the matching version tag
-# (or HAREL_SPEC_DIR=/path/to/harel). The schema-drift test guards that they match.
+# Refresh the bundled JSON Schema from fruwehq/determa-state-spec at the matching version tag
+# (or DETERMA_SPEC_DIR=/path/to/determa-state-spec). The schema-drift test guards that they match.
 sync-schema:
 	python scripts/sync_schema.py
 

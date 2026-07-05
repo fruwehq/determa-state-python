@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Refresh the bundled JSON Schema from the spec repo (fruwehq/harel).
+"""Refresh the bundled JSON Schema from the spec repo (fruwehq/determa-state-spec).
 
-Writes ``src/harel/data/machine.schema.json`` from harel's
+Writes ``src/determa/state/data/machine.schema.json`` from Determa State's
 ``schema/machine.schema.json`` at the tag matching this package's version (falling back
-to ``main``), or from a local checkout via ``HAREL_SPEC_DIR``. This removes the manual
+to ``main``), or from a local checkout via ``DETERMA_SPEC_DIR``. This removes the manual
 copy step; the schema-drift test still guards that the two stay in sync.
 
 Usage: ``python scripts/sync_schema.py``  (or ``make sync-schema``).
@@ -20,8 +20,8 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DEST = ROOT / "src" / "harel" / "data" / "machine.schema.json"
-ABOUT = ROOT / "src" / "harel" / "__about__.py"
+DEST = ROOT / "src" / "determa" / "state" / "data" / "machine.schema.json"
+ABOUT = ROOT / "src" / "determa" / "state" / "__about__.py"
 
 
 def _version() -> str:
@@ -32,18 +32,18 @@ def _version() -> str:
 
 
 def _fetch() -> str:
-    override = os.environ.get("HAREL_SPEC_DIR")
+    override = os.environ.get("DETERMA_SPEC_DIR")
     if override:
         return (Path(override) / "schema" / "machine.schema.json").read_text(encoding="utf-8")
     last: Exception | None = None
     for ref in (f"v{_version()}", "main"):
-        url = f"https://raw.githubusercontent.com/fruwehq/harel/{ref}/schema/machine.schema.json"
+        url = f"https://raw.githubusercontent.com/fruwehq/determa-state-spec/{ref}/schema/machine.schema.json"
         try:
             with urllib.request.urlopen(url, timeout=10) as resp:  # noqa: S310 (fixed host)
                 return resp.read().decode("utf-8")
         except urllib.error.URLError as exc:
             last = exc
-    raise SystemExit(f"could not fetch schema from fruwehq/harel: {last}")
+    raise SystemExit(f"could not fetch schema from fruwehq/determa-state-spec: {last}")
 
 
 def main() -> int:

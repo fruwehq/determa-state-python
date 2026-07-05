@@ -1,6 +1,6 @@
 """Observer adapter (SPEC §8): a passive per-step callback.
 
-When a :class:`~harel.engine.Host` is given an observer, it is invoked once per
+When a :class:`~determa.state.engine.Host` is given an observer, it is invoked once per
 completed RTC step — for both automatic (run-to-quiescence) and manual (``step``)
 processing — with a record::
 

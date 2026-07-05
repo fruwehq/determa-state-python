@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 import yaml
 
-from harel import collect_errors, load_definitions
-from harel.errors import ValidationError
+from determa.state import collect_errors, load_definitions
+from determa.state.errors import ValidationError
 
 
 def _errors(src: str) -> list[str]:

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import pytest
 
-from harel import Host, load_definitions
-from harel.errors import ValidationError
+from determa.state import Host, load_definitions
+from determa.state.errors import ValidationError
 
 ORDER = """\
 id: order

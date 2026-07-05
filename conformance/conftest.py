@@ -1,9 +1,9 @@
 """Fetch the language-agnostic conformance suite before test collection.
 
-The suite lives in ``fruwehq/harel-conformance`` (no git submodule). It is cloned at the
+The suite lives in ``fruwehq/determa-state-conformance`` (no git submodule). It is cloned at the
 release tag matching this package's version (falling back to ``main`` while the tag does
 not yet exist) into a gitignored ``.cache/`` directory and reused. Override with a local
-checkout via ``HAREL_CONFORMANCE_DIR`` for offline work. If the suite cannot be obtained
+checkout via ``DETERMA_CONFORMANCE_DIR`` for offline work. If the suite cannot be obtained
 (offline, no override), the conformance tests skip rather than error.
 """
 
@@ -13,22 +13,22 @@ import os
 import subprocess
 from pathlib import Path
 
-import harel
+import determa.state as ds
 
 _ROOT = Path(__file__).resolve().parent.parent
-_CACHE = _ROOT / ".cache" / "harel-conformance"
-_REPO = "https://github.com/fruwehq/harel-conformance.git"
+_CACHE = _ROOT / ".cache" / "determa-state-conformance"
+_REPO = "https://github.com/fruwehq/determa-state-conformance.git"
 
 
 def _ensure_conformance() -> None:
-    if os.environ.get("HAREL_CONFORMANCE_DIR"):
+    if os.environ.get("DETERMA_CONFORMANCE_DIR"):
         return  # caller provides a local checkout
     if (_CACHE / ".git").exists():
         return  # already fetched; reuse (force a refresh by deleting .cache/)
     _CACHE.parent.mkdir(parents=True, exist_ok=True)
     # Prefer the release tag matching our version; fall back to main (tags may not exist
     # yet pre-release). Network/tooling failure leaves the suite absent -> tests skip.
-    for ref in (f"v{harel.__version__}", "main"):
+    for ref in (f"v{ds.__version__}", "main"):
         try:
             subprocess.run(
                 ["git", "clone", "--depth", "1", "--branch", ref, _REPO, str(_CACHE)],

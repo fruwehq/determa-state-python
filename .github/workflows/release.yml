@@ -2,7 +2,7 @@ name: release
 
 # Tag-triggered release: build sdist+wheel and publish to PyPI via Trusted
 # Publishing (OIDC) — no API token stored. Configure a PyPI Trusted Publisher for
-# project `harel-python` (repo fruwehq/harel-python, workflow release.yml,
+# project `determa-state` (repo fruwehq/determa-state-python, workflow release.yml,
 # environment `pypi`) before the first tag-driven release.
 on:
   push:

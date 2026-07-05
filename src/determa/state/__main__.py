@@ -1,4 +1,4 @@
-"""Entry point for ``python -m harel`` (mirrors the ``harel`` console script)."""
+"""Entry point for ``python -m determa.state`` (mirrors the ``determa-state`` console script)."""
 
 from __future__ import annotations
 
