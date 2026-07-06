@@ -81,6 +81,34 @@ snaps = host.snapshot_all()                     # persist / round-trip (§8)
 host.restore_all(snaps)
 ```
 
+`load_definitions` also accepts a **native mapping** (or a list of them for a
+multi-document machine) instead of YAML text, so a host can build machines in code
+without serializing — through the same `validate()` path:
+
+```python
+import determa.state as ds
+
+gate = {
+    "id": "gate",
+    "events": {"coin": {"payload": {"amount": {"type": "int", "required": True}}}},
+    "top": {
+        "esvs": {"fare": {"type": "int", "external": True}},
+        "initial": {"transition_to": "locked"},
+        "states": {
+            "locked": {"on_events": {"coin": {"transition_to": "unlocked",
+                                              "guard": "event.payload.amount >= fare"}}},
+            "unlocked": {"on_events": {"push": {"transition_to": "locked"}}},
+        },
+    },
+}
+
+defs = ds.load_definitions(gate)                 # dict, not a YAML string
+host = ds.Host()
+host.register_all(defs)
+inst = host.create_root(host.machines["gate"], "g1", external={"fare": 50})
+host.run_to_quiescence()
+```
+
 The public surface is everything exported from the `determa.state` package
 (`determa.state.__all__`): `Host`, `Instance`, `Definition`, `Machine`, `Status`, `Event`,
 `load_definitions` / `load_definition`, `validate` / `collect_errors`, and the
