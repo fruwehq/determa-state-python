@@ -26,8 +26,6 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, cast
 
-import jsonschema
-
 from .errors import ErrorRecord, ValidationError
 
 RESERVED_NAMES = frozenset({"top", "id", "parent", "event"})
@@ -67,6 +65,8 @@ def collect_errors(doc: dict[str, Any]) -> list[ErrorRecord]:
 
 
 def _structural_errors(doc: dict[str, Any]) -> list[ErrorRecord]:
+    import jsonschema  # deferred: ~40ms to import, only needed when validating a machine
+
     validator = jsonschema.Draft202012Validator(schema())
     out: list[ErrorRecord] = []
     for err in sorted(validator.iter_errors(doc), key=lambda e: list(e.absolute_path)):
