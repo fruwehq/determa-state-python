@@ -46,98 +46,167 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="determa-state", description="Determa State statechart engine")
+    p = argparse.ArgumentParser(
+        prog="determa-state",
+        description="Determa State statechart engine",
+        formatter_class=_GroupedHelpFormatter,
+        epilog=(
+            "store specification (--store / DETERMA_STORE):\n"
+            "  file:<dir>    portable snapshot files (the default, ./.determa)\n"
+            "  mem:          in-memory, ephemeral\n"
+            "  sqlite:<path> a single-file database\n"
+            "examples:\n"
+            "  determa-state --store mem: new t1 machine.yaml\n"
+            "  determa-state --store sqlite:./state.db list --json"
+        ),
+    )
     p.add_argument(
         "--store",
         default=None,
-        help="store spec: file:<dir> | mem: | sqlite:<path> (default ./.determa)",
+        help="store spec: file:<dir> | mem: | sqlite:<path> (default ./.determa or $DETERMA_STORE)",
     )
-    p.add_argument(
-        "--version", action="version", version=f"determa-state {_pkg_version()}"
-    )
-    sub = p.add_subparsers(dest="command", required=True)
+    p.add_argument("--version", action="version", version=f"determa-state {_pkg_version()}")
+    sub = p.add_subparsers(dest="command", required=True, metavar="<command>")
 
     # `--json` is accepted per-subcommand (after the positionals).
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--json", action="store_true", help="machine-readable output")
 
-    def add(cmd: str, **kw: Any) -> argparse.ArgumentParser:
-        return sub.add_parser(cmd, parents=[common], **kw)
+    def add(cmd: str, group: str, desc: str, example: str, **kw: Any) -> argparse.ArgumentParser:
+        sp = sub.add_parser(
+            cmd,
+            parents=[common],
+            help=desc,
+            description=desc,
+            epilog=f"example:\n  {example}",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            **kw,
+        )
+        sp._cli_group = group  # type: ignore[attr-defined]
+        sp._cli_help = desc  # type: ignore[attr-defined]
+        return sp
 
-    v = add("validate")
+    v = add("validate", "Authoring", "validate a machine definition file",
+            "determa-state validate machine.yaml")
     v.add_argument("machine")
     v.set_defaults(cmd=cmd_validate)
 
-    e = add("export")
+    e = add("export", "Authoring", "render a machine to a diagram",
+            "determa-state export machine.yaml --format mermaid")
     e.add_argument("machine")
-    e.add_argument("--format", default="mermaid")
-    e.add_argument("--state", default=None)
+    e.add_argument("--format", default="mermaid", choices=["mermaid"],
+                   help="output format (currently only 'mermaid')")
+    e.add_argument("--state", default=None, help="instance id whose active config to highlight")
     e.set_defaults(cmd=cmd_export)
 
-    n = add("new")
+    n = add("new", "Instances", "create a new instance from a machine",
+            "determa-state new t1 machine.yaml --external token=abc")
     n.add_argument("id")
     n.add_argument("machine")
-    n.add_argument("--external", action="append", default=[])
+    n.add_argument("--external", action="append", default=[],
+                   help="seed an external esv: k=v (repeatable)")
     n.set_defaults(cmd=cmd_new)
 
-    s = add("send")
+    s = add("send", "Instances", "deliver an event to an instance",
+            "determa-state send t1 coin --payload amount=100")
     s.add_argument("instance")
     s.add_argument("event")
-    s.add_argument("--payload", action="append", default=[])
-    s.add_argument("--payload-json", default=None)
+    s.add_argument("--payload", action="append", default=[], help="event field k=v (repeatable)")
+    s.add_argument("--payload-json", default=None, help="whole payload as one JSON object")
     s.set_defaults(cmd=cmd_send)
 
-    a = add("advance")
-    a.add_argument("duration")
+    a = add("advance", "Instances", "advance the virtual clock by a duration",
+            "determa-state advance 5s")
+    a.add_argument("duration", help="e.g. 500ms, 5s, 2m")
     a.set_defaults(cmd=cmd_advance)
 
-    env = add("env")
+    env = add("env", "Instances", "notify an instance of environment changes",
+              "determa-state env t1 --changed level=high")
     env.add_argument("instance")
-    env.add_argument("--changed", required=True)
+    env.add_argument("--changed", required=True, help="comma-separated k=v pairs")
     env.set_defaults(cmd=cmd_env)
 
-    st = add("state")
+    st = add("state", "Instances", "print an instance's current state",
+             "determa-state state t1 --json")
     st.add_argument("instance")
     st.set_defaults(cmd=cmd_state)
 
-    add("list").set_defaults(cmd=cmd_list)
-
-    snap = add("snapshot")
-    snap.add_argument("instance")
-    snap.set_defaults(cmd=cmd_snapshot)
-
-    r = add("restore")
-    r.add_argument("snapshot")
-    r.set_defaults(cmd=cmd_restore)
-
-    run = add("run")
-    run.add_argument("source", nargs="?", default="-", help="'-' for stdin, or an NDJSON file")
-    run.set_defaults(cmd=cmd_run)
-
-    md = add("mode")
-    md.add_argument("mode", nargs="?", choices=["auto", "manual"])
-    md.set_defaults(cmd=cmd_mode)
-
-    ij = add("inject")
-    ij.add_argument("instance")
-    ij.add_argument("event")
-    ij.add_argument("--payload", action="append", default=[])
-    ij.add_argument("--payload-json", default=None)
-    ij.set_defaults(cmd=cmd_inject)
-
-    sp = add("step")
-    sp.add_argument("instance")
-    sp.add_argument("--steps", type=int, default=1)
-    sp.set_defaults(cmd=cmd_step)
-
-    en = add("enabled")
+    en = add("enabled", "Instances", "list events an instance can currently handle",
+             "determa-state enabled t1")
     en.add_argument("instance")
     en.set_defaults(cmd=cmd_enabled)
 
-    ip = add("inspect")
+    ip = add("inspect", "Instances", "show full internal state for debugging",
+             "determa-state inspect t1 --json")
     ip.add_argument("instance")
     ip.set_defaults(cmd=cmd_inspect)
+
+    md = add("mode", "Stepping", "get or set auto vs manual processing mode",
+             "determa-state mode manual")
+    md.add_argument("mode", nargs="?", choices=["auto", "manual"])
+    md.set_defaults(cmd=cmd_mode)
+
+    ij = add("inject", "Stepping", "enqueue an event without processing (manual mode)",
+             "determa-state inject t1 coin --payload amount=100")
+    ij.add_argument("instance")
+    ij.add_argument("event")
+    ij.add_argument("--payload", action="append", default=[], help="event field k=v (repeatable)")
+    ij.add_argument("--payload-json", default=None, help="whole payload as one JSON object")
+    ij.set_defaults(cmd=cmd_inject)
+
+    sp = add("step", "Stepping", "process N RTC steps (manual mode)",
+             "determa-state step t1 --steps 1")
+    sp.add_argument("instance")
+    sp.add_argument("--steps", type=int, default=1, help="number of RTC steps (default 1)")
+    sp.set_defaults(cmd=cmd_step)
+
+    snap = add("snapshot", "Persistence", "serialize an instance to a snapshot",
+               "determa-state snapshot t1 > t1.json")
+    snap.add_argument("instance")
+    snap.set_defaults(cmd=cmd_snapshot)
+
+    r = add("restore", "Persistence", "recreate an instance from a snapshot",
+            "determa-state restore t1.json")
+    r.add_argument("snapshot")
+    r.set_defaults(cmd=cmd_restore)
+
+    ls = add("list", "Persistence", "list all instances",
+             "determa-state list --json")
+    ls.set_defaults(cmd=cmd_list)
+
+    run = add("run", "Batch", "drive many commands from NDJSON stdin (§13.7)",
+              "echo '[\"new\",\"t1\",\"machine.yaml\"]' | determa-state run -")
+    run.add_argument("source", nargs="?", default="-", help="'-' for stdin, or an NDJSON file")
+    run.set_defaults(cmd=cmd_run)
     return p
+
+
+# Command groups, shown gcloud-style in --help (alphabetical within each group).
+_GROUP_ORDER = ["Authoring", "Instances", "Stepping", "Persistence", "Batch"]
+
+
+class _GroupedHelpFormatter(argparse.RawDescriptionHelpFormatter):
+    """Renders the subcommand list grouped by category (gcloud-style) in top-level help."""
+
+    def _format_action(self, action: argparse.Action) -> str:
+        if not isinstance(action, argparse._SubParsersAction):
+            return super()._format_action(action)
+        groups: dict[str, list[tuple[str, argparse.ArgumentParser]]] = {}
+        for name, parser in action.choices.items():
+            groups.setdefault(getattr(parser, "_cli_group", "Commands"), []).append(
+                (name, parser)
+            )
+        width = max((len(n) for items in groups.values() for n, _ in items), default=0)
+        lines: list[str] = []
+        ordered = _GROUP_ORDER + sorted(g for g in groups if g not in _GROUP_ORDER)
+        for group_name in ordered:
+            items = groups.get(group_name)
+            if not items:
+                continue
+            lines.append(f"  {group_name}:")
+            for name, parser in sorted(items):
+                lines.append(f"    {name:<{width}}  {getattr(parser, '_cli_help', '')}")
+        return "\n".join(lines) + "\n"
 
 
 # --- host (de)serialization -------------------------------------------------
