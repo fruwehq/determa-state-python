@@ -7,7 +7,7 @@ The normative `SPEC.md`, the JSON Schema for machine YAML, and the cross-languag
 **conformance suite** live in the spec repo. This repository implements that spec in
 Python and is correct **iff it passes the conformance suite**.
 
-Implements the **Determa State spec v0.0.5** (early alpha; all Determa State repos share one
+Implements the **Determa State spec v0.0.6** (early alpha; all Determa State repos share one
 [synchronized version](https://github.com/fruwehq/determa-state-spec)).
 
 Status: **passing the full conformance suite** — all 31 engine cases
@@ -26,7 +26,7 @@ the build order in [issue #3][issue].
 The cross-language **conformance suite** is the single source of truth for correctness;
 this repository is correct **iff it passes it**. The suite lives in
 [`fruwehq/determa-state-conformance`](https://github.com/fruwehq/determa-state-conformance); the test
-harness **fetches it at the matching release tag** (`v0.0.5`) into a gitignored
+harness **fetches it at the matching release tag** (`v0.0.6`) into a gitignored
 `.cache/` — no git submodule. The normative `SPEC.md` and JSON Schema live in
 [`fruwehq/determa-state-spec`](https://github.com/fruwehq/determa-state-spec); the schema-drift test fetches the
 schema at the same tag.
@@ -79,6 +79,34 @@ assert inst.status is ds.Status.ACTIVE
 host.advance("30s")                             # virtual clock
 snaps = host.snapshot_all()                     # persist / round-trip (§8)
 host.restore_all(snaps)
+```
+
+`load_definitions` also accepts a **native mapping** (or a list of them for a
+multi-document machine) instead of YAML text, so a host can build machines in code
+without serializing — through the same `validate()` path:
+
+```python
+import determa.state as ds
+
+gate = {
+    "id": "gate",
+    "events": {"coin": {"payload": {"amount": {"type": "int", "required": True}}}},
+    "top": {
+        "esvs": {"fare": {"type": "int", "external": True}},
+        "initial": {"transition_to": "locked"},
+        "states": {
+            "locked": {"on_events": {"coin": {"transition_to": "unlocked",
+                                              "guard": "event.payload.amount >= fare"}}},
+            "unlocked": {"on_events": {"push": {"transition_to": "locked"}}},
+        },
+    },
+}
+
+defs = ds.load_definitions(gate)                 # dict, not a YAML string
+host = ds.Host()
+host.register_all(defs)
+inst = host.create_root(host.machines["gate"], "g1", external={"fare": 50})
+host.run_to_quiescence()
 ```
 
 The public surface is everything exported from the `determa.state` package
