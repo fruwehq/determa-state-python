@@ -7,7 +7,7 @@ The normative `SPEC.md`, the JSON Schema for machine YAML, and the cross-languag
 **conformance suite** live in the spec repo. This repository implements that spec in
 Python and is correct **iff it passes the conformance suite**.
 
-Implements the **Determa State spec v0.0.5** (early alpha; all Determa State repos share one
+Implements the **Determa State spec v0.0.6** (early alpha; all Determa State repos share one
 [synchronized version](https://github.com/fruwehq/determa-state-spec)).
 
 Status: **passing the full conformance suite** — all 31 engine cases
@@ -26,7 +26,7 @@ the build order in [issue #3][issue].
 The cross-language **conformance suite** is the single source of truth for correctness;
 this repository is correct **iff it passes it**. The suite lives in
 [`fruwehq/determa-state-conformance`](https://github.com/fruwehq/determa-state-conformance); the test
-harness **fetches it at the matching release tag** (`v0.0.5`) into a gitignored
+harness **fetches it at the matching release tag** (`v0.0.6`) into a gitignored
 `.cache/` — no git submodule. The normative `SPEC.md` and JSON Schema live in
 [`fruwehq/determa-state-spec`](https://github.com/fruwehq/determa-state-spec); the schema-drift test fetches the
 schema at the same tag.

@@ -5,4 +5,4 @@ Both the runtime (``determa.state.__version__``) and the build backend (hatchlin
 is exactly one place to bump.
 """
 
-__version__ = "0.0.5"
+__version__ = "0.0.6"
