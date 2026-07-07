@@ -279,7 +279,7 @@ def cmd_list(args: argparse.Namespace, store: Store) -> int:
         rows = [
             {
                 "id": i.id,
-                "def": f"{i.machine.id}@{i.machine.version}",
+                "definition": f"{i.machine.id}@{i.machine.version}",
                 "parent": i.parent_id,
                 "status": i.status.value,
                 "config": i.active_leaf_names(),
@@ -495,7 +495,7 @@ def _parse_captured(text: str) -> Any:
 def _state_json(host: Host, inst: Instance) -> dict[str, Any]:
     return {
         "instance": inst.id,
-        "def": f"{inst.machine.id}@{inst.machine.version}",
+        "definition": f"{inst.machine.id}@{inst.machine.version}",
         "status": inst.status.value,
         "config": inst.active_leaf_names(),
         "esvs": inst.resolved_esvs(),
