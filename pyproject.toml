@@ -44,7 +44,10 @@ dev = [
 ]
 
 [project.scripts]
+# The canonical command, plus a language-suffixed alias so the launcher (and users)
+# can pick a specific implementation when both are installed (DETERMA_STATE_IMPL=python).
 determa-state = "determa.state.cli:main"
+determa-state-python = "determa.state.cli:main"
 
 [tool.hatch.version]
 path = "src/determa/state/__about__.py"
