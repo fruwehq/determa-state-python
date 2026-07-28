@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import re
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, cast
@@ -59,10 +58,6 @@ def _validate_schema(document: dict[str, Any]) -> None:
         raise ValidationError("structural_validation", path=path, message=error.message)
 
 
-def _compatible(actual: str, expected: str) -> bool:
-    return actual == expected or (expected == "float" and actual == "int") or actual == "unknown"
-
-
 def _literal_matches(value: Any, expected: str) -> bool:
     if expected == "string":
         return isinstance(value, str)
@@ -87,49 +82,69 @@ def _event_declarations(bundle: Bundle, machine: MachineModel) -> dict[str, dict
     return declarations
 
 
-def _built_in_event_fields(event_name: str) -> dict[str, str]:
+def _built_in_event_fields(event_name: str) -> dict[str, cel.StaticType]:
     if event_name == "env":
-        return {"changed": "map"}
+        return {"changed": cel.MAP}
     if event_name == "determa.component_completed":
-        return {"component_id": "string", "component_runtime_id": "string"}
+        return {"component_id": cel.STRING, "component_runtime_id": cel.STRING}
     if event_name == "determa.component_failed":
-        return {"component_id": "string", "component_runtime_id": "string", "fault": "map"}
+        return {
+            "component_id": cel.STRING,
+            "component_runtime_id": cel.STRING,
+            "fault": cel.MAP,
+        }
     if event_name == "determa.spawned_instance_failed":
         return {
-            "instance": "instance_reference",
-            "instance_id": "string",
-            "machine_id": "string",
-            "machine_version": "int",
-            "fault": "map",
+            "instance": cel.StaticType("instance_reference", nullable=False),
+            "instance_id": cel.STRING,
+            "machine_id": cel.STRING,
+            "machine_version": cel.INT,
+            "fault": cel.MAP,
         }
     if event_name == "done":
         return {
-            "relationship": "string",
-            "state_path": "string",
-            "owner_runtime_id": "string",
-            "instance": "instance_reference",
-            "instance_id": "string",
-            "machine_id": "string",
-            "machine_version": "int",
+            "relationship": cel.STRING,
+            "state_path": cel.STRING,
+            "owner_runtime_id": cel.STRING,
+            "instance": cel.StaticType("instance_reference", nullable=True),
+            "instance_id": cel.STRING,
+            "machine_id": cel.STRING,
+            "machine_version": cel.INT,
         }
     return {}
 
 
-def _payload_types(declaration: dict[str, Any] | None, event_name: str) -> dict[str, str]:
+def _payload_types(
+    declaration: dict[str, Any] | None, event_name: str
+) -> dict[str, cel.StaticType]:
     if declaration is None:
         return _built_in_event_fields(event_name)
-    return {name: str(field["type"]) for name, field in (declaration.get("payload") or {}).items()}
+    return {
+        name: cel.type_from_declaration(field)
+        for name, field in (declaration.get("payload") or {}).items()
+    }
 
 
 def _scope(
     machine: MachineModel, state: StateNode
-) -> tuple[dict[str, str], dict[str, tuple[StateNode, dict[str, Any], str]]]:
+) -> tuple[
+    dict[str, cel.StaticType],
+    dict[str, tuple[StateNode, dict[str, Any], str]],
+]:
     chain = list(reversed(state.ancestors(include_self=True)))
-    types: dict[str, str] = {}
+    assigned_names = _assigned_variable_names(machine)
+    types: dict[str, cel.StaticType] = {}
     declarations: dict[str, tuple[StateNode, dict[str, Any], str]] = {}
     for node in chain:
         for name, declaration in (node.raw.get("variables") or {}).items():
-            types[name] = str(declaration["type"])
+            types[name] = cel.type_from_declaration(
+                declaration,
+                refine_container=(
+                    name not in assigned_names
+                    and not declaration.get("input")
+                    and not declaration.get("external")
+                ),
+            )
             declarations[name] = (
                 node,
                 declaration,
@@ -138,53 +153,51 @@ def _scope(
     return types, declarations
 
 
+def _assigned_variable_names(machine: MachineModel) -> set[str]:
+    names: set[str] = set()
+    for state in machine.states.values():
+        action_lists = [state.raw.get("entry") or [], state.raw.get("exit") or []]
+        if state.is_choice:
+            action_lists.extend(branch.get("action") or [] for branch in state.raw["choice"])
+        initial = state.raw.get("initial")
+        if isinstance(initial, dict):
+            action_lists.append(initial.get("action") or [])
+        for transition_or_list in (state.raw.get("on_events") or {}).values():
+            transitions = (
+                transition_or_list
+                if isinstance(transition_or_list, list)
+                else [transition_or_list]
+            )
+            action_lists.extend(transition.get("action") or [] for transition in transitions)
+        for actions in action_lists:
+            for action in actions:
+                if "assign" in action:
+                    names.update(action["assign"])
+    return names
+
+
 def _check_expression(
     expression: str,
     *,
-    scope: dict[str, str],
-    expected: str | None,
-    event_fields: dict[str, str] | None,
-    owner_fields: dict[str, str] | None,
+    scope: dict[str, cel.StaticType],
+    expected: cel.StaticType | str | None,
+    event_fields: dict[str, cel.StaticType] | None,
+    owner_fields: dict[str, cel.StaticType] | None,
     allow_event: bool,
     allow_owner: bool,
-) -> str:
-    references = cel.referenced_names(expression)
-    allowed = set(scope)
-    if allow_event:
-        allowed.add("event")
-    if allow_owner:
-        allowed.add("owner")
-    instance_names = {
-        name for name, type_name in scope.items() if type_name == "instance_reference"
-    }
+) -> cel.StaticType:
     try:
-        cel.compile_expression(expression)
+        return cel.check_expression(
+            expression,
+            scope,
+            expected=expected,
+            event_fields=event_fields if allow_event else None,
+            owner_fields=owner_fields if allow_owner else None,
+        )
+    except cel.CelProfileError as exc:
+        raise ValidationError("cel_profile_error", message=str(exc)) from exc
     except CelError as exc:
         raise ValidationError("semantic_validation", message=str(exc)) from exc
-    if cel.profile_error(expression, instance_names):
-        raise ValidationError("cel_profile_error")
-    if references - allowed:
-        raise ValidationError("semantic_validation", message="unknown CEL activation name")
-    if not allow_event and re.search(r"\bevent\b", expression):
-        raise ValidationError("semantic_validation")
-    if not allow_owner and re.search(r"\bowner\b", expression):
-        raise ValidationError("semantic_validation")
-    if re.search(r"\bevent\.(?!payload\b)", expression):
-        raise ValidationError("semantic_validation")
-    if re.search(r"\bowner\.(?!variables\b)", expression):
-        raise ValidationError("semantic_validation")
-    for field in re.findall(r"\bevent\.payload\.([A-Za-z_][A-Za-z0-9_]*)", expression):
-        if event_fields is None or field not in event_fields:
-            raise ValidationError("semantic_validation")
-    for field in re.findall(r"\bowner\.variables\.([A-Za-z_][A-Za-z0-9_]*)", expression):
-        if owner_fields is None or field not in owner_fields:
-            raise ValidationError("semantic_validation")
-    inferred = cel.infer_type(
-        expression, scope, event_fields=event_fields, owner_fields=owner_fields
-    )
-    if expected is not None and not _compatible(inferred, expected):
-        raise ValidationError("semantic_validation")
-    return inferred
 
 
 def _validate_semantics(bundle: Bundle, model: BundleModel) -> None:
@@ -392,7 +405,7 @@ def _validate_transition(
     bundle_model: BundleModel,
     machine: MachineModel,
     source: StateNode,
-    scope: dict[str, str],
+    scope: dict[str, cel.StaticType],
     scope_declarations: dict[str, tuple[StateNode, dict[str, Any], str]],
     events: dict[str, dict[str, Any]],
     event_name: str | None,
@@ -402,6 +415,17 @@ def _validate_transition(
 ) -> None:
     event_declaration = events.get(event_name) if event_name is not None else None
     event_fields = _payload_types(event_declaration, event_name or "")
+    if event_name == "env":
+        external_fields = tuple(
+            (name, cel.type_from_declaration(declaration))
+            for name, declaration in (machine.root.raw.get("variables") or {}).items()
+            if declaration.get("external") is True
+        )
+        event_fields = {
+            "changed": cel.StaticType(
+                "map", element=cel.DYNAMIC, fields=external_fields
+            )
+        }
     guard = transition.get("guard")
     if guard is not None:
         _check_expression(
@@ -510,11 +534,11 @@ def _validate_actions(
     bundle_model: BundleModel,
     machine: MachineModel,
     state: StateNode,
-    scope: dict[str, str],
+    scope: dict[str, cel.StaticType],
     scope_declarations: dict[str, tuple[StateNode, dict[str, Any], str]],
     events: dict[str, dict[str, Any]],
     event_name: str | None,
-    owner_fields: dict[str, str] | None,
+    owner_fields: dict[str, cel.StaticType] | None,
     context: str,
     graph: dict[str, set[str]],
 ) -> None:
@@ -589,9 +613,9 @@ def _validate_send(
     bundle_model: BundleModel,
     machine: MachineModel,
     state: StateNode,
-    scope: dict[str, str],
+    scope: dict[str, cel.StaticType],
     events: dict[str, dict[str, Any]],
-    event_fields: dict[str, str] | None,
+    event_fields: dict[str, cel.StaticType] | None,
     allow_event: bool,
 ) -> None:
     event_name = str(send["event"])
@@ -626,23 +650,21 @@ def _validate_send(
             else bundle_model.inline_component(machine, placement, pointer)
         )
         external_variables = {
-            name: declaration
+            name: cel.type_from_declaration(declaration)
             for name, declaration in (target_machine.root.raw.get("variables") or {}).items()
             if declaration.get("external") is True
         }
-        changed_members = _parse_cel_map_literal(changed)
-        if changed_members is None or set(changed_members) - set(external_variables):
-            raise ValidationError("semantic_validation")
-        for name, expression in changed_members.items():
-            _check_expression(
-                expression,
+        try:
+            cel.check_map_literal(
+                changed,
+                external_variables,
                 scope=scope,
-                expected=str(external_variables[name]["type"]),
                 event_fields=event_fields,
-                owner_fields=None,
-                allow_event=allow_event,
-                allow_owner=False,
             )
+        except cel.CelProfileError as exc:
+            raise ValidationError("cel_profile_error", message=str(exc)) from exc
+        except CelError as exc:
+            raise ValidationError("semantic_validation", message=str(exc)) from exc
         return
     if declaration is None or event_name in _RESERVED_EVENTS:
         raise ValidationError("semantic_validation")
@@ -687,29 +709,12 @@ def _validate_send(
                 allow_owner=False,
             )
 
-
-def _parse_cel_map_literal(expression: str) -> dict[str, str] | None:
-    body = expression.strip()
-    if not (body.startswith("{") and body.endswith("}")):
-        return None
-    body = body[1:-1].strip()
-    if not body:
-        return {}
-    members: dict[str, str] = {}
-    for item in body.split(","):
-        match = re.fullmatch(r"\s*(['\"])([A-Za-z_][A-Za-z0-9_]*)\1\s*:\s*(.+?)\s*", item)
-        if match is None:
-            return None
-        members[match.group(2)] = match.group(3)
-    return members
-
-
 def _validate_bindings(
     bindings: dict[str, Any],
     target: MachineModel,
     *,
-    scope: dict[str, str],
-    owner_fields: dict[str, str] | None,
+    scope: dict[str, cel.StaticType],
+    owner_fields: dict[str, cel.StaticType] | None,
     allow_owner: bool,
 ) -> None:
     root_variables = target.root.raw.get("variables") or {}
@@ -730,17 +735,15 @@ def _validate_bindings(
         if missing:
             raise ValidationError("invalid_binding")
         for name, expression in supplied.items():
-            inferred = _check_expression(
+            _check_expression(
                 expression,
                 scope=scope,
-                expected=str(expected[name]["type"]),
+                expected=cel.type_from_declaration(expected[name]),
                 event_fields=None,
                 owner_fields=owner_fields,
                 allow_event=False,
                 allow_owner=allow_owner,
             )
-            if not _compatible(inferred, str(expected[name]["type"])):
-                raise ValidationError("invalid_binding")
 
 
 def _validate_reachability(machine: MachineModel) -> None:

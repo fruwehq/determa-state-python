@@ -112,6 +112,7 @@ def run_case(case: CoreCase) -> None:
     captures: dict[str, list[dict[str, Any]]] = {}
     for index, step in enumerate(test.get("steps") or []):
         prior_state = state
+        prior_state_snapshot = copy.deepcopy(state)
         target_runtime_id = state["root_runtime_id"]
         dispatch_bundle = bundle
         if "send" in step:
@@ -135,11 +136,13 @@ def run_case(case: CoreCase) -> None:
             }
             if "correlation_id" in send:
                 envelope["correlation_id"] = send["correlation_id"]
+            envelope_snapshot = copy.deepcopy(envelope)
             result = dispatch(dispatch_bundle, state, {"input": envelope})
         elif "deliver" in step:
             delivery = step["deliver"]
             envelope = copy.deepcopy(captures[delivery["captured"]][delivery["index"]])
             target_runtime_id = _target_runtime_id(envelope["target"])
+            envelope_snapshot = copy.deepcopy(envelope)
             result = dispatch(dispatch_bundle, state, {"internal": envelope})
         else:
             raise AssertionError(f"{case.name} step {index}: unsupported driver step")
@@ -149,6 +152,9 @@ def run_case(case: CoreCase) -> None:
             target_runtime_id,
             captures,
             prior_state=prior_state,
+            prior_state_snapshot=prior_state_snapshot,
+            input_envelope=envelope,
+            input_envelope_snapshot=envelope_snapshot,
         )
         state = result["state"]
         if "capture_emissions_as" in step:
@@ -182,16 +188,42 @@ def _assert_result(
     captures: dict[str, list[dict[str, Any]]],
     *,
     prior_state: dict[str, Any] | None = None,
+    prior_state_snapshot: dict[str, Any] | None = None,
+    input_envelope: dict[str, Any] | None = None,
+    input_envelope_snapshot: dict[str, Any] | None = None,
 ) -> None:
     del captures
+    supported = {
+        "status",
+        "disposition",
+        "rejection",
+        "fault",
+        "caller_still_owns_input",
+        "state",
+        "config",
+        "variables",
+        "history",
+        "components",
+        "owned_instances",
+        "emissions",
+    }
+    assert set(expected) <= supported, set(expected) - supported
     for name in ("status", "disposition"):
         if name in expected:
             assert result[name] == expected[name], (name, result[name], expected[name])
+    if "state" in expected:
+        assert result["state"] == expected["state"]
     if "rejection" in expected:
         _assert_partial(result["rejection"], expected["rejection"], state=result["state"])
     if "fault" in expected:
         _assert_partial(result["fault"], expected["fault"], state=result["state"])
     if expected.get("caller_still_owns_input"):
+        assert input_envelope is not None
+        assert input_envelope_snapshot is not None
+        assert input_envelope == input_envelope_snapshot
+        assert prior_state is not None
+        assert prior_state_snapshot is not None
+        assert prior_state == prior_state_snapshot
         assert result["state"] is not None
         assert not {"queue", "timers", "dead_letters"} & set(result["state"])
         assert all(
@@ -254,7 +286,8 @@ def _assert_runtime(
         assert len(children) == len(expected["owned_instances"])
         for child, child_expected in zip(children, expected["owned_instances"], strict=True):
             key = child_expected["key"]
-            if key.get("owner") == "root":
+            if "owner" in key:
+                assert key["owner"] == "root"
                 assert child["owner_runtime_id"] == state["root_runtime_id"]
             if "spawn_sequence" in key:
                 assert child["spawn_sequence"] == key["spawn_sequence"]
@@ -308,6 +341,8 @@ def _assert_emission(
             elif isinstance(value, dict) and "bound_instance" in value:
                 reference = _visible_variables(state, runtime)[value["bound_instance"]]
                 assert actual["target"] == {"spawned_instance": reference}
+            else:
+                raise AssertionError(f"unsupported target assertion: {value!r}")
         elif key == "payload":
             _assert_partial(actual["payload"], value, state=state)
         else:
@@ -319,6 +354,7 @@ def _assert_partial(actual: Any, expected: Any, *, state: dict[str, Any] | None 
         assert isinstance(actual, dict), (actual, expected)
         if set(expected) == {"instance_reference"}:
             assertion = expected["instance_reference"]
+            assert set(assertion) <= {"machine_id", "targetable"}
             assert _is_reference(actual)
             if "machine_id" in assertion:
                 assert actual["machine_id"] == assertion["machine_id"]
@@ -331,6 +367,7 @@ def _assert_partial(actual: Any, expected: Any, *, state: dict[str, Any] | None 
                     and target.get("role") == "spawned"
                     and target.get("status") == "running"
                     and target.get("instance_reference") == actual
+                    and not _has_faulted_ancestor(state, target)
                 )
                 assert targetable is assertion["targetable"]
             return
@@ -436,4 +473,16 @@ def _is_descendant_runtime(
             return True
         parent = state["runtimes"].get(owner_id)
         owner_id = parent.get("owner_runtime_id") if parent is not None else None
+    return False
+
+
+def _has_faulted_ancestor(state: dict[str, Any], runtime: dict[str, Any]) -> bool:
+    owner_id = runtime.get("owner_runtime_id")
+    while owner_id is not None:
+        owner = state["runtimes"].get(owner_id)
+        if owner is None:
+            return True
+        if owner.get("status") == "faulted":
+            return True
+        owner_id = owner.get("owner_runtime_id")
     return False

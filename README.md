@@ -4,9 +4,9 @@ Python implementation of [Determa State](https://github.com/fruwehq/determa-stat
 a language-agnostic statechart engine with a shared normative conformance suite.
 
 This pre-release implements Determa State `format: 1` at the approved specification
-commit `03771fac569a47b82f27891cd3700d4d1d876f8b`. Correctness is determined by the
+commit `4bd4d9588d11b75d376380b6120676a056a4bc45`. Correctness is determined by the
 75-case core suite at conformance commit
-`409bbdc6c2d4a4e9d50ddb1d994c5f5cd7d97762`.
+`fc4842010ab8d83bf4c5c6280a5627ca86829f7f`.
 
 The package version remains `0.0.6` until the specification, conformance suite, Python
 engine, and Rust engine are released together.

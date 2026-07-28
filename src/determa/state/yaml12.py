@@ -12,6 +12,18 @@ from .errors import ValidationError
 
 _JSON_NUMBER = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\Z")
 _INTEGER = re.compile(r"-?(?:0|[1-9][0-9]*)\Z")
+_NONPORTABLE_YAML_NUMBER = re.compile(
+    r"""
+    [+-]?(?:
+        0[xX][0-9a-fA-F_]+
+        |0[oO][0-7_]+
+        |(?:[0-9][0-9_]*)(?:\.[0-9_]*)?(?:[eE][+-]?[0-9_]+)?
+        |\.[0-9][0-9_]*(?:[eE][+-]?[0-9_]+)?
+        |\.(?:inf|nan)
+    )\Z
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
 _INVALID_BOOLEAN = frozenset({"True", "TRUE", "False", "FALSE"})
 _INVALID_NULL = frozenset({"Null", "NULL", "~", ""})
 _STRING_BOOLEAN_LIKE = frozenset(
@@ -98,14 +110,6 @@ def _validate_portable_values(value: Any, ancestors: set[int]) -> None:
     raise ValidationError("non_json_value")
 
 
-def _numeric_candidate(value: str) -> bool:
-    lower = value.lower()
-    return bool(
-        re.match(r"^[+-]?(?:[0-9]|\.)", value)
-        or lower.startswith(("0x", "+0x", "-0x", "0o", "+0o", "-0o"))
-    )
-
-
 def _resolve_plain(value: str) -> Any:
     if value == "true":
         return True
@@ -132,7 +136,7 @@ def _resolve_plain(value: str) -> Any:
         if not math.isfinite(double):
             raise ValidationError("numeric_value_out_of_range")
         return 0.0 if double == 0.0 else double
-    if _numeric_candidate(value):
+    if _NONPORTABLE_YAML_NUMBER.fullmatch(value):
         raise ValidationError("invalid_numeric_syntax")
     return value
 

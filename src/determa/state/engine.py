@@ -535,9 +535,22 @@ def _validate_prior_state(state: dict[str, Any], bundle: Bundle) -> bool:
         if runtime["role"] == "component":
             if owner["components"].get(runtime.get("component_id")) != runtime["runtime_id"]:
                 return False
+            if not _valid_component_relation(bundle, models, owner, runtime):
+                return False
         elif runtime["role"] != "spawned":
             return False
+        elif not _valid_spawned_relation(bundle, models, owner, runtime):
+            return False
         if _ownership_cycle(runtimes, runtime):
+            return False
+    for owner in runtimes.values():
+        expected_components = {
+            child["component_id"]: child["runtime_id"]
+            for child in runtimes.values()
+            if child.get("role") == "component"
+            and child.get("owner_runtime_id") == owner["runtime_id"]
+        }
+        if owner["components"] != expected_components:
             return False
     return True
 
@@ -634,6 +647,18 @@ def _validate_runtime_state(
     if any(path not in machine.states for path in runtime["state_activation_sequence"]):
         return False
     if any(
+        runtime["next_state_activation_sequence"].get(path, 0) <= sequence
+        for path, sequence in runtime["state_activation_sequence"].items()
+    ):
+        return False
+    history_states = {
+        "$root" if node is machine.root else node.path: node
+        for node in machine.states.values()
+        if node.type == "composite" and node.raw.get("history", "none") != "none"
+    }
+    if set(runtime["history"]) != set(history_states):
+        return False
+    if any(
         not isinstance(key, str) or not isinstance(value, (list, type(None)))
         for key, value in runtime["history"].items()
     ):
@@ -643,6 +668,22 @@ def _validate_runtime_state(
         and (len(value) != 1 or not isinstance(value[0], str) or value[0] not in machine.states)
         for value in runtime["history"].values()
     ):
+        return False
+    for key, value in runtime["history"].items():
+        if value is None:
+            continue
+        history_state = history_states[key]
+        destination = machine.states[value[0]]
+        if not history_state.is_ancestor_of(destination, strict=True):
+            return False
+        if history_state.raw["history"] == "shallow" and destination.parent is not history_state:
+            return False
+    component_pointers = {
+        f"{node.pointer}/components/{index}"
+        for node in machine.states.values()
+        for index, _placement in enumerate(node.raw.get("components") or [])
+    }
+    if set(runtime["next_component_activation_sequence"]) - component_pointers:
         return False
     if any(
         not isinstance(key, str) or not isinstance(value, str)
@@ -746,6 +787,106 @@ def _valid_spawned_identity(state: dict[str, Any], runtime: dict[str, Any]) -> b
     ):
         return False
     return bool(runtime["runtime_id"] == expected_id)
+
+
+def _runtime_model(
+    bundle: Bundle,
+    models: BundleModel,
+    runtime: dict[str, Any],
+) -> MachineModel:
+    base = models.machine(runtime["machine_id"])
+    if runtime["root_pointer"] == base.root_pointer:
+        return base
+    root = _pointer_get(bundle.raw, runtime["root_pointer"])
+    return MachineModel(
+        bundle,
+        base.raw,
+        machine_index=base.machine_index,
+        root=root,
+        root_pointer=runtime["root_pointer"],
+        identity_machine=base.identity_machine,
+    )
+
+
+def _valid_component_relation(
+    bundle: Bundle,
+    models: BundleModel,
+    owner: dict[str, Any],
+    runtime: dict[str, Any],
+) -> bool:
+    owner_machine = _runtime_model(bundle, models, owner)
+    owning_path = runtime["owning_state_path"]
+    if owning_path not in owner["active"] or owning_path not in owner_machine.states:
+        return False
+    owning_state = owner_machine.states[owning_path]
+    if (
+        owning_state.type != "parallel"
+        or owner["state_activation_sequence"].get(owning_path)
+        != runtime["owning_state_activation_sequence"]
+    ):
+        return False
+    index = runtime["component_declaration_index"]
+    placements = owning_state.raw.get("components") or []
+    if index >= len(placements):
+        return False
+    placement = placements[index]
+    pointer = f"{owning_state.pointer}/components/{index}"
+    if (
+        runtime["component_definition_pointer"] != pointer
+        or placement["component_id"] != runtime["component_id"]
+        or owner["next_component_activation_sequence"].get(pointer, 0)
+        <= runtime["component_activation_sequence"]
+    ):
+        return False
+    if "machine_id" in placement:
+        target = models.machine(placement["machine_id"])
+        return bool(
+            runtime["machine_id"] == target.machine_id
+            and runtime["machine_version"] == target.version
+            and runtime["root_pointer"] == target.root_pointer
+        )
+    return bool(
+        runtime["machine_id"] == owner["machine_id"]
+        and runtime["machine_version"] == owner["machine_version"]
+        and runtime["root_pointer"] == f"{pointer}/root"
+    )
+
+
+def _valid_spawned_relation(
+    bundle: Bundle,
+    models: BundleModel,
+    owner: dict[str, Any],
+    runtime: dict[str, Any],
+) -> bool:
+    if owner["next_spawn_sequence"] <= runtime["spawn_sequence"]:
+        return False
+    spawn = _pointer_get(bundle.raw, runtime["spawn_action_pointer"])
+    if not isinstance(spawn, dict) or spawn.get("machine_id") != runtime["machine_id"]:
+        return False
+    holder = runtime.get("holder")
+    if holder is None:
+        return True
+    owner_machine = _runtime_model(bundle, models, owner)
+    state_path = holder["state_path"]
+    if (
+        state_path not in owner["active"]
+        or state_path not in owner_machine.states
+        or owner["state_activation_sequence"].get(state_path)
+        != holder["state_activation_sequence"]
+    ):
+        return False
+    state = owner_machine.states[state_path]
+    prefix = f"{state.pointer}/variables/"
+    if not holder["pointer"].startswith(prefix):
+        return False
+    encoded_name = holder["pointer"][len(prefix) :]
+    name = encoded_name.replace("~1", "/").replace("~0", "~")
+    declarations = state.raw.get("variables") or {}
+    return bool(
+        name in declarations
+        and declarations[name].get("type") == "instance_reference"
+        and owner["scopes"][state_path].get(name) == runtime["instance_reference"]
+    )
 
 
 def _valid_fault(fault: Any, runtime: dict[str, Any]) -> bool:
@@ -1040,7 +1181,8 @@ def _locate_target(state: dict[str, Any], target: Any) -> tuple[str | None, dict
             or value.get("root_runtime_id") != state["root_runtime_id"]
         ):
             return "invalid_instance_target", None
-        return None, runtimes[state["root_runtime_id"]]
+        runtime = runtimes[state["root_runtime_id"]]
+        return _target_eligibility(state, runtime), runtime
     if "spawned_instance" in target:
         reference = target["spawned_instance"]
         if not _is_instance_reference(reference):
@@ -1048,7 +1190,7 @@ def _locate_target(state: dict[str, Any], target: Any) -> tuple[str | None, dict
         runtime = runtimes.get(reference["instance_id"])
         if runtime is None or runtime.get("instance_reference") != reference:
             return "invalid_instance_target", None
-        return None, runtime
+        return _target_eligibility(state, runtime), runtime
     if "component" in target:
         value = target["component"]
         if not isinstance(value, dict):
@@ -1056,8 +1198,27 @@ def _locate_target(state: dict[str, Any], target: Any) -> tuple[str | None, dict
         runtime = runtimes.get(value.get("component_runtime_id"))
         if runtime is None or runtime.get("target") != target:
             return "inactive_component_target", None
-        return None, runtime
+        return _target_eligibility(state, runtime), runtime
     return "invalid_instance_target", None
+
+
+def _target_eligibility(state: dict[str, Any], runtime: dict[str, Any]) -> str | None:
+    code = (
+        "inactive_component_target"
+        if runtime["role"] == "component"
+        else "invalid_instance_target"
+    )
+    if runtime["status"] != "running":
+        return code
+    owner_id = runtime.get("owner_runtime_id")
+    while owner_id is not None:
+        owner = state["runtimes"].get(owner_id)
+        if not isinstance(owner, dict):
+            return code
+        if owner["status"] == "faulted":
+            return code
+        owner_id = owner.get("owner_runtime_id")
+    return None
 
 
 @dataclass
@@ -1706,14 +1867,14 @@ class _Execution:
         if "component" in target_spec:
             child_id = runtime["components"].get(target_spec["component"])
             child = self.state["runtimes"].get(child_id)
-            if child is None or child["status"] != "running":
+            if child is None or _target_eligibility(self.state, child) is not None:
                 raise StepFault("inactive_component_target", f"{pointer}{suffix}")
             return cast(dict[str, Any], copy.deepcopy(child["target"]))
         if "instance" in target_spec:
             if not _is_instance_reference(evaluated):
                 raise StepFault("invalid_instance_target", f"{pointer}{suffix}/instance")
             child = self.state["runtimes"].get(evaluated["instance_id"])
-            if child is None or child["status"] != "running":
+            if child is None or _target_eligibility(self.state, child) is not None:
                 raise StepFault("invalid_instance_target", f"{pointer}{suffix}/instance")
             return {"spawned_instance": copy.deepcopy(evaluated)}
         if target_spec.get("external") is True:

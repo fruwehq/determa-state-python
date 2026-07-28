@@ -19,7 +19,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 DEST = ROOT / "src" / "determa" / "state" / "data" / "machine.schema.json"
-SPEC_COMMIT = "03771fac569a47b82f27891cd3700d4d1d876f8b"
+SPEC_COMMIT = "4bd4d9588d11b75d376380b6120676a056a4bc45"
 
 
 def _fetch() -> str:

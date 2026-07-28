@@ -11,8 +11,8 @@ package so it can coexist with the umbrella `determa` launcher.
 The implementation is conformant only when it passes the language-neutral suite.
 Format-1 work currently uses these immutable pre-release inputs:
 
-- specification: `03771fac569a47b82f27891cd3700d4d1d876f8b`;
-- conformance: `409bbdc6c2d4a4e9d50ddb1d994c5f5cd7d97762` (75 core cases).
+- specification: `4bd4d9588d11b75d376380b6120676a056a4bc45`;
+- conformance: `fc4842010ab8d83bf4c5c6280a5627ca86829f7f` (75 core cases).
 
 The package version is still `0.0.6`; the specification, conformance suite, Python
 engine, and Rust engine version together.
