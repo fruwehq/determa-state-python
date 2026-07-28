@@ -28,6 +28,34 @@ def test_unicode_is_not_normalized() -> None:
 @pytest.mark.parametrize(
     ("expression", "expected"),
     [
+        ("[1] == [1.0]", False),
+        ("[1] != [1.0]", True),
+        ("{'x': 1} == {'x': 1.0}", False),
+        ("{'x': 1} != {'x': 1.0}", True),
+        ("[{'x': [1]}] == [{'x': [1.0]}]", False),
+        ("[{'x': [1]}] != [{'x': [1.0]}]", True),
+        ("{'a': 1, 'b': [2]} == {'b': [2], 'a': 1}", True),
+        ("[true] == [1]", False),
+        ("['1'] == [1]", False),
+        ("1 in [1.0]", False),
+        ("1 in [1]", True),
+        ("{'x': [1]} in [{'x': [1.0]}]", False),
+        ("{'x': [1]} in [{'x': [1]}]", True),
+        ("'x' in {'x': 1}", True),
+        ("'missing' in {'x': 1}", False),
+    ],
+)
+def test_profile_owns_recursive_collection_equality_and_membership(
+    expression: str,
+    expected: bool,
+) -> None:
+    assert cel.check_expression(expression, {}, expected=cel.BOOL) == cel.BOOL
+    assert cel.evaluate(expression, {}) is expected
+
+
+@pytest.mark.parametrize(
+    ("expression", "expected"),
+    [
         ("integer_value + 1", cel.INT),
         ("double(integer_value)", cel.FLOAT),
         ("int(floating_value)", cel.INT),

@@ -153,6 +153,9 @@ def _program(expression: str) -> celpy.Runner:
             environment.program(
                 _tree(expression),
                 functions={
+                    "_==_": _portable_equal,
+                    "_!=_": _portable_not_equal,
+                    "_in_": _portable_membership,
                     "double": _portable_double,
                     "int": _portable_int,
                     "string": _portable_string,
@@ -632,6 +635,99 @@ def check_map_literal(
     for name, value_node in supplied.items():
         actual = checker.check(value_node)
         _expect(_assignable(actual, expected_fields[name]))
+
+
+def _portable_kind(value: Any) -> str:
+    celpy_module, celtypes, _ = _load()
+    if isinstance(value, celpy_module.CELEvalError):
+        return "error"
+    if value is None:
+        return "null"
+    if isinstance(value, (celtypes.BoolType, bool)):
+        return "bool"
+    if isinstance(value, (celtypes.IntType, int)):
+        integer = int(value)
+        if not _INT_MIN <= integer <= _INT_MAX:
+            raise ValueError("integer is outside signed 64-bit range")
+        return "int"
+    if isinstance(value, (celtypes.DoubleType, float)):
+        if not math.isfinite(float(value)):
+            raise ValueError("double is not finite")
+        return "float"
+    if isinstance(value, (celtypes.StringType, str)):
+        return "string"
+    if isinstance(value, (celtypes.ListType, list)):
+        return "list"
+    if isinstance(value, (celtypes.MapType, dict)):
+        return "map"
+    raise TypeError(f"unsupported portable equality value: {type(value).__name__}")
+
+
+def _portable_map(value: Any) -> dict[str, Any]:
+    _, celtypes, _ = _load()
+    result: dict[str, Any] = {}
+    for key, item in value.items():
+        if not isinstance(key, (celtypes.StringType, str)):
+            raise TypeError("portable maps require string keys")
+        result[str(key)] = item
+    return result
+
+
+def _portable_equal_value(left: Any, right: Any) -> bool:
+    left_kind = _portable_kind(left)
+    right_kind = _portable_kind(right)
+    if left_kind == "error" or right_kind == "error":
+        raise TypeError("cannot compare an evaluation error")
+    if left_kind != right_kind:
+        return False
+    if left_kind == "list":
+        return len(left) == len(right) and all(
+            _portable_equal_value(left_item, right_item)
+            for left_item, right_item in zip(left, right, strict=True)
+        )
+    if left_kind == "map":
+        left_map = _portable_map(left)
+        right_map = _portable_map(right)
+        return set(left_map) == set(right_map) and all(
+            _portable_equal_value(left_map[key], right_map[key]) for key in left_map
+        )
+    return bool(left == right)
+
+
+def _portable_equal(left: Any, right: Any) -> Any:
+    celpy_module, celtypes, _ = _load()
+    if isinstance(left, celpy_module.CELEvalError):
+        return left
+    if isinstance(right, celpy_module.CELEvalError):
+        return right
+    return celtypes.BoolType(_portable_equal_value(left, right))
+
+
+def _portable_not_equal(left: Any, right: Any) -> Any:
+    celpy_module, celtypes, _ = _load()
+    if isinstance(left, celpy_module.CELEvalError):
+        return left
+    if isinstance(right, celpy_module.CELEvalError):
+        return right
+    return celtypes.BoolType(not _portable_equal_value(left, right))
+
+
+def _portable_membership(item: Any, container: Any) -> Any:
+    celpy_module, celtypes, _ = _load()
+    if isinstance(item, celpy_module.CELEvalError):
+        return item
+    if isinstance(container, celpy_module.CELEvalError):
+        return container
+    kind = _portable_kind(container)
+    if kind == "list":
+        return celtypes.BoolType(
+            any(_portable_equal_value(item, candidate) for candidate in container)
+        )
+    if kind == "map":
+        return celtypes.BoolType(
+            any(_portable_equal_value(item, key) for key in container)
+        )
+    raise TypeError("in requires a list or string-keyed map")
 
 
 def _portable_double(value: Any) -> Any:

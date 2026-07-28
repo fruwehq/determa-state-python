@@ -677,6 +677,13 @@ def _validate_send(
     supplied = send.get("payload") or {}
     if set(supplied) - set(payload_types):
         raise ValidationError("semantic_validation")
+    required = {
+        name
+        for name, field in (declaration.get("payload") or {}).items()
+        if field.get("required") is True and "default" not in field
+    }
+    if required - set(supplied):
+        raise ValidationError("semantic_validation")
     for name, expression in supplied.items():
         _check_expression(
             expression,

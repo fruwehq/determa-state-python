@@ -356,3 +356,71 @@ machines:
         load_bundle(source)
 
     assert caught.value.code == "semantic_validation"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        "",
+        "payload: { optional_value: \"'provided'\" }",
+    ],
+)
+def test_send_requires_every_required_payload_expression(payload: str) -> None:
+    source = f"""
+format: 1
+namespace: example.required_send_payload
+events:
+  go: {{ direction: input }}
+  notice:
+    direction: internal
+    payload:
+      required_value: {{ type: string, required: true }}
+      optional_value: {{ type: string }}
+machines:
+  - machine_id: required_send_payload
+    root:
+      on_events:
+        go:
+          action:
+            - send:
+                event: notice
+                {payload}
+"""
+
+    with pytest.raises(ValidationError) as caught:
+        load_bundle(source)
+
+    assert caught.value.code == "semantic_validation"
+
+
+@pytest.mark.parametrize(
+    "payload_declaration",
+    [
+        "optional_value: { type: string }",
+        "defaulted_value: { type: string, default: fallback }",
+    ],
+)
+def test_send_allows_absent_optional_or_defaulted_payload_fields(
+    payload_declaration: str,
+) -> None:
+    bundle = load_bundle(
+        f"""
+format: 1
+namespace: example.optional_send_payload
+events:
+  go: {{ direction: input }}
+  notice:
+    direction: internal
+    payload:
+      {payload_declaration}
+machines:
+  - machine_id: optional_send_payload
+    root:
+      on_events:
+        go:
+          action:
+            - send: {{ event: notice }}
+"""
+    )
+
+    assert bundle.machine("optional_send_payload") is not None

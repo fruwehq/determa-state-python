@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Literal, cast
 
@@ -448,10 +449,68 @@ def _valid_prior_state(state: Any, bundle: Bundle) -> bool:
     if not isinstance(state, dict):
         return False
     try:
-        validate_portable_values(state)
+        _validate_prior_state_values(state)
         return validate_unicode(state) and _validate_prior_state(state, bundle)
     except (IndexError, KeyError, TypeError, ValueError, ValidationError):
         return False
+
+
+def _is_prior_counter_path(path: tuple[str | int, ...]) -> bool:
+    if path in {
+        ("next_logical_step_sequence",),
+        ("next_output_sequence",),
+        ("fault", "step_sequence"),
+    }:
+        return True
+    if len(path) < 3 or path[0] != "runtimes" or not isinstance(path[1], str):
+        return False
+    suffix = path[2:]
+    if suffix in {
+        ("next_spawn_sequence",),
+        ("component_activation_sequence",),
+        ("owning_state_activation_sequence",),
+        ("spawn_sequence",),
+        ("fault", "step_sequence"),
+        ("holder", "state_activation_sequence"),
+        ("target", "component", "activation_sequence"),
+    }:
+        return True
+    return len(suffix) == 2 and suffix[0] in {
+        "next_state_activation_sequence",
+        "state_activation_sequence",
+        "next_component_activation_sequence",
+    }
+
+
+def _validate_prior_state_values(state: dict[str, Any]) -> None:
+    def visit(value: Any, path: tuple[str | int, ...], ancestors: set[int]) -> None:
+        if _is_prior_counter_path(path):
+            if not _logical_counter(value):
+                raise ValidationError("numeric_value_out_of_range")
+            return
+        if isinstance(value, list):
+            identity = id(value)
+            if identity in ancestors:
+                raise ValidationError("non_json_value")
+            ancestors.add(identity)
+            for index, item in enumerate(value):
+                visit(item, (*path, index), ancestors)
+            ancestors.remove(identity)
+            return
+        if isinstance(value, dict):
+            identity = id(value)
+            if identity in ancestors:
+                raise ValidationError("non_json_value")
+            ancestors.add(identity)
+            for key, item in value.items():
+                if not isinstance(key, str):
+                    raise ValidationError("non_string_map_key")
+                visit(item, (*path, key), ancestors)
+            ancestors.remove(identity)
+            return
+        validate_portable_values(value)
+
+    visit(state, (), set())
 
 
 def _validate_prior_state(state: dict[str, Any], bundle: Bundle) -> bool:
@@ -482,8 +541,8 @@ def _validate_prior_state(state: dict[str, Any], bundle: Bundle) -> bool:
         or not isinstance(state["root_runtime_id"], str)
         or not isinstance(state["root_machine_id"], str)
         or state["status"] not in {"running", "completed", "faulted"}
-        or not _nonnegative_integer(state["next_logical_step_sequence"])
-        or not _nonnegative_integer(state["next_output_sequence"])
+        or not _logical_counter(state["next_logical_step_sequence"])
+        or not _logical_counter(state["next_output_sequence"])
         or not isinstance(state["runtimes"], dict)
     ):
         return False
@@ -522,8 +581,13 @@ def _validate_prior_state(state: dict[str, Any], bundle: Bundle) -> bool:
             return False
         if runtime.get("runtime_id") != runtime_id:
             return False
+        if runtime_id != state["root_runtime_id"] and runtime.get("role") == "root":
+            return False
         if not _validate_runtime_state(state, runtime, bundle, models):
             return False
+
+    if state["status"] == "completed" and len(runtimes) != 1:
+        return False
 
     for runtime in runtimes.values():
         owner_id = runtime.get("owner_runtime_id")
@@ -586,14 +650,15 @@ def _validate_runtime_state(
     if (
         runtime["role"] not in {"root", "component", "spawned"}
         or runtime["status"] not in {"running", "completed", "faulted"}
+        or (runtime["role"] == "spawned" and runtime["status"] == "completed")
         or not isinstance(runtime["machine_id"], str)
         or runtime["machine_id"] not in models.machines
-        or not _nonnegative_integer(runtime["machine_version"])
+        or not _bounded_nonnegative_integer(runtime["machine_version"])
         or not isinstance(runtime["root_pointer"], str)
         or not isinstance(runtime["active"], list)
         or not isinstance(runtime["scopes"], dict)
         or not isinstance(runtime["history"], dict)
-        or not _nonnegative_integer(runtime["next_spawn_sequence"])
+        or not _logical_counter(runtime["next_spawn_sequence"])
         or not _counter_map(runtime["next_state_activation_sequence"])
         or not _counter_map(runtime["state_activation_sequence"])
         or not _counter_map(runtime["next_component_activation_sequence"])
@@ -690,11 +755,20 @@ def _validate_runtime_state(
         for key, value in runtime["components"].items()
     ):
         return False
-    if runtime["fault"] is not None and not _valid_fault(runtime["fault"], runtime):
+    if runtime["fault"] is not None and not _valid_fault(
+        runtime["fault"], runtime, state["next_logical_step_sequence"]
+    ):
         return False
     if runtime["status"] == "faulted" and runtime["fault"] is None:
         return False
     if runtime["status"] != "faulted" and runtime["fault"] is not None:
+        return False
+    if runtime["status"] == "completed" and (
+        runtime["active"]
+        or runtime["scopes"]
+        or runtime["state_activation_sequence"]
+        or runtime["components"]
+    ):
         return False
     if runtime["role"] == "component":
         if not _valid_component_identity(state, runtime):
@@ -722,10 +796,10 @@ def _valid_component_identity(state: dict[str, Any], runtime: dict[str, Any]) ->
         not isinstance(runtime["component_id"], str)
         or runtime["component_runtime_id"] != runtime["runtime_id"]
         or not isinstance(runtime["component_definition_pointer"], str)
-        or not _nonnegative_integer(runtime["component_declaration_index"])
-        or not _nonnegative_integer(runtime["component_activation_sequence"])
+        or not _bounded_nonnegative_integer(runtime["component_declaration_index"])
+        or not _logical_counter(runtime["component_activation_sequence"])
         or not isinstance(runtime["owning_state_path"], str)
-        or not _nonnegative_integer(runtime["owning_state_activation_sequence"])
+        or not _logical_counter(runtime["owning_state_activation_sequence"])
     ):
         return False
     expected_id = _identity(
@@ -755,7 +829,7 @@ def _valid_component_identity(state: dict[str, Any], runtime: dict[str, Any]) ->
 
 def _valid_spawned_identity(state: dict[str, Any], runtime: dict[str, Any]) -> bool:
     if (
-        not _nonnegative_integer(runtime.get("spawn_sequence"))
+        not _logical_counter(runtime.get("spawn_sequence"))
         or not isinstance(runtime.get("spawn_action_pointer"), str)
         or not _is_instance_reference(runtime.get("instance_reference"))
         or runtime["instance_reference"].get("root_instance_id") != state["root_instance_id"]
@@ -783,7 +857,7 @@ def _valid_spawned_identity(state: dict[str, Any], runtime: dict[str, Any]) -> b
         or set(holder) != {"pointer", "state_path", "state_activation_sequence"}
         or not isinstance(holder["pointer"], str)
         or not isinstance(holder["state_path"], str)
-        or not _nonnegative_integer(holder["state_activation_sequence"])
+        or not _logical_counter(holder["state_activation_sequence"])
     ):
         return False
     return bool(runtime["runtime_id"] == expected_id)
@@ -889,7 +963,33 @@ def _valid_spawned_relation(
     )
 
 
-def _valid_fault(fault: Any, runtime: dict[str, Any]) -> bool:
+def _valid_fault(
+    fault: Any,
+    runtime: dict[str, Any],
+    next_logical_step_sequence: int,
+) -> bool:
+    pointer_codes = {
+        "guard_fault",
+        "action_fault",
+        "invalid_instance_target",
+        "inactive_component_target",
+        "binding_not_empty",
+    }
+    system_locators = {
+        "contained_runtime_fault": "system:unhandled_contained_failure",
+        "cascade_fault": "system:cascade_cleanup",
+        "invariant_fault": "system:invariant",
+    }
+    code = fault.get("code") if isinstance(fault, dict) else None
+    locator = fault.get("source_locator") if isinstance(fault, dict) else None
+    valid_locator = (
+        isinstance(code, str)
+        and isinstance(locator, str)
+        and (
+            (code in pointer_codes and locator.startswith("/"))
+            or system_locators.get(code) == locator
+        )
+    )
     return (
         isinstance(fault, dict)
         and set(fault) == {"runtime_id", "cause_id", "code", "step_sequence", "source_locator"}
@@ -898,18 +998,23 @@ def _valid_fault(fault: Any, runtime: dict[str, Any]) -> bool:
         and bool(fault["cause_id"])
         and isinstance(fault["code"], str)
         and bool(fault["code"])
-        and _nonnegative_integer(fault["step_sequence"])
-        and isinstance(fault["source_locator"], str)
+        and _logical_counter(fault["step_sequence"])
+        and fault["step_sequence"] < next_logical_step_sequence
+        and valid_locator
     )
 
 
-def _nonnegative_integer(value: Any) -> bool:
+def _bounded_nonnegative_integer(value: Any) -> bool:
     return isinstance(value, int) and not isinstance(value, bool) and 0 <= value <= _INT_MAX
+
+
+def _logical_counter(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool) and value >= 0
 
 
 def _counter_map(value: Any) -> bool:
     return isinstance(value, dict) and all(
-        isinstance(key, str) and _nonnegative_integer(counter) for key, counter in value.items()
+        isinstance(key, str) and _logical_counter(counter) for key, counter in value.items()
     )
 
 
@@ -1108,7 +1213,7 @@ def _validate_reserved_payload(event: str, envelope: dict[str, Any]) -> str | No
                 isinstance(payload[name], str) and bool(payload[name])
                 for name in ("instance_id", "machine_id")
             )
-            and _nonnegative_integer(payload["machine_version"])
+            and _bounded_nonnegative_integer(payload["machine_version"])
             and payload["machine_version"] > 0
             and payload["instance"]["instance_id"] == payload["instance_id"]
             and payload["instance"]["machine_id"] == payload["machine_id"]
@@ -1137,7 +1242,7 @@ def _validate_reserved_payload(event: str, envelope: dict[str, Any]) -> str | No
                     isinstance(payload[name], str) and bool(payload[name])
                     for name in ("instance_id", "machine_id")
                 )
-                and _nonnegative_integer(payload["machine_version"])
+                and _bounded_nonnegative_integer(payload["machine_version"])
                 and payload["machine_version"] > 0
                 and payload["instance"]["instance_id"] == payload["instance_id"]
                 and payload["instance"]["machine_id"] == payload["machine_id"]
@@ -1746,7 +1851,7 @@ class _Execution:
                     self.activation(runtime, machine, state, event_visible=event_visible),
                     f"{action_pointer}/cancel/instance",
                 )
-                self.cancel(reference)
+                self.cancel(runtime, reference)
             elif "stop" in action:
                 raise _StopRuntime
 
@@ -1799,8 +1904,13 @@ class _Execution:
             assert declaration is not None
             payload_result = _normalize_payload(declaration, payload_values)
             if payload_result is None:
-                first = sorted(payload_values, key=lambda item: item.encode("utf-8"))[0]
-                raise StepFault("action_fault", f"{pointer}/payload/{_escape_pointer(first)}")
+                supplied = sorted(payload_values, key=lambda item: item.encode("utf-8"))
+                locator = (
+                    f"{pointer}/payload/{_escape_pointer(supplied[0])}"
+                    if supplied
+                    else f"{pointer}/payload"
+                )
+                raise StepFault("action_fault", locator)
             normalized_payload = payload_result
         resolved = [
             self.resolve_send_target(runtime, target_spec, value, pointer, index, "targets" in send)
@@ -2010,13 +2120,32 @@ class _Execution:
         child.update(copy.deepcopy(snapshot_runtimes[child_runtime_id]))
         self.state["next_output_sequence"] = snapshot["next_output_sequence"]
 
-    def cancel(self, reference: Any) -> None:
+    def cancel(self, runtime: dict[str, Any], reference: Any) -> None:
         if not _is_instance_reference(reference):
             return
         child = self.state["runtimes"].get(reference["instance_id"])
-        if child is None or child["role"] != "spawned":
+        if (
+            child is None
+            or child["role"] != "spawned"
+            or not self.owns_descendant(runtime, child)
+        ):
             return
-        self.cleanup_runtime(child, dispose=True)
+        self.cleanup_descendant(child)
+
+    def owns_descendant(
+        self,
+        runtime: dict[str, Any],
+        descendant: dict[str, Any],
+    ) -> bool:
+        owner_id = descendant.get("owner_runtime_id")
+        while owner_id is not None:
+            if owner_id == runtime["runtime_id"]:
+                return True
+            owner = self.state["runtimes"].get(owner_id)
+            if not isinstance(owner, dict):
+                return False
+            owner_id = owner.get("owner_runtime_id")
+        return False
 
     def apply_transition(
         self,
@@ -2124,63 +2253,66 @@ class _Execution:
             runtime["active"].remove(state.path)
 
     def cleanup_state_children(self, runtime: dict[str, Any], state: StateNode) -> None:
-        children = list(self.state["runtimes"].values())
-        components = [
-            child
-            for child in children
-            if child.get("role") == "component"
-            and child.get("owner_runtime_id") == runtime["runtime_id"]
-            and child.get("owning_state_path") == state.path
-        ]
-        components.sort(
-            key=lambda child: (
-                child["component_definition_pointer"].encode("utf-8"),
-                child["owning_state_activation_sequence"],
-                child["component_declaration_index"],
-                child["component_activation_sequence"],
-            ),
-            reverse=True,
-        )
-        for child in components:
-            self.cleanup_runtime(child, dispose=True)
-        held = [
-            child
-            for child in list(self.state["runtimes"].values())
-            if child.get("role") == "spawned"
-            and child.get("owner_runtime_id") == runtime["runtime_id"]
-            and child.get("holder") is not None
-            and child["holder"]["state_path"] == state.path
-            and child["holder"]["state_activation_sequence"]
-            == runtime["state_activation_sequence"].get(state.path)
-        ]
-        held.sort(key=_spawn_cleanup_key)
-        for child in held:
-            self.cleanup_runtime(child, dispose=True)
+        activation_sequence = runtime["state_activation_sequence"].get(state.path)
 
-    def cleanup_runtime(self, runtime: dict[str, Any], *, dispose: bool) -> None:
-        machine = self.model_for(runtime)
-        descendants = [
+        def selected(child: dict[str, Any]) -> bool:
+            if child["role"] == "component":
+                return child.get("owning_state_path") == state.path
+            holder = child.get("holder")
+            return bool(
+                holder is not None
+                and holder["state_path"] == state.path
+                and holder["state_activation_sequence"] == activation_sequence
+            )
+
+        for child in self.ordered_children(runtime, selected):
+            self.cleanup_descendant(child)
+
+    def ordered_children(
+        self,
+        runtime: dict[str, Any],
+        selected: Callable[[dict[str, Any]], bool] | None = None,
+    ) -> list[dict[str, Any]]:
+        children = [
             child
             for child in list(self.state["runtimes"].values())
             if child.get("owner_runtime_id") == runtime["runtime_id"]
+            and (selected is None or selected(child))
         ]
         components = sorted(
-            [child for child in descendants if child["role"] == "component"],
-            key=lambda child: (
-                child["component_definition_pointer"].encode("utf-8"),
-                child["owning_state_activation_sequence"],
-                child["component_declaration_index"],
-                child["component_activation_sequence"],
-            ),
+            (child for child in children if child["role"] == "component"),
+            key=_component_cleanup_key,
             reverse=True,
         )
         spawned = sorted(
-            [child for child in descendants if child["role"] == "spawned"],
+            (child for child in children if child["role"] == "spawned"),
             key=_spawn_cleanup_key,
         )
-        for child in [*components, *spawned]:
-            self.cleanup_runtime(child, dispose=True)
-        if runtime["status"] == "running":
+        return [*components, *spawned]
+
+    def cleanup_descendant(
+        self,
+        runtime: dict[str, Any],
+        *,
+        frozen: bool = False,
+    ) -> None:
+        try:
+            self.cleanup_runtime(runtime, dispose=True, frozen=frozen)
+        except StepFault as exc:
+            raise StepFault("cascade_fault", "system:cascade_cleanup") from exc
+
+    def cleanup_runtime(
+        self,
+        runtime: dict[str, Any],
+        *,
+        dispose: bool,
+        frozen: bool = False,
+    ) -> None:
+        machine = self.model_for(runtime)
+        frozen = frozen or runtime["status"] == "faulted"
+        for child in self.ordered_children(runtime):
+            self.cleanup_descendant(child, frozen=frozen)
+        if runtime["status"] == "running" and not frozen:
             for path in list(reversed(runtime["active"])):
                 self.exit_state(runtime, machine, machine.states[path])
         if dispose:
@@ -2194,19 +2326,8 @@ class _Execution:
     def complete_runtime(self, runtime: dict[str, Any], machine: MachineModel) -> None:
         if runtime["status"] != "running":
             return
-        for child in sorted(
-            [
-                item
-                for item in list(self.state["runtimes"].values())
-                if item.get("owner_runtime_id") == runtime["runtime_id"]
-            ],
-            key=lambda item: (
-                0 if item["role"] == "component" else 1,
-                item.get("component_definition_pointer", "").encode("utf-8"),
-                item.get("spawn_sequence", 0),
-            ),
-        ):
-            self.cleanup_runtime(child, dispose=True)
+        for child in self.ordered_children(runtime):
+            self.cleanup_descendant(child)
         for path in list(reversed(runtime["active"])):
             self.exit_state(runtime, machine, machine.states[path])
         runtime["status"] = "completed"
@@ -2377,6 +2498,16 @@ def _spawn_cleanup_key(runtime: dict[str, Any]) -> tuple[int, bytes, int, int]:
         holder["pointer"].encode("utf-8"),
         int(holder["state_activation_sequence"]),
         int(runtime["spawn_sequence"]),
+    )
+
+
+def _component_cleanup_key(runtime: dict[str, Any]) -> tuple[bytes, int, int, int]:
+    owning_state_pointer = runtime["component_definition_pointer"].rsplit("/components/", 1)[0]
+    return (
+        owning_state_pointer.encode("utf-8"),
+        int(runtime["owning_state_activation_sequence"]),
+        int(runtime["component_declaration_index"]),
+        int(runtime["component_activation_sequence"]),
     )
 
 
