@@ -5,8 +5,8 @@ a language-agnostic statechart engine with a shared normative conformance suite.
 
 This pre-release implements Determa State `format: 1` at the approved specification
 commit `4bd4d9588d11b75d376380b6120676a056a4bc45`. Correctness is determined by the
-75-case core suite at conformance commit
-`fc4842010ab8d83bf4c5c6280a5627ca86829f7f`.
+88-case core suite at conformance commit
+`ffbc65cbce49733803119a7dabf02a9727819ba8`.
 
 The package version remains `0.0.6` until the specification, conformance suite, Python
 engine, and Rust engine are released together.

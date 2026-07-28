@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import math
 
 import pytest
 
@@ -52,6 +53,68 @@ machines:
     root:
       variables:
         settings: { type: map, input: true }
+"""
+
+NUMERIC_BOUNDARY_BUNDLE = """
+format: 1
+namespace: example.numeric_boundary
+events:
+  ordinary_values:
+    direction: input
+    payload:
+      mapped: { type: map, required: true }
+machines:
+  - machine_id: numeric_boundary
+    root:
+      variables:
+        created_map: { type: map, input: true }
+        rate: { type: float, external: true }
+        stored_map: { type: map, init: {} }
+        guard_selected: { type: bool, init: false }
+      on_events:
+        ordinary_values:
+          action:
+            - assign: { stored_map: "event.payload.mapped" }
+        env:
+          - guard: "event.payload.changed.rate == 1.0"
+            action:
+              - assign: { guard_selected: "true" }
+              - refresh: {}
+          - action:
+              - assign: { guard_selected: "false" }
+              - refresh: {}
+"""
+
+HOLDER_REUSE_BUNDLE = """
+format: 1
+namespace: example.holder_reuse
+events:
+  prepare: { direction: input }
+  leave: { direction: input }
+machines:
+  - machine_id: owner
+    root:
+      type: composite
+      initial: { transition_to: holding }
+      states:
+        holding:
+          variables:
+            child_reference:
+              type: instance_reference
+              machine_id: child
+              nullable: true
+              init: null
+          on_events:
+            prepare:
+              action:
+                - spawn: { machine_id: child, bind_to: child_reference }
+                - assign: { child_reference: "null" }
+                - spawn: { machine_id: child, bind_to: child_reference }
+                - assign: { child_reference: "null" }
+            leave: { transition_to: outside }
+        outside: {}
+  - machine_id: child
+    root: {}
 """
 
 FROZEN_SUBTREE_BUNDLE = """
@@ -871,6 +934,138 @@ def test_nested_nonportable_creation_binding_is_rejected() -> None:
     assert result["status"] == "rejected"
     assert result["rejection"] == {"code": "invalid_binding"}
     assert result["state"] is None
+
+
+def test_programmatic_values_are_recursively_validated_and_normalized() -> None:
+    bundle = load_bundle(NUMERIC_BOUNDARY_BUNDLE)
+    invalid = create(
+        bundle,
+        "numeric_boundary",
+        "numeric-invalid",
+        "numeric-invalid-create",
+        {
+            "input": {"created_map": {"nested": [math.nan]}},
+            "external": {"rate": 0.0},
+        },
+    )
+    assert invalid["rejection"] == {"code": "invalid_binding"}
+    assert invalid["state"] is None
+
+    created = create(
+        bundle,
+        "numeric_boundary",
+        "numeric-boundary",
+        "numeric-create",
+        {
+            "input": {
+                "created_map": {
+                    "integer": 1,
+                    "double": 1.0,
+                    "nested": [-0.0],
+                }
+            },
+            "external": {"rate": -0.0},
+        },
+    )
+    state = created["state"]
+    created_values = _root_variables(state)
+    assert type(created_values["created_map"]["integer"]) is int
+    assert type(created_values["created_map"]["double"]) is float
+    assert math.copysign(1.0, created_values["created_map"]["nested"][0]) == 1.0
+    assert math.copysign(1.0, created_values["rate"]) == 1.0
+
+    envelope = _envelope(state, "ordinary_values", "ordinary-values")
+    envelope["payload"] = {
+        "mapped": {
+            "integer": 1,
+            "double": 1.0,
+            "nested": [-0.0],
+        }
+    }
+    envelope_snapshot = copy.deepcopy(envelope)
+    handled = dispatch(bundle, state, {"input": envelope})
+    assert envelope == envelope_snapshot
+    stored = _root_variables(handled["state"])["stored_map"]
+    assert type(stored["integer"]) is int
+    assert type(stored["double"]) is float
+    assert math.copysign(1.0, stored["nested"][0]) == 1.0
+
+    rejected_envelope = _envelope(handled["state"], "ordinary_values", "non-finite")
+    rejected_envelope["payload"] = {"mapped": {"nested": [math.inf]}}
+    rejected = dispatch(bundle, handled["state"], {"input": rejected_envelope})
+    assert rejected["rejection"] == {"code": "invalid_payload"}
+    assert rejected["state"] is handled["state"]
+
+    malformed_state = copy.deepcopy(handled["state"])
+    root = malformed_state["runtimes"][malformed_state["root_runtime_id"]]
+    root["scopes"]["root"]["stored_map"]["nested"][0] = math.nan
+    next_step = malformed_state["next_logical_step_sequence"]
+    rejected = dispatch(bundle, malformed_state)
+    assert rejected["rejection"] == {"code": "invalid_prior_state"}
+    assert rejected["state"] is malformed_state
+    assert malformed_state["next_logical_step_sequence"] == next_step
+    retained = malformed_state["runtimes"][root["runtime_id"]]["scopes"]["root"]
+    assert math.isnan(retained["stored_map"]["nested"][0])
+
+
+def test_env_changed_is_normalized_before_guard_and_refresh() -> None:
+    bundle = load_bundle(NUMERIC_BOUNDARY_BUNDLE)
+    state = create(
+        bundle,
+        "numeric_boundary",
+        "numeric-env",
+        "numeric-create",
+        {
+            "input": {"created_map": {}},
+            "external": {"rate": 0},
+        },
+    )["state"]
+    root = state["runtimes"][state["root_runtime_id"]]
+    root["scopes"]["root"]["created_map"] = {"nested": [-0.0]}
+    envelope = _envelope(state, "env", "env-change")
+    envelope["payload"] = {"changed": {"rate": 1}}
+    envelope_snapshot = copy.deepcopy(envelope)
+
+    result = dispatch(bundle, state, {"input": envelope})
+
+    assert envelope == envelope_snapshot
+    values = _root_variables(result["state"])
+    assert values["guard_selected"] is True
+    assert type(values["rate"]) is float
+    assert values["rate"] == 1.0
+    assert math.copysign(1.0, values["created_map"]["nested"][0]) == 1.0
+    assert math.copysign(1.0, _root_variables(state)["created_map"]["nested"][0]) == -1.0
+
+
+def test_holder_association_survives_reference_clear_and_reuse() -> None:
+    bundle = load_bundle(HOLDER_REUSE_BUNDLE)
+    state = create(bundle, "owner", "holder-owner", "holder-create", {})["state"]
+    prepared = dispatch(
+        bundle,
+        state,
+        {"input": _envelope(state, "prepare", "prepare")},
+    )
+    prepared_state = prepared["state"]
+    children = [
+        runtime
+        for runtime in prepared_state["runtimes"].values()
+        if runtime["role"] == "spawned"
+    ]
+    assert _root_variables(prepared_state)["child_reference"] is None
+    assert len(children) == 2
+    assert {child["holder"]["pointer"] for child in children} == {
+        "/machines/0/root/states/holding/variables/child_reference"
+    }
+
+    left = dispatch(
+        bundle,
+        prepared_state,
+        {"input": _envelope(prepared_state, "leave", "leave")},
+    )
+
+    assert left["disposition"] == "handled"
+    assert len(left["state"]["runtimes"]) == 1
+    assert _root_variables(left["state"]) == {}
 
 
 def test_cyclic_payload_is_rejected_without_recursion() -> None:
