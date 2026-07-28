@@ -1,159 +1,170 @@
 # determa-state
 
-Reference implementation (**Python**) of the [**Determa State**](https://github.com/fruwehq/determa-state-spec)
-statechart engine.
+Python implementation of [Determa State](https://github.com/fruwehq/determa-state-spec),
+a language-agnostic statechart engine with a shared normative conformance suite.
 
-The normative `SPEC.md`, the JSON Schema for machine YAML, and the cross-language
-**conformance suite** live in the spec repo. This repository implements that spec in
-Python and is correct **iff it passes the conformance suite**.
+This pre-release implements Determa State `format: 1` at the approved specification
+commit `03771fac569a47b82f27891cd3700d4d1d876f8b`. Correctness is determined by the
+75-case core suite at conformance commit
+`409bbdc6c2d4a4e9d50ddb1d994c5f5cd7d97762`.
 
-Implements the **Determa State spec v0.0.6** (early alpha; all Determa State repos share one
-[synchronized version](https://github.com/fruwehq/determa-state-spec)).
+The package version remains `0.0.6` until the specification, conformance suite, Python
+engine, and Rust engine are released together.
 
-Status: **passing the full conformance suite** — all 31 engine cases
-(`conformance/01`–`31`) plus `conformance/cli/01`–`03`. Implements YAML 1.2 loading
-+ validation, the full statechart semantics (RTC dispatch, hierarchy, orthogonal
-regions + `done`, shallow/deep history, choice pseudostates, submachine states, esvs, CEL guards,
-structured actions,
-active objects + bus, defer, timers, faults), static contracts, snapshot
-round-trip + safe-point migration, Mermaid `export`, and the §13 CLI. Built up
-the build order in [issue #3][issue].
+## Install
 
-[issue]: https://github.com/fruwehq/determa-state-python/issues/3
+The published `0.0.6` distribution predates format 1. Until the next synchronized
+Determa State release, install this pre-release implementation from a checkout:
 
-## Conformance suite
-
-The cross-language **conformance suite** is the single source of truth for correctness;
-this repository is correct **iff it passes it**. The suite lives in
-[`fruwehq/determa-state-conformance`](https://github.com/fruwehq/determa-state-conformance); the test
-harness **fetches it at the matching release tag** (`v0.0.6`) into a gitignored
-`.cache/` — no git submodule. The normative `SPEC.md` and JSON Schema live in
-[`fruwehq/determa-state-spec`](https://github.com/fruwehq/determa-state-spec); the schema-drift test fetches the
-schema at the same tag.
-
-For **offline** work, point the harness at a local checkout:
-```
-export DETERMA_CONFORMANCE_DIR=/path/to/determa-state-conformance   # the suite
-export DETERMA_SPEC_DIR=/path/to/determa-state-spec                        # the schema (optional)
+```sh
+git clone https://github.com/fruwehq/determa-state-python.git
+cd determa-state-python
+python -m pip install -e .
 ```
 
-## Scope (per the spec)
-- Load and validate machine YAML against `schema/machine.schema.json`, parsed under
-  the **YAML 1.2 core schema** (only `true`/`false` are booleans).
-- Execute statecharts per `SPEC.md`: run-to-completion; hierarchy; orthogonal regions
-  (+ `done`); shallow/deep history; `initial` transitions; `esvs` (extended-state
-  variables declared in states, hierarchical) including `external` esvs + the `env`
-  event and `refresh`; `defer` (deferred-set, edge-triggered); timers via an injected
-  clock; active-object spawning; `publish` (directed / by subscription / scoped); and
-  faults (the `error` event).
-- **Guards in CEL** (e.g. [`cel-python`](https://pypi.org/project/cel-python/));
-  **structured actions** (`assign`/`publish`/`refresh`/`spawn`/`stop`) with CEL values.
-- **Adapters** — bus / queue / clock / store / observer (SPEC §8), each with a simple
-  in-memory default for tests.
-- An **`export`** command that renders a machine (and an instance's current
-  `state_config`) to **Mermaid** `stateDiagram-v2` (SPEC §12), behind a pluggable
-  exporter interface so more formats (PlantUML, SCXML, …) can be added later.
-- A test harness that runs the upstream conformance cases against this engine.
+The distribution is `determa-state`; the import is `determa.state`. It also installs
+`determa-state` and `determa-state-python` commands.
 
-## Use as a library
-The CLI (`determa-state …`) is a thin wrapper over a programmatic API; an engine can be
-embedded in a host program **without** the CLI or the file-backed store (SPEC §2):
+## Define A Bundle
+
+Format 1 uses one self-contained bundle containing one or more machines:
+
+```yaml
+format: 1
+namespace: example.counter
+events:
+  increment:
+    direction: input
+    payload:
+      amount: { type: int, required: true }
+  reset:
+    direction: input
+machines:
+  - machine_id: counter
+    version: 1
+    root:
+      type: composite
+      variables:
+        count: { type: int, init: 0 }
+      initial: { transition_to: running }
+      states:
+        running:
+          on_events:
+            increment:
+              action:
+                - assign: { count: "count + event.payload.amount" }
+            reset:
+              action:
+                - assign: { count: "0" }
+```
+
+The same bundle is available at [`examples/format-1.yaml`](examples/format-1.yaml).
+Documents are parsed using the portable YAML 1.2 scalar rules, then checked against the
+bundled normative JSON Schema and semantic validation rules. Abandoned draft grammar
+names are not accepted.
+
+## Use The Library
+
+`create` and `dispatch` are pure foreground operations. They do not retain hidden
+machine state or call queues, timers, databases, or remote services.
 
 ```python
+from pathlib import Path
+
 import determa.state as ds
 
-defs = ds.load_definitions(open("gate.yaml").read())
-ds.validate(defs[0].raw)                     # raises ValidationError if invalid
+bundle = ds.load_bundle(Path("examples/format-1.yaml").read_text())
+created = ds.create(
+    bundle,
+    machine_id="counter",
+    root_instance_id="counter-42",
+    creation_id="create-counter-42",
+    bindings={},
+)
+state = created["state"]
 
-host = ds.Host()
-host.register_all(defs)
-inst = host.create_root(host.machines["gate"], "g1", external={"fare": 50})
-host.run_to_quiescence()
-
-host.deliver("g1", "coin", {"amount": 100})     # typed event; False if rejected
-host.run_to_quiescence()
-assert inst.active_leaf_names() == ["unlocked"]
-assert inst.resolved_esvs()["fare"] == 50
-assert inst.status is ds.Status.ACTIVE
-
-host.advance("30s")                             # virtual clock
-snaps = host.snapshot_all()                     # persist / round-trip (§8)
-host.restore_all(snaps)
-```
-
-`load_definitions` also accepts a **native mapping** (or a list of them for a
-multi-document machine) instead of YAML text, so a host can build machines in code
-without serializing — through the same `validate()` path:
-
-```python
-import determa.state as ds
-
-gate = {
-    "id": "gate",
-    "events": {"coin": {"payload": {"amount": {"type": "int", "required": True}}}},
-    "top": {
-        "esvs": {"fare": {"type": "int", "external": True}},
-        "initial": {"transition_to": "locked"},
-        "states": {
-            "locked": {"on_events": {"coin": {"transition_to": "unlocked",
-                                              "guard": "event.payload.amount >= fare"}}},
-            "unlocked": {"on_events": {"push": {"transition_to": "locked"}}},
-        },
-    },
+target = {
+    "root": {
+        "root_instance_id": state["root_instance_id"],
+        "root_runtime_id": state["root_runtime_id"],
+    }
 }
+result = ds.dispatch(
+    bundle,
+    state,
+    {
+        "input": {
+            "event": "increment",
+            "event_id": "counter-42:increment:1",
+            "target": target,
+            "payload": {"amount": 2},
+        }
+    },
+)
 
-defs = ds.load_definitions(gate)                 # dict, not a YAML string
-host = ds.Host()
-host.register_all(defs)
-inst = host.create_root(host.machines["gate"], "g1", external={"fare": 50})
-host.run_to_quiescence()
+assert result["status"] == "running"
+assert result["disposition"] == "handled"
+state = result["state"]
+root = state["runtimes"][state["root_runtime_id"]]
+assert root["scopes"]["root"]["count"] == 2
 ```
 
-The public surface is everything exported from the `determa.state` package
-(`determa.state.__all__`): `Host`, `Instance`, `Definition`, `Machine`, `Status`, `Event`,
-`load_definitions` / `load_definition`, `validate` / `collect_errors`, and the
-error types. See [`tests/test_library_api.py`](tests/test_library_api.py).
+Both calls return all result fields: `status`, `disposition`, `state`, `emissions`,
+`fault`, and `rejection` (`create` has a null disposition). The caller owns delivery:
+the core processes at most one supplied envelope and does not place it in an internal
+queue. Successful processing returns a new JSON-compatible logical aggregate while
+leaving the supplied prior state unchanged. Rejections and unhandled deliveries return
+the exact supplied state object.
 
-### Observing transitions (SPEC §8)
-Pass an **observer** — a passive callback invoked once per RTC step (automatic *or*
-manual) with `{ instance, event, transition, entered, exited, published, spawned,
-faulted }`. Built-ins: `JsonlObserver(stream)` (a drop-in transition log) and
-`CollectingObserver` (records to a list).
+`load_bundle` also accepts a native Python mapping through the same structural and
+semantic validation path. Native values must satisfy the same portable Unicode and
+numeric domain as source documents.
 
-```python
-import sys
-import determa.state as ds
-host = ds.Host(observer=ds.JsonlObserver(sys.stdout))  # one JSON line per step
+## Implemented Core
+
+- strict format-1 loading, default materialization, bundle fingerprinting, and exact
+  source-level scalar handling;
+- portable CEL guards and action expressions;
+- hierarchical dispatch, local and unmarked transitions, choices, shallow/deep
+  history, entry/exit behavior, final states, and stop interruption;
+- lexical typed variables, input/external bindings, `env` refresh, and typed payloads;
+- explicit sends, isolated lifecycle-bound components, and deterministic routing;
+- owned spawn, nominal instance references, binding, cancellation, completion,
+  failure propagation, and cleanup cascades;
+- atomic RTC rollback, deterministic identities/counters, pure inspection, and
+  incompatible or malformed prior-state rejection.
+
+Format 1 deliberately does not define native queues, timers, deferral, dead letters,
+stores, snapshot wire encoding, machine hot-swap/migration, package imports,
+standardized enabled-event inspection, or a standardized execution CLI. Hosts may
+persist the returned logical aggregate in their own transaction, but portable
+serialization and definition migration remain separate specification work.
+
+The implementation-local CLI only validates a bundle:
+
+```sh
+determa-state validate examples/format-1.yaml
 ```
 
-The Observer is *domain* observability (what the machine did). For *operational*
-diagnostics the engine also emits **standard-library logging** under the `determa.state` logger
-(dispatch/transition at `DEBUG`, faults/dead-letter at `WARNING`). It is silent by
-default (a `NullHandler` is attached); enable it from the host app:
-
-```python
-import logging
-logging.basicConfig(level=logging.DEBUG)   # or logging.getLogger("determa.state").setLevel(...)
-```
-
-## Layout
-- `src/determa/state/` — the package.
-- `tests/` — the implementation's own **unit tests** (hermetic, offline).
-- `conformance/` — the harness that runs the external **conformance suite** black-box
-  against this implementation (kept separate from the unit tests).
+It prints the normalized bundle fingerprint on success.
 
 ## Develop
-```
-python -m venv .venv && . .venv/bin/activate
-pip install -e '.[dev]'
 
-make check        # ruff + mypy + unit tests (hermetic, offline) — the PR gate
-make conformance  # download & run the language-agnostic conformance suite
+```sh
+python -m venv .venv
+. .venv/bin/activate
+python -m pip install -e '.[dev]'
+
+ruff check .
+mypy src/determa
+pytest -q
+pytest conformance -q
 ```
-Equivalently: `pytest` runs the unit tests only; `pytest conformance` runs the
-conformance suite (it fetches `determa-state-conformance` into `.cache/` on first run — set
-`DETERMA_CONFORMANCE_DIR` to use a local checkout offline). The two are **separate**:
-unit tests never touch the network; conformance is opt-in.
+
+Unit tests are hermetic and offline. The conformance harness uses the immutable commits
+listed above, cached under `.cache/`; local checkouts can be supplied with
+`DETERMA_CONFORMANCE_DIR` and `DETERMA_SPEC_DIR`.
 
 ## License
-MIT — see [LICENSE](LICENSE).
+
+MIT. See [LICENSE](LICENSE).

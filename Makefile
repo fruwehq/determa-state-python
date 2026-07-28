@@ -4,15 +4,14 @@
 test:
 	pytest -q
 
-# Conformance — the language-agnostic suite from fruwehq/determa-state-conformance, run
-# black-box against this implementation. Downloads the suite (pinned to the release
-# tag matching this package's version) into .cache/ on first run.
+# Conformance — the language-agnostic format-1 core suite, pinned to the approved
+# immutable pre-release commits in conformance/pins.py.
 # Offline / against a local checkout:  DETERMA_CONFORMANCE_DIR=/path/to/determa-state-conformance make conformance
 conformance:
 	pytest conformance -q
 
-# Refresh the bundled JSON Schema from fruwehq/determa-state-spec at the matching version tag
-# (or DETERMA_SPEC_DIR=/path/to/determa-state-spec). The schema-drift test guards that they match.
+# Refresh the bundled JSON Schema from the immutable format-1 specification pin
+# (or DETERMA_SPEC_DIR=/path/to/determa-state-spec).
 sync-schema:
 	python scripts/sync_schema.py
 
@@ -20,7 +19,7 @@ lint:
 	ruff check .
 
 typecheck:
-	mypy src
+	mypy src/determa
 
 # Everything a PR needs to pass locally (unit gate), plus conformance.
 check: lint typecheck test

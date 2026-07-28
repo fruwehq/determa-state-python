@@ -1,95 +1,67 @@
 # Contributing to Determa State (Python)
 
-**determa-state** is the Python reference implementation of the
-[Determa State](https://github.com/fruwehq/determa-state-spec) statechart engine. It is correct **iff** it
-passes the language-agnostic [conformance suite](https://github.com/fruwehq/determa-state-conformance).
-The prose specification lives in [`fruwehq/determa-state-spec`](https://github.com/fruwehq/determa-state-spec)
-(`SPEC.md`, the JSON Schema, and examples); the executable correctness target lives in
-[`fruwehq/determa-state-conformance`](https://github.com/fruwehq/determa-state-conformance).
+`determa-state` is the Python implementation of the
+[Determa State specification](https://github.com/fruwehq/determa-state-spec). The
+[language-neutral conformance suite](https://github.com/fruwehq/determa-state-conformance)
+is the executable arbiter of behavior.
 
-## Dev setup
+## Development Setup
 
 ```sh
 python -m venv .venv
-source .venv/bin/activate     # or `.venv\Scripts\activate` on Windows
-pip install -e '.[dev]'
+. .venv/bin/activate
+python -m pip install -e '.[dev]'
 ```
 
-Python ≥ 3.11. The package is import-named `determa.state`, distribution-named `determa-state`.
+Python 3.11 or newer is supported. The distribution is `determa-state`; the import is
+`determa.state`.
 
-## The gate
+## Gates
 
-Before pushing, run all three and keep them clean (`make check` does exactly this):
+Run the implementation gates and the full format-1 conformance suite before review:
 
 ```sh
 ruff check .
-mypy src
-pytest            # unit tests only — hermetic, offline
+mypy src/determa
+pytest -q
+pytest conformance -q
 ```
 
-CI runs `test (ubuntu-24.04)` on every PR and is **required** — a PR merges only once it
-is green. This job runs the **unit tests only**.
-
-## Unit tests vs. conformance — kept separate
-
-This implementation has its **own unit tests** (`tests/`), which are hermetic and offline
-— `pytest` (or `make test`) runs only these, and they never touch the network. That is the
-required PR gate.
-
-**Conformance is separate.** The language-agnostic suite is downloaded and run black-box
-against the built CLI/engine, in its own directory (`conformance/`) and its own CI job
-(`conformance`, non-blocking by default). Run it locally with:
+`tests/` is hermetic and offline. `conformance/` uses the approved immutable
+specification and suite commits recorded in `conformance/pins.py`. The harness caches
+those checkouts under `.cache/`. For offline or local cross-repository work:
 
 ```sh
-make conformance   # == pytest conformance
+DETERMA_CONFORMANCE_DIR=/path/to/determa-state-conformance \
+DETERMA_SPEC_DIR=/path/to/determa-state-spec \
+pytest conformance -q
 ```
 
-The suite is **not** a submodule. `conformance/conftest.py` clones
-`fruwehq/determa-state-conformance` at the release tag matching this package's version (falling
-back to `main` while the tag does not yet exist) into a gitignored `.cache/` directory and
-reuses it. To force a refresh, delete `.cache/`.
-
-- **Offline / local edits:** point the tests at a local checkout with
-  `DETERMA_CONFORMANCE_DIR=/path/to/determa-state-conformance` (and `DETERMA_SPEC_DIR=/path/to/determa-state-spec`
-  for the schema-parity test). If the suite cannot be obtained and no override is set, the
-  conformance tests **skip** rather than error.
-- **Black-box CLI conformance** runs the implementation's `determa-state` (via `python -m determa.state`)
-  as a **subprocess** against `conformance/run_cli.py`, so packaging/entry-point regressions
-  are caught (SPEC §13.6).
+CI checks out both immutable inputs directly and also verifies that the packaged schema
+is byte-for-value equivalent to the pinned specification schema.
 
 ## Workflow
 
-1. Branch from `main`, open a Pull Request, and **squash-merge** — `main` stays linear.
-2. Resolve all review threads before merging.
-3. **Never push to `main` directly.**
-4. **No AI/assistant attribution anywhere** — not in commits, PR bodies, comments, or
-   docs (no `Co-Authored-By:`, no "Generated with…"). Commits and PRs read as the
-   author's own work.
-5. One issue → one PR. A behavior change usually pairs with a `determa-state-spec` edit and a
-   `determa-state-conformance` case; link them from the PR.
+1. Read `AGENTS.md` and the linked specification/conformance changes first.
+2. Create one branch and one pull request for one issue.
+3. Never push directly to protected `main`.
+4. Resolve every review thread and keep the branch current before squash-merging.
+5. Do not add assistant attribution to commits, PRs, comments, or documentation.
+6. Specify and add conformance behavior before changing an engine.
 
-## Versioning
+Do not reintroduce compatibility aliases for abandoned pre-format-1 grammar or public
+behavior.
 
-The version source of truth is **`pyproject.toml`** (`version = …`); the package derives
-`determa.state.__version__` from the installed distribution metadata (no second copy to keep in
-sync). The package version **is** the implemented Determa State spec version.
+## Versioning And Release
 
-> determa-state-spec, determa-state-conformance, and determa-state share one synchronized SemVer version
-> (currently pre-1.0 `0.0.x`). A release tags all three `vX.Y.Z` in lockstep; an
-> implementation declares "implements Determa State spec vX.Y.Z" and pins the conformance suite
-> at that tag.
+`src/determa/state/__about__.py` is the single package version source. Determa State
+specification, conformance, Python, and Rust versions are synchronized. The current
+package remains `0.0.6` while format 1 is pre-release.
 
-### Releasing `vX.Y.Z` (lockstep)
-1. Land all spec / conformance / implementation changes on the three `main` branches.
-2. Bump the version in **`pyproject.toml`** (here) and the `VERSION` files in `determa-state-spec` and
-   `determa-state-conformance`.
-3. Tag `vX.Y.Z` on **determa-state-spec** and **determa-state-conformance** (`gh api -X POST
-   repos/fruwehq/<repo>/git/refs -f ref=refs/tags/vX.Y.Z -f sha=$(gh api
-   repos/fruwehq/<repo>/commits/main --jq .sha)`), so this package pins the matching
-   conformance tag instead of falling back to `main`.
-4. Tag **determa-state** `vX.Y.Z` only to publish to PyPI — it triggers `release.yml`
-   (Trusted Publishing).
+A `vX.Y.Z` tag triggers `release.yml` and publishes to PyPI through Trusted Publishing,
+gated by the manually approved `pypi` environment. Version bumps, tags, and publication
+are separate release work and require explicit authorization.
 
 ## License
 
-Contributions are made under the project's [MIT license](LICENSE).
+Contributions are made under the [MIT license](LICENSE).

@@ -1,95 +1,187 @@
-"""Loading machine definitions from YAML text or native mappings (SPEC §2, §4).
-
-A machine file is one or more ``---``-separated documents; the first is the
-root definition (SPEC §9). Each document is validated (structure + reserved
-names) before a :class:`Definition` is produced. Later build steps resolve the
-raw document into a navigable state model; step 1 keeps the validated raw
-mapping as the single source of structure.
-
-Hosts that build machines in code can pass a native mapping (``dict``) — or a
-sequence of them for a multi-document machine — instead of serializing to a
-YAML string. The same ``validate()`` path runs either way, so a hand-built
-machine is held to the same contract as a file-loaded one.
-"""
+"""Format-1 bundle loading, normalization, and deterministic fingerprinting."""
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+import copy
+import hashlib
+import json
+import math
+import struct
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 
 from . import yaml12
-from .errors import ErrorRecord, ValidationError
-from .validator import validate
+from .errors import ValidationError
 
-#: A machine definition as YAML text, a single mapping, or a sequence of mappings
-#: (one per ``---`` document; the first is the root, SPEC §9).
-DefinitionSource = str | Mapping[str, Any] | Sequence[Mapping[str, Any]]
+BundleSource = str | Mapping[str, Any]
+
+
+def _utf8_key(value: str) -> bytes:
+    return value.encode("utf-8", errors="strict")
+
+
+def _normalize_typed_literal(declaration: dict[str, Any], member: str) -> None:
+    if member not in declaration:
+        return
+    value = declaration[member]
+    if (
+        declaration.get("type") == "float"
+        and isinstance(value, int)
+        and not isinstance(value, bool)
+    ):
+        value = float(value)
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValidationError("numeric_value_out_of_range")
+        value = 0.0 if value == 0.0 else value
+    declaration[member] = value
+
+
+def _normalize_event(declaration: dict[str, Any]) -> None:
+    declaration.setdefault("direction", "internal")
+    for field in (declaration.get("payload") or {}).values():
+        field.setdefault("required", False)
+        _normalize_typed_literal(field, "default")
+
+
+def _normalize_action(action: dict[str, Any]) -> None:
+    send = action.get("send")
+    if isinstance(send, dict) and "to" not in send and "targets" not in send:
+        send["to"] = {"self": True}
+
+
+def _normalize_transition(transition: dict[str, Any], *, event_transition: bool) -> None:
+    if event_transition:
+        transition.setdefault("lang", "cel")
+    for action in transition.get("action") or []:
+        _normalize_action(action)
+
+
+def _normalize_state(state: dict[str, Any], *, pointer: str) -> None:
+    if "choice" in state:
+        for branch in state["choice"]:
+            _normalize_transition(branch, event_transition=False)
+        return
+    state.setdefault("type", "simple")
+    if state["type"] == "composite":
+        state.setdefault("history", "none")
+    for declaration in (state.get("variables") or {}).values():
+        if declaration.get("type") != "instance_reference":
+            declaration.setdefault("input", False)
+            declaration.setdefault("external", False)
+        _normalize_typed_literal(declaration, "init")
+    for action in state.get("entry") or []:
+        _normalize_action(action)
+    for action in state.get("exit") or []:
+        _normalize_action(action)
+    initial = state.get("initial")
+    if isinstance(initial, dict):
+        _normalize_transition(initial, event_transition=False)
+    for transition_or_list in (state.get("on_events") or {}).values():
+        transitions = (
+            transition_or_list if isinstance(transition_or_list, list) else [transition_or_list]
+        )
+        for transition in transitions:
+            _normalize_transition(transition, event_transition=True)
+    for name, child in (state.get("states") or {}).items():
+        _normalize_state(child, pointer=f"{pointer}/states/{_escape_pointer(name)}")
+    for index, placement in enumerate(state.get("components") or []):
+        inline_root = placement.get("root")
+        if isinstance(inline_root, dict):
+            _normalize_state(inline_root, pointer=f"{pointer}/components/{index}/root")
+
+
+def _escape_pointer(value: str) -> str:
+    return value.replace("~", "~0").replace("/", "~1")
+
+
+def normalize_bundle(raw: dict[str, Any]) -> dict[str, Any]:
+    """Materialize only the normative format-1 defaults."""
+    normalized = copy.deepcopy(raw)
+    for declaration in (normalized.get("events") or {}).values():
+        _normalize_event(declaration)
+    for machine_index, machine in enumerate(normalized.get("machines") or []):
+        machine.setdefault("version", 1)
+        languages = machine.setdefault("languages", {})
+        languages.setdefault("guard", "cel")
+        languages.setdefault("action", "determa")
+        for declaration in (machine.get("events") or {}).values():
+            _normalize_event(declaration)
+        _normalize_state(machine["root"], pointer=f"/machines/{machine_index}/root")
+    return normalized
+
+
+def _typed_value(value: Any) -> list[Any]:
+    if value is None:
+        return ["null"]
+    if isinstance(value, bool):
+        return ["boolean", value]
+    if isinstance(value, str):
+        return ["string", value]
+    if isinstance(value, int):
+        return ["integer", str(value)]
+    if isinstance(value, float):
+        bits = struct.pack("!d", 0.0 if value == 0.0 else value).hex()
+        return ["float", bits]
+    if isinstance(value, list):
+        return ["list", [_typed_value(item) for item in value]]
+    if isinstance(value, dict):
+        entries = [[key, _typed_value(value[key])] for key in sorted(value, key=_utf8_key)]
+        return ["map", entries]
+    raise ValidationError("non_json_value")
+
+
+def canonical_json(value: Any) -> str:
+    """Canonical JSON for identity tuples, whose members are already normalized."""
+    return json.dumps(value, ensure_ascii=False, allow_nan=False, separators=(",", ":"))
+
+
+def hash_identity(value: Any) -> str:
+    encoded = canonical_json(value).encode("utf-8", errors="strict")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def bundle_fingerprint(normalized: dict[str, Any]) -> str:
+    return hash_identity(["determa-validated-bundle-fingerprint-1", _typed_value(normalized)])
 
 
 @dataclass(frozen=True)
-class Definition:
-    """A validated machine definition (one YAML document)."""
+class Bundle:
+    """A validated, normalized format-1 bundle."""
 
-    id: str
-    version: int
-    format: int
     raw: dict[str, Any]
+    fingerprint: str
 
     @property
-    def top(self) -> dict[str, Any]:
-        """The outermost state node (SPEC §4.5)."""
-        return cast(dict[str, Any], self.raw["top"])
+    def namespace(self) -> str:
+        return str(self.raw["namespace"])
+
+    @property
+    def machines(self) -> list[dict[str, Any]]:
+        return list(self.raw["machines"])
+
+    def machine(self, machine_id: str) -> dict[str, Any] | None:
+        return next((m for m in self.raw["machines"] if m["machine_id"] == machine_id), None)
 
 
-def _doc_to_definition(doc: Any, index: int) -> Definition:
-    """Validate one document (mapping) and wrap it as a :class:`Definition`."""
-    if not isinstance(doc, Mapping):
-        raise ValidationError(
-            [ErrorRecord(path=f"doc[{index}]", message="a machine definition must be a mapping")]
-        )
-    raw = dict(doc)  # normalize any Mapping to a plain dict (and defensive copy)
-    validate(raw)
-    return Definition(
-        id=raw["id"],
-        version=raw.get("version", 1),
-        format=raw.get("format", 1),
-        raw=raw,
-    )
-
-
-def load_definitions(source: DefinitionSource) -> list[Definition]:
-    """Parse and validate every document in a machine file or native mapping(s).
-
-    ``source`` is YAML text (``str``), a single native mapping (``dict``), or a
-    sequence of mappings (multi-document). Each document runs through the same
-    :func:`validate` path, so building a machine in code is held to the same
-    contract as loading one from a YAML file.
-    """
+def load_bundle(source: BundleSource) -> Bundle:
+    """Parse, structurally validate, semantically validate, and normalize one bundle."""
     if isinstance(source, str):
-        docs: list[Any] = list(yaml12.load_all(source))
+        document = yaml12.load(source)
     elif isinstance(source, Mapping):
-        docs = [source]
+        document = copy.deepcopy(dict(source))
+        yaml12.validate_portable_values(document)
+        if not yaml12.validate_unicode(document):
+            raise ValidationError("invalid_unicode")
     else:
-        docs = list(source)
-    if not docs:
-        raise ValidationError([ErrorRecord(path="(root)", message="no document")])
-    return [_doc_to_definition(doc, i) for i, doc in enumerate(docs)]
+        raise ValidationError("non_json_value")
+    if not isinstance(document, dict):
+        raise ValidationError("structural_validation")
+    if document.get("format") != 1 or isinstance(document.get("format"), bool):
+        raise ValidationError("unsupported_format")
+    from .validator import validate
 
-
-def load_definition(source: DefinitionSource) -> Definition:
-    """Load a single-definition machine (from text or a native mapping).
-
-    Errors if the source carries more than one document.
-    """
-    defs = load_definitions(source)
-    if len(defs) != 1:
-        raise ValidationError(
-            [
-                ErrorRecord(
-                    path="(root)",
-                    message=f"expected one definition, got {len(defs)}",
-                )
-            ]
-        )
-    return defs[0]
+    validate(document)
+    normalized = normalize_bundle(document)
+    return Bundle(raw=normalized, fingerprint=bundle_fingerprint(normalized))
