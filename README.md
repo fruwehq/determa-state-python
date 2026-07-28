@@ -8,13 +8,14 @@ commit `4bd4d9588d11b75d376380b6120676a056a4bc45`. Correctness is determined by 
 88-case core suite at conformance commit
 `ffbc65cbce49733803119a7dabf02a9727819ba8`.
 
-The package version remains `0.0.6` until the specification, conformance suite, Python
-engine, and Rust engine are released together.
+The package metadata is `0.0.7` for the next synchronized release of the specification,
+conformance suite, Python engine, and Rust engine.
 
 ## Install
 
-The published `0.0.6` distribution predates format 1. Until the next synchronized
-Determa State release, install this pre-release implementation from a checkout:
+The published `0.0.6` distribution predates format 1. Until the synchronized `0.0.7`
+Determa State release is published, install this pre-release implementation from a
+checkout:
 
 ```sh
 git clone https://github.com/fruwehq/determa-state-python.git

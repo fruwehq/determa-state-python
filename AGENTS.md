@@ -14,8 +14,8 @@ Format-1 work currently uses these immutable pre-release inputs:
 - specification: `4bd4d9588d11b75d376380b6120676a056a4bc45`;
 - conformance: `ffbc65cbce49733803119a7dabf02a9727819ba8` (88 core cases).
 
-The package version is still `0.0.6`; the specification, conformance suite, Python
-engine, and Rust engine version together.
+The package metadata is `0.0.7` for the next synchronized release; the specification,
+conformance suite, Python engine, and Rust engine version together.
 
 ## Boundaries
 

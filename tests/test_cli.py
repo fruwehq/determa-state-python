@@ -8,8 +8,8 @@ from determa.state import __version__
 from determa.state.cli import main
 
 
-def test_version_remains_unchanged() -> None:
-    assert __version__ == "0.0.6"
+def test_version_matches_release_metadata() -> None:
+    assert __version__ == "0.0.7"
 
 
 def test_validate_command_reports_fingerprint(tmp_path, capsys) -> None:
