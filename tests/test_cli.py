@@ -8,7 +8,7 @@ from determa.state import __version__
 from determa.state.cli import main
 
 
-def test_version_remains_unchanged() -> None:
+def test_version_matches_release_metadata() -> None:
     assert __version__ == "0.0.7"
 
 
