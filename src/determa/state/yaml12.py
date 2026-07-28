@@ -76,6 +76,22 @@ def validate_portable_values(value: Any) -> None:
     _validate_portable_values(value, set())
 
 
+def normalize_portable_values(value: Any) -> Any:
+    """Copy a portable host value and normalize every binary64 negative zero."""
+    validate_portable_values(value)
+    return _normalize_portable_values(value)
+
+
+def _normalize_portable_values(value: Any) -> Any:
+    if isinstance(value, float):
+        return 0.0 if value == 0.0 else value
+    if isinstance(value, list):
+        return [_normalize_portable_values(item) for item in value]
+    if isinstance(value, dict):
+        return {key: _normalize_portable_values(item) for key, item in value.items()}
+    return value
+
+
 def _validate_portable_values(value: Any, ancestors: set[int]) -> None:
     if value is None or isinstance(value, (str, bool)):
         return

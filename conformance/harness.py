@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import math
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,6 +56,13 @@ def _load_test(path: Path) -> dict[str, Any]:
 def _materialize_driver_value(value: Any) -> Any:
     if isinstance(value, dict) and set(value) == {"invalid_unicode_scalar"}:
         return chr(int(value["invalid_unicode_scalar"], 16))
+    if isinstance(value, dict) and set(value) == {"non_finite_double"}:
+        marker = value["non_finite_double"]
+        return {
+            "nan": math.nan,
+            "positive_infinity": math.inf,
+            "negative_infinity": -math.inf,
+        }[marker]
     if isinstance(value, dict):
         return {key: _materialize_driver_value(item) for key, item in value.items()}
     if isinstance(value, list):
@@ -128,6 +136,9 @@ def run_case(case: CoreCase) -> None:
                 ]
                 target = {"spawned_instance": copy.deepcopy(reference)}
                 target_runtime_id = reference["instance_id"]
+            elif "component" in send:
+                target = _component_target(state, send["component"])
+                target_runtime_id = _target_runtime_id(target)
             envelope = {
                 "event": send["event"],
                 "event_id": send.get("event_id", f"conformance:{case.name}:step:{index}:input"),
@@ -141,9 +152,30 @@ def run_case(case: CoreCase) -> None:
         elif "deliver" in step:
             delivery = step["deliver"]
             envelope = copy.deepcopy(captures[delivery["captured"]][delivery["index"]])
+            replacement = _materialize_driver_value(delivery.get("replace") or {})
+            if "payload" in replacement:
+                envelope["payload"] = copy.deepcopy(replacement["payload"])
+            if "target" in replacement:
+                envelope["target"] = _driver_target(state, replacement["target"])
+            if "spawned_instance_reference" in replacement:
+                envelope["target"]["spawned_instance"].update(
+                    copy.deepcopy(replacement["spawned_instance_reference"])
+                )
             target_runtime_id = _target_runtime_id(envelope["target"])
             envelope_snapshot = copy.deepcopy(envelope)
             result = dispatch(dispatch_bundle, state, {"internal": envelope})
+        elif "inspect" in step:
+            mutation = step["inspect"]["corrupt_prior_state"]
+            prior_state = copy.deepcopy(state)
+            root = prior_state["runtimes"][prior_state["root_runtime_id"]]
+            selected = _visible_variable_storage(root, mutation["variable"])
+            for member in mutation["path"][:-1]:
+                selected = selected[member]
+            selected[mutation["path"][-1]] = _materialize_driver_value(mutation["value"])
+            prior_state_snapshot = copy.deepcopy(prior_state)
+            result = dispatch(dispatch_bundle, prior_state)
+            envelope = None
+            envelope_snapshot = None
         else:
             raise AssertionError(f"{case.name} step {index}: unsupported driver step")
         _assert_result(
@@ -199,6 +231,7 @@ def _assert_result(
         "rejection",
         "fault",
         "caller_still_owns_input",
+        "caller_still_owns_state",
         "state",
         "config",
         "variables",
@@ -232,6 +265,11 @@ def _assert_result(
         )
         if result["disposition"] == "rejected":
             assert result["state"] is prior_state
+    if expected.get("caller_still_owns_state"):
+        assert prior_state is not None
+        assert prior_state_snapshot is not None
+        assert prior_state == prior_state_snapshot
+        assert result["state"] is prior_state
     if result["state"] is None:
         return
     state = result["state"]
@@ -351,6 +389,13 @@ def _assert_emission(
 
 def _assert_partial(actual: Any, expected: Any, *, state: dict[str, Any] | None = None) -> None:
     if isinstance(expected, dict):
+        if expected == {"normalized_double": "positive_zero"}:
+            assert (
+                type(actual) is float
+                and actual == 0.0
+                and math.copysign(1.0, actual) == 1.0
+            ), actual
+            return
         assert isinstance(actual, dict), (actual, expected)
         if set(expected) == {"instance_reference"}:
             assertion = expected["instance_reference"]
@@ -413,6 +458,30 @@ def _root_target(state: dict[str, Any]) -> dict[str, Any]:
             "root_runtime_id": state["root_runtime_id"],
         }
     }
+
+
+def _component_target(state: dict[str, Any], component_id: str) -> dict[str, Any]:
+    root = state["runtimes"][state["root_runtime_id"]]
+    runtime_id = root["components"][component_id]
+    return copy.deepcopy(state["runtimes"][runtime_id]["target"])
+
+
+def _driver_target(state: dict[str, Any], selector: Any) -> dict[str, Any]:
+    if selector == "root":
+        return _root_target(state)
+    if "bound_instance" in selector:
+        root = state["runtimes"][state["root_runtime_id"]]
+        reference = _visible_variables(state, root)[selector["bound_instance"]]
+        return {"spawned_instance": copy.deepcopy(reference)}
+    return _component_target(state, selector["component"])
+
+
+def _visible_variable_storage(runtime: dict[str, Any], name: str) -> Any:
+    for path in reversed(runtime["active"]):
+        scope = runtime["scopes"].get(path, {})
+        if name in scope:
+            return scope[name]
+    raise KeyError(name)
 
 
 def _target_runtime_id(target: dict[str, Any]) -> str:

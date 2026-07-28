@@ -12,7 +12,7 @@ from . import cel
 from .definition import Bundle, BundleSource, _escape_pointer, hash_identity, load_bundle
 from .errors import CelError, StepFault, ValidationError
 from .model import BundleModel, MachineModel, StateNode
-from .yaml12 import validate_portable_values, validate_unicode
+from .yaml12 import normalize_portable_values, validate_portable_values, validate_unicode
 
 Result = dict[str, Any]
 Delivery = dict[str, dict[str, Any]] | None
@@ -197,15 +197,15 @@ def _value_matches(value: Any, type_name: str) -> bool:
 
 def _normalize_value(value: Any, type_name: str) -> Any:
     try:
-        validate_portable_values(value)
+        normalized = normalize_portable_values(value)
     except ValidationError as exc:
         raise ValueError(type_name) from exc
-    if not _value_matches(value, type_name):
+    if not _value_matches(normalized, type_name):
         raise ValueError(type_name)
     if type_name == "float":
-        number = float(value)
+        number = float(normalized)
         return 0.0 if number == 0.0 else number
-    return copy.deepcopy(value)
+    return normalized
 
 
 def _is_instance_reference(value: Any) -> bool:
@@ -390,13 +390,26 @@ def dispatch(
     rejection = _validate_envelope(validated, models, prior_state, envelope, delivery_mode)
     if rejection is not None:
         return _rejected(prior_state, rejection)
-    state = copy.deepcopy(prior_state)
+    state = _copy_normalized_prior_state(prior_state)
     step_sequence = int(state["next_logical_step_sequence"])
     execution = _Execution(validated, models, state, step_sequence=step_sequence)
     runtime = execution.runtime_for_target(envelope["target"])
     normalized_envelope = copy.deepcopy(envelope)
     declaration = execution.event_declaration(runtime, envelope["event"])
-    if envelope["event"] == "env" or envelope["event"] in _reserved_events():
+    if envelope["event"] == "env":
+        runtime_root = _pointer_get(validated.raw, runtime["root_pointer"])
+        external = {
+            name: variable
+            for name, variable in (runtime_root.get("variables") or {}).items()
+            if variable.get("external") is True
+        }
+        normalized_envelope["payload"] = {
+            "changed": {
+                name: _normalize_value(value, str(external[name]["type"]))
+                for name, value in envelope["payload"]["changed"].items()
+            }
+        }
+    elif envelope["event"] in _reserved_events():
         normalized_envelope["payload"] = copy.deepcopy(envelope["payload"])
     else:
         assert declaration is not None
@@ -511,6 +524,21 @@ def _validate_prior_state_values(state: dict[str, Any]) -> None:
         validate_portable_values(value)
 
     visit(state, (), set())
+
+
+def _copy_normalized_prior_state(state: dict[str, Any]) -> dict[str, Any]:
+    def visit(value: Any, path: tuple[str | int, ...]) -> Any:
+        if _is_prior_counter_path(path):
+            return value
+        if isinstance(value, float):
+            return 0.0 if value == 0.0 else value
+        if isinstance(value, list):
+            return [visit(item, (*path, index)) for index, item in enumerate(value)]
+        if isinstance(value, dict):
+            return {key: visit(item, (*path, key)) for key, item in value.items()}
+        return value
+
+    return cast(dict[str, Any], visit(state, ()))
 
 
 def _validate_prior_state(state: dict[str, Any], bundle: Bundle) -> bool:
@@ -953,13 +981,11 @@ def _valid_spawned_relation(
     prefix = f"{state.pointer}/variables/"
     if not holder["pointer"].startswith(prefix):
         return False
-    encoded_name = holder["pointer"][len(prefix) :]
-    name = encoded_name.replace("~1", "/").replace("~0", "~")
     declarations = state.raw.get("variables") or {}
-    return bool(
-        name in declarations
-        and declarations[name].get("type") == "instance_reference"
-        and owner["scopes"][state_path].get(name) == runtime["instance_reference"]
+    return any(
+        holder["pointer"] == f"{prefix}{_escape_pointer(name)}"
+        and declaration.get("type") == "instance_reference"
+        for name, declaration in declarations.items()
     )
 
 
