@@ -1,63 +1,71 @@
 # AGENTS.md — determa-state-python
 
-Guidance for AI/coding agents working in this repository. (Tool-agnostic; not specific to any one assistant.)
+Guidance for coding agents working in this repository.
 
-## What this repo is
-The **Python reference implementation** of Determa State. Distribution name
-**`determa-state`**; import name **`determa.state`** (a PEP 420 namespace package — there is
-**no** `src/determa/__init__.py`, so it coexists with the `determa` launcher package). It is
-correct **iff** it passes the conformance suite.
+## Repository
+
+This is the Python implementation of Determa State. The distribution is
+`determa-state`; the import is `determa.state`. `src/determa` is a PEP 420 namespace
+package so it can coexist with the umbrella `determa` launcher.
+
+The implementation is conformant only when it passes the language-neutral suite.
+Format-1 work currently uses these immutable pre-release inputs:
+
+- specification: `4bd4d9588d11b75d376380b6120676a056a4bc45`;
+- conformance: `fc4842010ab8d83bf4c5c6280a5627ca86829f7f` (75 core cases).
+
+The package version is still `0.0.6`; the specification, conformance suite, Python
+engine, and Rust engine version together.
+
+## Boundaries
+
+The implemented public API is `load_bundle`, `create`, and `dispatch`, plus validation
+and error types exported by `determa.state`. It implements the exact `format: 1`
+grammar. Do not restore abandoned draft field names or compatibility aliases.
+
+The core is a pure foreground transform over one root ownership aggregate. It has no
+hidden queues, timers, stores, snapshots, migration, enabled-event inspection, or
+standardized execution CLI. Snapshot portability, machine definition migration or
+hot-swap, package imports, and living tutorials are separate initiatives.
 
 Layout:
-- `src/determa/state/` — the engine package (`__about__.py` is the single version source).
-- `tests/` — the implementation's own **unit tests** (hermetic, offline).
-- `conformance/` — a **black-box harness** that fetches `determa-state-conformance` at the
-  tag matching this package's version into `.cache/` (override with `DETERMA_CONFORMANCE_DIR`;
-  spec schema override `DETERMA_SPEC_DIR`).
-- `.github/workflows/` — `test.yml` (CI gate) and `release.yml` (tag → PyPI).
 
-## Determa in one paragraph
-**Determa** is a family for defining/running well-specified, verifiable behavior. **Determa
-State** is a language-agnostic **statechart engine** (Harel/UML lineage, PSiCC RTC): one
-YAML/JSON machine runs identically under any implementation, validated against a shared
-conformance suite. Guards/action values are **CEL** (via the `cel-python`/`celpy` package,
-lazily imported so the CLI starts fast). An umbrella `determa` launcher dispatches
-`determa <product> …` → `determa-<product>` on PATH; this package also installs a
-`determa-state-python` alias for explicit implementation selection.
+- `src/determa/state/` — loader, validator, CEL profile, model, and engine;
+- `src/determa/state/data/machine.schema.json` — exact pinned normative schema;
+- `tests/` — hermetic implementation tests;
+- `conformance/` — black-box format-1 harness and immutable pins;
+- `.github/workflows/test.yml` — unit and pinned conformance gates;
+- `.github/workflows/release.yml` — tag-triggered PyPI publication.
 
-## Repositories (org `fruwehq`, local folders `~/src/personal/`)
-| Repo | Role |
-|---|---|
-| determa-state-spec | normative prose spec + schema. No CI. |
-| determa-state-conformance | the conformance suite (arbiter). No CI. |
-| **determa-state-python** (this) | Python impl — `determa-state` / `determa.state`. |
-| determa-state-rust | Rust impl — crate `determa-state`. |
-| determa | umbrella launcher (`python/`, `rust/`, `node/`). |
+## Working Rules
 
-## Working rules (every Determa repo)
-- **One issue → one PR**, branch → PR → **squash-merge**, linear history, resolve threads; `main` is protected (**and requires branches be up-to-date** — after a merge moves `main`, update other open PRs, which re-runs CI, before merging).
-- **No AI/assistant attribution** anywhere (commits, PRs, comments, docs).
-- **Conformance-first:** spec text → conformance case → this impl. Don't diverge from the pinned suite.
-- **Synchronized SemVer** with spec + rust (currently **0.0.6**); bump `src/determa/state/__about__.py`.
-- **No abbreviations** in JSON output / public identifiers (`definition` not `def`). Kept for now: `config`, machine-keywords (`esvs`, …), snapshot `def_id`/`def_version`, `spawn.def`.
+- One issue to one PR, squash merge, linear history, and resolved review threads.
+- Never put assistant attribution in commits, PRs, comments, or documentation.
+- Behavioral work is specification, then conformance, then implementations. The
+  conformance suite is the arbiter.
+- Do not change the package version, tag, publish, or merge unless explicitly
+  authorized as release work.
+- Keep JSON/public identifiers unabbreviated and use only exact normative grammar.
+- Unit tests remain hermetic and offline. Conformance may use its immutable checkouts.
+- Preserve lazy CEL and JSON Schema imports where practical.
 
-## Gates (run before requesting review — this is the CI gate)
+## Gates
+
 ```sh
-pip install -e '.[dev]'
+python -m pip install -e '.[dev]'
 ruff check .
 mypy src/determa
-pytest -q                 # unit tests (hermetic, offline) — CI job "test (ubuntu-24.04)"
-pytest conformance        # conformance suite (network, or DETERMA_CONFORMANCE_DIR) — CI job "conformance"
-# convenience: `make check` (gate) and `make conformance`
+pytest -q
+DETERMA_CONFORMANCE_DIR=/path/to/conformance \
+DETERMA_SPEC_DIR=/path/to/spec \
+pytest conformance -q
 ```
-Keep CEL/`jsonschema` imports lazy (they dominate startup); unit tests must not touch the network.
 
-## Releasing
-Tag `vX.Y.Z` → `release.yml` builds sdist+wheel and publishes to **PyPI via Trusted
-Publishing (OIDC)** — **gated on the `pypi` GitHub Environment (manual approval)**. The
-PyPI project name is `determa-state`. **A tag publishes**, so only tag when you intend to
-release. After a spec release, the conformance fetch auto-targets the new `v{version}` tag.
+`make check` runs lint, type checking, and unit tests. `make conformance` fetches or
+reuses the immutable inputs recorded in `conformance/pins.py`.
 
-## Pointers
-- Library API (SPEC §2): `Host`, `Instance`, `load_definitions` (accepts YAML **or** a dict/mapping), `validate`, etc. — see `README.md` and `tests/test_library_api.py`.
-- CLI (SPEC §13/§14): `src/determa/state/cli.py`. Spec: `determa-state-spec/SPEC.md`.
+## Release
+
+A `vX.Y.Z` tag triggers `release.yml`, builds the distribution, and publishes to PyPI
+using Trusted Publishing through the manually approved `pypi` environment. A tag
+publishes, so do not create one during ordinary implementation work.

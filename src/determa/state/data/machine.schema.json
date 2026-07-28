@@ -1,217 +1,1149 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://determa.dev/state/schema/machine.schema.json",
-  "title": "Determa State machine definition",
-  "description": "Strict structural schema for a Determa State statechart definition (SPEC.md §4). Validates one YAML/JSON document. Semantics (RTC, scoping, defer, timers, bus) live in SPEC.md and the conformance suite.",
-  "type": "object",
-  "required": ["id", "top"],
-  "additionalProperties": false,
-  "properties": {
-    "format": { "type": "integer", "minimum": 1, "default": 1, "description": "Grammar version. Optional; defaults to 1." },
-    "id": { "$ref": "#/$defs/identifier", "description": "Stable definition id." },
-    "version": { "type": "integer", "minimum": 1, "default": 1, "description": "This definition's version; drives migration (SPEC §10)." },
-    "contracts": { "type": "array", "items": { "$ref": "#/$defs/identifier" } },
-    "subscribe": { "type": "array", "items": { "$ref": "#/$defs/identifier" }, "description": "External event types delivered to this machine by subscription (SPEC §5.7)." },
+  "title": "Determa State format 1 bundle",
+  "description": "Strict structural schema for the pre-release format 1 bundle grammar defined by SPEC.md.",
+  "$ref": "#/$defs/bundle",
+  "$defs": {
+    "identifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*$"
+    },
+    "celVisibleIdentifier": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/identifier"
+        },
+        {
+          "not": {
+            "enum": [
+              "event",
+              "owner",
+              "false",
+              "in",
+              "null",
+              "true",
+              "as",
+              "break",
+              "const",
+              "continue",
+              "else",
+              "for",
+              "function",
+              "if",
+              "import",
+              "let",
+              "loop",
+              "package",
+              "namespace",
+              "return",
+              "var",
+              "void",
+              "while"
+            ]
+          }
+        }
+      ]
+    },
+    "stateIdentifier": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/identifier"
+        },
+        {
+          "not": {
+            "const": "root"
+          }
+        }
+      ]
+    },
+    "dottedIdentifier": {
+      "type": "string",
+      "pattern": "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$"
+    },
+    "eventHandlerName": {
+      "type": "string",
+      "pattern": "^(?:[A-Za-z_][A-Za-z0-9_]*|determa\\.(?:component_completed|component_failed|spawned_instance_failed))$"
+    },
+    "authorEventName": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/identifier"
+        },
+        {
+          "not": {
+            "enum": ["env", "done"]
+          }
+        }
+      ]
+    },
+    "expression": {
+      "type": "string",
+      "description": "A CEL expression."
+    },
+    "valueType": {
+      "enum": ["string", "int", "float", "bool", "map", "list"]
+    },
     "languages": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "guard": { "type": "string", "default": "cel" },
-        "action": { "type": "string", "default": "determa" }
+        "guard": {
+          "const": "cel",
+          "default": "cel"
+        },
+        "action": {
+          "const": "determa",
+          "default": "determa"
+        }
       }
     },
-    "events": {
-      "type": "object",
-      "additionalProperties": { "$ref": "#/$defs/eventDecl" }
-    },
-    "meta": { "type": "object" },
-    "migrations": { "type": "array", "items": { "$ref": "#/$defs/migration" } },
-    "top": { "$ref": "#/$defs/state", "description": "The outermost state (PSiCC \"top\"); all behavior lives under it." }
-  },
-  "$defs": {
-    "identifier": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*$" },
-    "dottedRef": { "type": "string", "pattern": "^[A-Za-z_][A-Za-z0-9_]*(\\.[A-Za-z_][A-Za-z0-9_]*)*$" },
-    "cel": { "type": "string", "description": "A CEL expression (string)." },
-    "valueType": { "enum": ["string", "int", "float", "bool", "map", "list"] },
-    "duration": { "type": "string", "pattern": "^[0-9]+(ms|s|m|h)$" },
-
-    "esv": {
+    "payloadField": {
       "type": "object",
       "required": ["type"],
       "additionalProperties": false,
-      "description": "An extended-state variable, initialized on entry to its declaring state (SPEC §4.4).",
       "properties": {
-        "type": { "$ref": "#/$defs/valueType" },
-        "init": { "description": "Initial literal value (must match type). Omit for unset/null." },
-        "external": { "type": "boolean", "default": false, "description": "Seeded from the host at entry; read-only to assign; retained until refreshed (SPEC §5.4)." }
+        "type": {
+          "$ref": "#/$defs/valueType"
+        },
+        "required": {
+          "type": "boolean",
+          "default": false
+        },
+        "default": {}
+      },
+      "allOf": [
+        {
+          "not": {
+            "properties": {
+              "required": {
+                "const": true
+              }
+            },
+            "required": ["required", "default"]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "string"
+              }
+            },
+            "required": ["type", "default"]
+          },
+          "then": {
+            "properties": {
+              "default": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "int"
+              }
+            },
+            "required": ["type", "default"]
+          },
+          "then": {
+            "properties": {
+              "default": {
+                "type": "integer",
+                "minimum": -9223372036854775808,
+                "maximum": 9223372036854775807
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "float"
+              }
+            },
+            "required": ["type", "default"]
+          },
+          "then": {
+            "properties": {
+              "default": {
+                "type": "number",
+                "minimum": -1.7976931348623157e308,
+                "maximum": 1.7976931348623157e308
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "bool"
+              }
+            },
+            "required": ["type", "default"]
+          },
+          "then": {
+            "properties": {
+              "default": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "map"
+              }
+            },
+            "required": ["type", "default"]
+          },
+          "then": {
+            "properties": {
+              "default": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "list"
+              }
+            },
+            "required": ["type", "default"]
+          },
+          "then": {
+            "properties": {
+              "default": {
+                "type": "array"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "payloadDeclaration": {
+      "type": "object",
+      "propertyNames": {
+        "$ref": "#/$defs/celVisibleIdentifier"
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/payloadField"
       }
     },
-
-    "eventDecl": {
+    "publicEventDeclaration": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "scope": { "enum": ["internal", "local", "global"], "default": "internal" },
+        "direction": {
+          "enum": ["internal", "input", "output"],
+          "default": "internal"
+        },
+        "payload": {
+          "$ref": "#/$defs/payloadDeclaration"
+        },
+        "correlates_to": {
+          "$ref": "#/$defs/identifier"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["correlates_to"]
+          },
+          "then": {
+            "required": ["direction"],
+            "properties": {
+              "direction": {
+                "const": "input"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "privateEventDeclaration": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "direction": {
+          "const": "internal",
+          "default": "internal"
+        },
+        "payload": {
+          "$ref": "#/$defs/payloadDeclaration"
+        }
+      }
+    },
+    "variable": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "properties": {
+        "type": {
+          "enum": ["string", "int", "float", "bool", "map", "list", "instance_reference"]
+        },
+        "init": {},
+        "input": {
+          "type": "boolean",
+          "default": false
+        },
+        "external": {
+          "type": "boolean",
+          "default": false
+        },
+        "nullable": {
+          "type": "boolean"
+        },
+        "machine_id": {
+          "$ref": "#/$defs/identifier"
+        }
+      },
+      "allOf": [
+        {
+          "not": {
+            "properties": {
+              "input": {
+                "const": true
+              },
+              "external": {
+                "const": true
+              }
+            },
+            "required": ["input", "external"]
+          }
+        },
+        {
+          "if": {
+            "not": {
+              "anyOf": [
+                {
+                  "properties": {
+                    "input": {
+                      "const": true
+                    }
+                  },
+                  "required": ["input"]
+                },
+                {
+                  "properties": {
+                    "external": {
+                      "const": true
+                    }
+                  },
+                  "required": ["external"]
+                }
+              ]
+            }
+          },
+          "then": {
+            "required": ["init"]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "instance_reference"
+              }
+            },
+            "required": ["type"]
+          },
+          "then": {
+            "required": ["init", "nullable"],
+            "properties": {
+              "init": {
+                "type": "null"
+              },
+              "input": {
+                "const": false
+              },
+              "external": {
+                "const": false
+              },
+              "nullable": {
+                "const": true
+              }
+            }
+          },
+          "else": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": ["nullable"]
+                },
+                {
+                  "required": ["machine_id"]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "string"
+              }
+            },
+            "required": ["type", "init"]
+          },
+          "then": {
+            "properties": {
+              "init": {
+                "type": "string"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "int"
+              }
+            },
+            "required": ["type", "init"]
+          },
+          "then": {
+            "properties": {
+              "init": {
+                "type": "integer",
+                "minimum": -9223372036854775808,
+                "maximum": 9223372036854775807
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "float"
+              }
+            },
+            "required": ["type", "init"]
+          },
+          "then": {
+            "properties": {
+              "init": {
+                "type": "number",
+                "minimum": -1.7976931348623157e308,
+                "maximum": 1.7976931348623157e308
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "bool"
+              }
+            },
+            "required": ["type", "init"]
+          },
+          "then": {
+            "properties": {
+              "init": {
+                "type": "boolean"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "map"
+              }
+            },
+            "required": ["type", "init"]
+          },
+          "then": {
+            "properties": {
+              "init": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "list"
+              }
+            },
+            "required": ["type", "init"]
+          },
+          "then": {
+            "properties": {
+              "init": {
+                "type": "array"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "target": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["self"],
+          "additionalProperties": false,
+          "properties": {
+            "self": {
+              "const": true
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["owner"],
+          "additionalProperties": false,
+          "properties": {
+            "owner": {
+              "const": true
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["component"],
+          "additionalProperties": false,
+          "properties": {
+            "component": {
+              "$ref": "#/$defs/identifier"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["instance"],
+          "additionalProperties": false,
+          "properties": {
+            "instance": {
+              "$ref": "#/$defs/expression"
+            }
+          }
+        },
+        {
+          "type": "object",
+          "required": ["external"],
+          "additionalProperties": false,
+          "properties": {
+            "external": {
+              "const": true
+            }
+          }
+        }
+      ]
+    },
+    "send": {
+      "type": "object",
+      "required": ["event"],
+      "additionalProperties": false,
+      "properties": {
+        "event": {
+          "$ref": "#/$defs/identifier"
+        },
+        "to": {
+          "$ref": "#/$defs/target"
+        },
+        "targets": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/target"
+          }
+        },
         "payload": {
           "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/celVisibleIdentifier"
+          },
           "additionalProperties": {
-            "type": "object",
-            "required": ["type"],
-            "additionalProperties": false,
-            "properties": {
-              "type": { "$ref": "#/$defs/valueType" },
-              "required": { "type": "boolean", "default": false },
-              "default": {}
-            }
+            "$ref": "#/$defs/expression"
+          }
+        },
+        "correlation_id": {
+          "$ref": "#/$defs/expression"
+        }
+      },
+      "not": {
+        "required": ["to", "targets"]
+      }
+    },
+    "bindingExpressions": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "input": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/celVisibleIdentifier"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/expression"
+          }
+        },
+        "external": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/celVisibleIdentifier"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/expression"
           }
         }
       }
     },
-
+    "spawn": {
+      "type": "object",
+      "required": ["machine_id"],
+      "additionalProperties": false,
+      "properties": {
+        "machine_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "bindings": {
+          "$ref": "#/$defs/bindingExpressions"
+        },
+        "bind_to": {
+          "$ref": "#/$defs/celVisibleIdentifier"
+        }
+      }
+    },
+    "cancel": {
+      "type": "object",
+      "required": ["instance"],
+      "additionalProperties": false,
+      "properties": {
+        "instance": {
+          "$ref": "#/$defs/expression"
+        }
+      }
+    },
     "action": {
       "type": "object",
       "minProperties": 1,
       "maxProperties": 1,
       "additionalProperties": false,
       "properties": {
-        "assign": { "type": "object", "minProperties": 1, "additionalProperties": { "$ref": "#/$defs/cel" } },
-        "publish": {
+        "assign": {
           "type": "object",
-          "required": ["event"],
-          "additionalProperties": false,
-          "properties": {
-            "event": { "$ref": "#/$defs/identifier" },
-            "to": { "$ref": "#/$defs/cel" },
-            "payload": { "type": "object", "additionalProperties": { "$ref": "#/$defs/cel" } }
+          "minProperties": 1,
+          "maxProperties": 1,
+          "propertyNames": {
+            "$ref": "#/$defs/celVisibleIdentifier"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/expression"
           }
+        },
+        "send": {
+          "$ref": "#/$defs/send"
         },
         "refresh": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "only": { "type": "array", "items": { "$ref": "#/$defs/identifier" } }
+            "only": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "$ref": "#/$defs/celVisibleIdentifier"
+              }
+            }
           }
         },
         "spawn": {
-          "type": "object",
-          "required": ["def"],
-          "additionalProperties": false,
-          "properties": {
-            "def": { "$ref": "#/$defs/identifier" },
-            "payload": { "type": "object", "additionalProperties": { "$ref": "#/$defs/cel" } },
-            "result": { "$ref": "#/$defs/identifier" }
-          }
+          "$ref": "#/$defs/spawn"
         },
-        "stop": { "type": "object", "maxProperties": 0 }
+        "cancel": {
+          "$ref": "#/$defs/cancel"
+        },
+        "stop": {
+          "type": "object",
+          "maxProperties": 0
+        }
       }
     },
-    "actionList": { "type": "array", "items": { "$ref": "#/$defs/action" } },
-
+    "actionList": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/action"
+      }
+    },
+    "exitAction": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/action"
+        },
+        {
+          "not": {
+            "anyOf": [
+              {
+                "required": ["spawn"]
+              },
+              {
+                "required": ["stop"]
+              }
+            ]
+          }
+        }
+      ]
+    },
+    "exitActionList": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/exitAction"
+      }
+    },
+    "historyTarget": {
+      "type": "object",
+      "required": ["history"],
+      "additionalProperties": false,
+      "properties": {
+        "history": {
+          "$ref": "#/$defs/dottedIdentifier"
+        }
+      }
+    },
+    "transitionTarget": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/dottedIdentifier"
+        },
+        {
+          "$ref": "#/$defs/historyTarget"
+        }
+      ]
+    },
     "transition": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "transition_to": { "$ref": "#/$defs/dottedRef" },
-        "guard": { "$ref": "#/$defs/cel" },
-        "lang": { "type": "string" },
-        "action": { "$ref": "#/$defs/actionList" },
-        "internal": { "type": "boolean" },
-        "local": { "type": "boolean" }
-      }
+        "transition_to": {
+          "$ref": "#/$defs/transitionTarget"
+        },
+        "guard": {
+          "$ref": "#/$defs/expression"
+        },
+        "lang": {
+          "const": "cel"
+        },
+        "action": {
+          "$ref": "#/$defs/actionList"
+        },
+        "local": {
+          "const": true
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "required": ["local"]
+          },
+          "then": {
+            "required": ["transition_to"]
+          }
+        }
+      ]
     },
     "transitionOrList": {
       "oneOf": [
-        { "$ref": "#/$defs/transition" },
-        { "type": "array", "items": { "$ref": "#/$defs/transition" }, "minItems": 1 }
+        {
+          "$ref": "#/$defs/transition"
+        },
+        {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/transition"
+          }
+        }
       ]
     },
-
     "initialTransition": {
       "type": "object",
       "required": ["transition_to"],
       "additionalProperties": false,
       "properties": {
-        "transition_to": { "$ref": "#/$defs/dottedRef" },
-        "guard": { "$ref": "#/$defs/cel" },
-        "action": { "$ref": "#/$defs/actionList" }
+        "transition_to": {
+          "$ref": "#/$defs/dottedIdentifier"
+        },
+        "action": {
+          "$ref": "#/$defs/actionList"
+        }
       }
     },
-
     "choiceBranch": {
       "type": "object",
       "required": ["transition_to"],
       "additionalProperties": false,
       "properties": {
-        "transition_to": { "$ref": "#/$defs/dottedRef" },
-        "guard": { "$ref": "#/$defs/cel" },
-        "action": { "$ref": "#/$defs/actionList" }
+        "transition_to": {
+          "$ref": "#/$defs/transitionTarget"
+        },
+        "guard": {
+          "$ref": "#/$defs/expression"
+        },
+        "action": {
+          "$ref": "#/$defs/actionList"
+        }
       }
     },
-
-    "after": {
+    "activeState": {
+      "allOf": [
+        {
+          "$ref": "#/$defs/state"
+        },
+        {
+          "not": {
+            "required": ["choice"]
+          }
+        }
+      ]
+    },
+    "component": {
       "type": "object",
-      "required": ["duration"],
+      "required": ["component_id"],
       "additionalProperties": false,
       "properties": {
-        "duration": { "$ref": "#/$defs/duration" },
-        "transition_to": { "$ref": "#/$defs/dottedRef" },
-        "guard": { "$ref": "#/$defs/cel" },
-        "action": { "$ref": "#/$defs/actionList" }
-      }
+        "component_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "machine_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "root": {
+          "$ref": "#/$defs/activeState"
+        },
+        "with": {
+          "$ref": "#/$defs/bindingExpressions"
+        },
+        "meta": {
+          "type": "object"
+        }
+      },
+      "oneOf": [
+        {
+          "required": ["machine_id"],
+          "not": {
+            "required": ["root"]
+          }
+        },
+        {
+          "required": ["root"],
+          "not": {
+            "required": ["machine_id"]
+          }
+        }
+      ]
     },
-
-    "region": {
-      "type": "object",
-      "required": ["initial", "states"],
-      "additionalProperties": false,
-      "properties": {
-        "initial": { "$ref": "#/$defs/initialTransition" },
-        "states": { "type": "object", "minProperties": 1, "additionalProperties": { "$ref": "#/$defs/state" } }
-      }
-    },
-
     "state": {
       "type": "object",
       "additionalProperties": false,
       "properties": {
-        "type": { "enum": ["simple", "composite", "orthogonal", "final"], "default": "simple" },
-        "meta": { "type": "object" },
-        "esvs": { "type": "object", "additionalProperties": { "$ref": "#/$defs/esv" } },
-        "entry": { "$ref": "#/$defs/actionList" },
-        "exit": { "$ref": "#/$defs/actionList" },
-        "initial": { "$ref": "#/$defs/initialTransition" },
-        "states": { "type": "object", "additionalProperties": { "$ref": "#/$defs/state" } },
-        "regions": { "type": "array", "minItems": 2, "items": { "$ref": "#/$defs/region" } },
-        "on_events": { "type": "object", "additionalProperties": { "$ref": "#/$defs/transitionOrList" } },
-        "after": { "type": "array", "items": { "$ref": "#/$defs/after" } },
-        "defer": { "type": "array", "items": { "$ref": "#/$defs/identifier" } },
-        "history": { "enum": ["none", "shallow", "deep"], "default": "none" },
-        "choice": { "type": "array", "minItems": 2, "items": { "$ref": "#/$defs/choiceBranch" } },
-        "submachine": { "$ref": "#/$defs/identifier" },
-        "with": { "type": "object", "additionalProperties": { "$ref": "#/$defs/cel" } }
+        "type": {
+          "enum": ["simple", "composite", "parallel", "final"],
+          "default": "simple"
+        },
+        "meta": {
+          "type": "object"
+        },
+        "variables": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/celVisibleIdentifier"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/variable"
+          }
+        },
+        "entry": {
+          "$ref": "#/$defs/actionList"
+        },
+        "exit": {
+          "$ref": "#/$defs/exitActionList"
+        },
+        "initial": {
+          "$ref": "#/$defs/initialTransition"
+        },
+        "states": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": {
+            "$ref": "#/$defs/stateIdentifier"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/state"
+          }
+        },
+        "components": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "$ref": "#/$defs/component"
+          }
+        },
+        "on_events": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/eventHandlerName"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/transitionOrList"
+          }
+        },
+        "history": {
+          "enum": ["none", "shallow", "deep"],
+          "default": "none"
+        },
+        "choice": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "$ref": "#/$defs/choiceBranch"
+          }
+        }
       },
       "allOf": [
         {
-          "if": { "properties": { "type": { "const": "composite" } }, "required": ["type"] },
-          "then": { "required": ["initial", "states"] }
+          "if": {
+            "properties": {
+              "type": {
+                "const": "simple"
+              }
+            }
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": ["initial"]
+                },
+                {
+                  "required": ["states"]
+                },
+                {
+                  "required": ["components"]
+                },
+                {
+                  "required": ["history"]
+                }
+              ]
+            }
+          }
         },
         {
-          "if": { "properties": { "type": { "const": "orthogonal" } }, "required": ["type"] },
-          "then": { "required": ["regions"] }
+          "if": {
+            "properties": {
+              "type": {
+                "const": "composite"
+              }
+            },
+            "required": ["type"]
+          },
+          "then": {
+            "required": ["initial", "states"],
+            "not": {
+              "required": ["components"]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "parallel"
+              }
+            },
+            "required": ["type"]
+          },
+          "then": {
+            "required": ["components"],
+            "not": {
+              "anyOf": [
+                {
+                  "required": ["initial"]
+                },
+                {
+                  "required": ["states"]
+                },
+                {
+                  "required": ["history"]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "type": {
+                "const": "final"
+              }
+            },
+            "required": ["type"]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": ["exit"]
+                },
+                {
+                  "required": ["initial"]
+                },
+                {
+                  "required": ["states"]
+                },
+                {
+                  "required": ["components"]
+                },
+                {
+                  "required": ["on_events"]
+                },
+                {
+                  "required": ["history"]
+                },
+                {
+                  "required": ["choice"]
+                }
+              ]
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["history"]
+          },
+          "then": {
+            "required": ["type"],
+            "properties": {
+              "type": {
+                "const": "composite"
+              }
+            }
+          }
+        },
+        {
+          "if": {
+            "required": ["choice"]
+          },
+          "then": {
+            "not": {
+              "anyOf": [
+                {
+                  "required": ["variables"]
+                },
+                {
+                  "required": ["entry"]
+                },
+                {
+                  "required": ["exit"]
+                },
+                {
+                  "required": ["initial"]
+                },
+                {
+                  "required": ["states"]
+                },
+                {
+                  "required": ["components"]
+                },
+                {
+                  "required": ["on_events"]
+                },
+                {
+                  "required": ["history"]
+                },
+                {
+                  "required": ["type"]
+                }
+              ]
+            }
+          }
         }
       ]
     },
-
-    "migration": {
+    "machine": {
       "type": "object",
-      "required": ["from", "to"],
+      "required": ["machine_id", "root"],
       "additionalProperties": false,
       "properties": {
-        "from": { "type": "integer", "minimum": 1 },
-        "to": { "type": "integer", "minimum": 1 },
-        "when": { "$ref": "#/$defs/cel" },
-        "state_map": { "type": "object", "additionalProperties": { "$ref": "#/$defs/dottedRef" } },
-        "esvs": { "$ref": "#/$defs/actionList" }
+        "machine_id": {
+          "$ref": "#/$defs/identifier"
+        },
+        "version": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 9223372036854775807,
+          "default": 1
+        },
+        "languages": {
+          "$ref": "#/$defs/languages"
+        },
+        "events": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/authorEventName"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/privateEventDeclaration"
+          }
+        },
+        "root": {
+          "$ref": "#/$defs/activeState"
+        },
+        "meta": {
+          "type": "object"
+        }
+      }
+    },
+    "bundle": {
+      "type": "object",
+      "required": ["format", "namespace", "machines"],
+      "additionalProperties": false,
+      "properties": {
+        "format": {
+          "const": 1
+        },
+        "namespace": {
+          "$ref": "#/$defs/dottedIdentifier"
+        },
+        "events": {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/authorEventName"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/publicEventDeclaration"
+          }
+        },
+        "machines": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "$ref": "#/$defs/machine"
+          }
+        },
+        "meta": {
+          "type": "object"
+        }
       }
     }
   }

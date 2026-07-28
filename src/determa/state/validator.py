@@ -1,23 +1,4 @@
-"""Machine-definition validation (SPEC §2).
-
-Two layers:
-
-1. **Structural** — the document MUST validate against the normative
-   ``schema/machine.schema.json`` (bundled as package data).
-2. **Reserved names** (SPEC §2/§3):
-   - The structural / CEL-intrinsic names ``top``, ``id``, ``parent``, ``event``
-     are forbidden as state and esv identifiers (they collide with the root
-     state or the guard/action intrinsics).
-   - The reserved event names ``initial``, ``entry``, ``exit``, ``env``,
-     ``error``, ``done`` are forbidden only as *declared* event types (they are
-     implicitly provided by the engine). They MAY be used as ``on_events``
-     handlers, and (occupying a different namespace) as state/esv names — e.g.
-     a state named ``done`` is allowed.
-
-
-Errors are returned as ``{path, message}`` records (the §13.4 ``validate``
-JSON shape). Later build steps add reference-resolution and contract checks.
-"""
+"""Structural and semantic validation for Determa State format 1."""
 
 from __future__ import annotations
 
@@ -26,240 +7,802 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any, cast
 
-from .errors import ErrorRecord, ValidationError
-
-RESERVED_NAMES = frozenset({"top", "id", "parent", "event"})
-RESERVED_EVENTS = frozenset({"initial", "entry", "exit", "env", "error", "done"})
-ALL_RESERVED = RESERVED_NAMES | RESERVED_EVENTS
+from . import cel
+from .definition import Bundle, _escape_pointer, normalize_bundle
+from .errors import CelError, ErrorRecord, ValidationError
+from .model import BundleModel, MachineModel, StateNode
 
 _SCHEMA_PATH = Path(__file__).parent / "data" / "machine.schema.json"
+_RESERVED_EVENTS = frozenset(
+    {
+        "env",
+        "done",
+        "determa.component_completed",
+        "determa.component_failed",
+        "determa.spawned_instance_failed",
+    }
+)
 
 
 @lru_cache(maxsize=1)
 def schema() -> dict[str, Any]:
-    """The bundled normative machine JSON Schema (SPEC §4)."""
-    with _SCHEMA_PATH.open(encoding="utf-8") as fh:
-        return cast(dict[str, Any], json.load(fh))
+    with _SCHEMA_PATH.open(encoding="utf-8") as source:
+        return cast(dict[str, Any], json.load(source))
 
 
-def _json_path(parts: list[Any]) -> str:
-    if not parts:
-        return "(root)"
-    return "/" + "/".join(str(p) for p in parts)
+def validate(document: dict[str, Any]) -> None:
+    """Validate one parsed bundle or raise the first exact load-layer code."""
+    _validate_schema(document)
+    normalized = normalize_bundle(document)
+    provisional = Bundle(raw=normalized, fingerprint="")
+    model = BundleModel(provisional)
+    _validate_semantics(provisional, model)
 
 
-def validate(doc: dict[str, Any]) -> None:
-    """Validate a machine document; raise :class:`ValidationError` on failure."""
-    errors = collect_errors(doc)
-    if errors:
-        raise ValidationError(errors)
+def collect_errors(document: dict[str, Any]) -> list[ErrorRecord]:
+    try:
+        validate(document)
+    except ValidationError as exc:
+        return exc.errors
+    return []
 
 
-def collect_errors(doc: dict[str, Any]) -> list[ErrorRecord]:
-    """Return all validation errors (structural + reserved names + static analysis)."""
-    errors: list[ErrorRecord] = list(_structural_errors(doc))
-    errors.extend(_reserved_name_errors(doc))
-    if isinstance(doc, dict) and isinstance(doc.get("top"), dict):
-        errors.extend(_reachability_errors(doc["top"]))
-    return errors
-
-
-def _structural_errors(doc: dict[str, Any]) -> list[ErrorRecord]:
-    import jsonschema  # deferred: ~40ms to import, only needed when validating a machine
+def _validate_schema(document: dict[str, Any]) -> None:
+    import jsonschema
 
     validator = jsonschema.Draft202012Validator(schema())
-    out: list[ErrorRecord] = []
-    for err in sorted(validator.iter_errors(doc), key=lambda e: list(e.absolute_path)):
-        out.append(
-            ErrorRecord(path=_json_path(list(err.absolute_path)), message=err.message)
-        )
-    return out
+    errors = sorted(validator.iter_errors(document), key=lambda error: list(error.absolute_path))
+    if errors:
+        error = errors[0]
+        path = "/" + "/".join(str(part) for part in error.absolute_path)
+        raise ValidationError("structural_validation", path=path, message=error.message)
 
 
-def _reserved_name_errors(doc: dict[str, Any]) -> list[ErrorRecord]:
-    if not isinstance(doc, dict):
-        return []
-    errors: list[ErrorRecord] = []
-    top = doc.get("top")
-    if isinstance(top, dict):
-        _walk_state("/top", top, errors)
-    events = doc.get("events")
-    if isinstance(events, dict):
-        for name in events:
-            if name in ALL_RESERVED:
-                errors.append(
-                    ErrorRecord(
-                        path=f"/events/{name}",
-                        message=f"'{name}' is a reserved event name",
-                    )
-                )
-    return errors
+def _literal_matches(value: Any, expected: str) -> bool:
+    if expected == "string":
+        return isinstance(value, str)
+    if expected == "bool":
+        return isinstance(value, bool)
+    if expected == "int":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if expected == "float":
+        return isinstance(value, int | float) and not isinstance(value, bool)
+    if expected == "list":
+        return isinstance(value, list)
+    if expected == "map":
+        return isinstance(value, dict)
+    if expected == "instance_reference":
+        return value is None
+    return False
 
 
-def _check_choice(path: str, branches: list[Any], errors: list[ErrorRecord]) -> None:
-    """A choice MUST have exactly one default (unguarded) branch, and it MUST be last
-    (SPEC §5.5.1)."""
-    defaults = [i for i, br in enumerate(branches) if isinstance(br, dict) and "guard" not in br]
-    if not defaults:
-        errors.append(
-            ErrorRecord(path=f"{path}/choice", message="choice has no default (else) branch")
-        )
-    elif len(defaults) > 1:
-        errors.append(
-            ErrorRecord(path=f"{path}/choice", message="choice has more than one default branch")
-        )
-    elif defaults[0] != len(branches) - 1:
-        errors.append(
-            ErrorRecord(path=f"{path}/choice", message="the default (else) branch must be last")
-        )
+def _event_declarations(bundle: Bundle, machine: MachineModel) -> dict[str, dict[str, Any]]:
+    declarations = dict(bundle.raw.get("events") or {})
+    declarations.update(machine.raw.get("events") or {})
+    return declarations
 
 
-def _check_transition_list(path: str, branches: list[Any], errors: list[ErrorRecord]) -> None:
-    """In a guarded transition list, an unguarded branch shadows all later ones, so it
-    MUST be last — otherwise the later branches are dead (SPEC §2)."""
-    for br in branches[:-1]:
-        if isinstance(br, dict) and "guard" not in br:
-            errors.append(
-                ErrorRecord(
-                    path=path,
-                    message="an unguarded transition must be last; later branches are dead",
-                )
+def _built_in_event_fields(event_name: str) -> dict[str, cel.StaticType]:
+    if event_name == "env":
+        return {"changed": cel.MAP}
+    if event_name == "determa.component_completed":
+        return {"component_id": cel.STRING, "component_runtime_id": cel.STRING}
+    if event_name == "determa.component_failed":
+        return {
+            "component_id": cel.STRING,
+            "component_runtime_id": cel.STRING,
+            "fault": cel.MAP,
+        }
+    if event_name == "determa.spawned_instance_failed":
+        return {
+            "instance": cel.StaticType("instance_reference", nullable=False),
+            "instance_id": cel.STRING,
+            "machine_id": cel.STRING,
+            "machine_version": cel.INT,
+            "fault": cel.MAP,
+        }
+    if event_name == "done":
+        return {
+            "relationship": cel.STRING,
+            "state_path": cel.STRING,
+            "owner_runtime_id": cel.STRING,
+            "instance": cel.StaticType("instance_reference", nullable=True),
+            "instance_id": cel.STRING,
+            "machine_id": cel.STRING,
+            "machine_version": cel.INT,
+        }
+    return {}
+
+
+def _payload_types(
+    declaration: dict[str, Any] | None, event_name: str
+) -> dict[str, cel.StaticType]:
+    if declaration is None:
+        return _built_in_event_fields(event_name)
+    return {
+        name: cel.type_from_declaration(field)
+        for name, field in (declaration.get("payload") or {}).items()
+    }
+
+
+def _scope(
+    machine: MachineModel, state: StateNode
+) -> tuple[
+    dict[str, cel.StaticType],
+    dict[str, tuple[StateNode, dict[str, Any], str]],
+]:
+    chain = list(reversed(state.ancestors(include_self=True)))
+    assigned_names = _assigned_variable_names(machine)
+    types: dict[str, cel.StaticType] = {}
+    declarations: dict[str, tuple[StateNode, dict[str, Any], str]] = {}
+    for node in chain:
+        for name, declaration in (node.raw.get("variables") or {}).items():
+            types[name] = cel.type_from_declaration(
+                declaration,
+                refine_container=(
+                    name not in assigned_names
+                    and not declaration.get("input")
+                    and not declaration.get("external")
+                ),
             )
-            return
-
-
-def _reachability_errors(top: dict[str, Any]) -> list[ErrorRecord]:
-    """Flag declared states unreachable from ``top`` (SPEC §2). Conservative and
-    guard-agnostic: reachability follows every ``initial``/region-initial/``on_events``/
-    ``after``/``choice`` target regardless of guards, and entering a state implies its
-    ancestors (whose own edges are then also followed)."""
-    raws: dict[str, dict[str, Any]] = {}
-    parent: dict[str, str | None] = {}
-    children: dict[str, dict[str, str]] = {}
-
-    def _build(path: str, node: dict[str, Any], par: str | None) -> None:
-        raws[path] = node
-        parent[path] = par
-        children[path] = {}
-        for cn, cd in (node.get("states") or {}).items():
-            if isinstance(cd, dict):
-                children[path][cn] = f"{path}.{cn}"
-                _build(f"{path}.{cn}", cd, path)
-        for region in node.get("regions") or []:
-            for cn, cd in (region.get("states") or {}).items() if isinstance(region, dict) else []:
-                if isinstance(cd, dict):
-                    children[path][cn] = f"{path}.{cn}"
-                    _build(f"{path}.{cn}", cd, path)
-
-    _build("top", top, None)
-
-    def _resolve(src: str, ref: object) -> str | None:
-        if not isinstance(ref, str):
-            return None
-        parts = ref.split(".")
-        cur: str | None = src
-        anchor: str | None = None
-        while cur is not None:
-            if parts[0] in children.get(cur, {}):
-                anchor = children[cur][parts[0]]
-                break
-            cur = parent.get(cur)
-        if anchor is None:
-            return None
-        node = anchor
-        for p in parts[1:]:
-            node = children.get(node, {}).get(p, "")
-            if not node:
-                return None
-        return node
-
-    def _targets(node: dict[str, Any]) -> list[object]:
-        out: list[object] = []
-        initials = [node.get("initial")]
-        initials += [r.get("initial") for r in node.get("regions") or [] if isinstance(r, dict)]
-        for t in initials:
-            if isinstance(t, dict):
-                out.append(t.get("transition_to"))
-        for spec in (node.get("on_events") or {}).values():
-            for tr in spec if isinstance(spec, list) else [spec]:
-                if isinstance(tr, dict):
-                    out.append(tr.get("transition_to"))
-        for group in (node.get("after") or [], node.get("choice") or []):
-            for tr in group:
-                if isinstance(tr, dict):
-                    out.append(tr.get("transition_to"))
-        return out
-
-    reachable: set[str] = set()
-    stack = ["top"]
-    while stack:
-        path = stack.pop()
-        if path in reachable:
-            continue
-        reachable.add(path)
-        par = parent.get(path)
-        if par is not None and par not in reachable:
-            stack.append(par)  # entering a state implies its ancestors; follow their edges too
-        for ref in _targets(raws[path]):
-            tgt = _resolve(path, ref)
-            if tgt is not None and tgt not in reachable:
-                stack.append(tgt)
-
-    errors: list[ErrorRecord] = []
-    for path in raws:
-        if path != "top" and path not in reachable:
-            errors.append(
-                ErrorRecord(
-                    path="/" + path.replace(".", "/"),
-                    message=f"unreachable state '{path.rsplit('.', 1)[-1]}'",
-                )
+            declarations[name] = (
+                node,
+                declaration,
+                f"{node.pointer}/variables/{_escape_pointer(name)}",
             )
-    return sorted(errors, key=lambda e: e["path"])
+    return types, declarations
 
 
-def _forbid(
-    name: object, reserved: frozenset[str], path: str, errors: list[ErrorRecord]
+def _assigned_variable_names(machine: MachineModel) -> set[str]:
+    names: set[str] = set()
+    for state in machine.states.values():
+        action_lists = [state.raw.get("entry") or [], state.raw.get("exit") or []]
+        if state.is_choice:
+            action_lists.extend(branch.get("action") or [] for branch in state.raw["choice"])
+        initial = state.raw.get("initial")
+        if isinstance(initial, dict):
+            action_lists.append(initial.get("action") or [])
+        for transition_or_list in (state.raw.get("on_events") or {}).values():
+            transitions = (
+                transition_or_list
+                if isinstance(transition_or_list, list)
+                else [transition_or_list]
+            )
+            action_lists.extend(transition.get("action") or [] for transition in transitions)
+        for actions in action_lists:
+            for action in actions:
+                if "assign" in action:
+                    names.update(action["assign"])
+    return names
+
+
+def _check_expression(
+    expression: str,
+    *,
+    scope: dict[str, cel.StaticType],
+    expected: cel.StaticType | str | None,
+    event_fields: dict[str, cel.StaticType] | None,
+    owner_fields: dict[str, cel.StaticType] | None,
+    allow_event: bool,
+    allow_owner: bool,
+) -> cel.StaticType:
+    try:
+        return cel.check_expression(
+            expression,
+            scope,
+            expected=expected,
+            event_fields=event_fields if allow_event else None,
+            owner_fields=owner_fields if allow_owner else None,
+        )
+    except cel.CelProfileError as exc:
+        raise ValidationError("cel_profile_error", message=str(exc)) from exc
+    except CelError as exc:
+        raise ValidationError("semantic_validation", message=str(exc)) from exc
+
+
+def _validate_semantics(bundle: Bundle, model: BundleModel) -> None:
+    if not isinstance(bundle.raw.get("format"), int) or isinstance(bundle.raw.get("format"), bool):
+        raise ValidationError("unsupported_format")
+    events = bundle.raw.get("events") or {}
+    for _name, declaration in events.items():
+        correlation = declaration.get("correlates_to")
+        if correlation is not None:
+            target = events.get(correlation)
+            if declaration["direction"] != "input" or not target or target["direction"] != "output":
+                raise ValidationError("semantic_validation")
+    graph: dict[str, set[str]] = {machine_id: set() for machine_id in model.machines}
+    for machine in model.machines.values():
+        if not isinstance(machine.raw["version"], int) or isinstance(machine.raw["version"], bool):
+            raise ValidationError("semantic_validation")
+        _validate_machine(bundle, model, machine, graph)
+    _reject_initialization_cycles(graph)
+
+
+def _validate_machine(
+    bundle: Bundle,
+    bundle_model: BundleModel,
+    machine: MachineModel,
+    graph: dict[str, set[str]],
 ) -> None:
-    if name in reserved:
-        errors.append(
-            ErrorRecord(path=path, message=f"'{name}' is a reserved name")
+    declarations = _event_declarations(bundle, machine)
+    for name, declaration in (machine.raw.get("events") or {}).items():
+        if name in _RESERVED_EVENTS or declaration["direction"] != "internal":
+            raise ValidationError("semantic_validation")
+    component_ids: set[str] = set()
+    for state in machine.states.values():
+        _validate_variable_literals(state)
+        _validate_state_structure(
+            bundle, bundle_model, machine, state, declarations, component_ids, graph
+        )
+    _validate_reachability(machine)
+
+
+def _validate_variable_literals(state: StateNode) -> None:
+    for declaration in (state.raw.get("variables") or {}).values():
+        expected = str(declaration["type"])
+        if "init" in declaration and not _literal_matches(declaration["init"], expected):
+            raise ValidationError("semantic_validation")
+        if expected == "int" and isinstance(declaration.get("init"), float):
+            raise ValidationError("semantic_validation")
+
+
+def _validate_payload_literals(declaration: dict[str, Any]) -> None:
+    for field in (declaration.get("payload") or {}).values():
+        if "default" in field and not _literal_matches(field["default"], str(field["type"])):
+            raise ValidationError("semantic_validation")
+        if field["type"] == "int" and isinstance(field.get("default"), float):
+            raise ValidationError("semantic_validation")
+
+
+def _validate_state_structure(
+    bundle: Bundle,
+    bundle_model: BundleModel,
+    machine: MachineModel,
+    state: StateNode,
+    events: dict[str, dict[str, Any]],
+    component_ids: set[str],
+    graph: dict[str, set[str]],
+) -> None:
+    scope, scope_declarations = _scope(machine, state)
+    if state is machine.root:
+        for declaration in (bundle.raw.get("events") or {}).values():
+            _validate_payload_literals(declaration)
+        for declaration in (machine.raw.get("events") or {}).values():
+            _validate_payload_literals(declaration)
+    _validate_actions(
+        state.raw.get("entry") or [],
+        bundle=bundle,
+        bundle_model=bundle_model,
+        machine=machine,
+        state=state,
+        scope=scope,
+        scope_declarations=scope_declarations,
+        events=events,
+        event_name=None,
+        owner_fields=None,
+        context="entry",
+        graph=graph,
+    )
+    _validate_actions(
+        state.raw.get("exit") or [],
+        bundle=bundle,
+        bundle_model=bundle_model,
+        machine=machine,
+        state=state,
+        scope=scope,
+        scope_declarations=scope_declarations,
+        events=events,
+        event_name=None,
+        owner_fields=None,
+        context="exit",
+        graph=graph,
+    )
+    initial = state.raw.get("initial")
+    if isinstance(initial, dict):
+        target = machine.resolve(initial["transition_to"], state)
+        if not state.is_ancestor_of(target, strict=True):
+            raise ValidationError("semantic_validation")
+        _validate_transition(
+            initial,
+            bundle=bundle,
+            bundle_model=bundle_model,
+            machine=machine,
+            source=state,
+            scope=scope,
+            scope_declarations=scope_declarations,
+            events=events,
+            event_name=None,
+            pointer=f"{state.pointer}/initial",
+            context="initial",
+            graph=graph,
+        )
+    for event_name, transition_or_list in (state.raw.get("on_events") or {}).items():
+        declaration = events.get(event_name)
+        if declaration is None and event_name not in _RESERVED_EVENTS:
+            raise ValidationError("semantic_validation")
+        transitions = (
+            transition_or_list if isinstance(transition_or_list, list) else [transition_or_list]
+        )
+        for index, transition in enumerate(transitions):
+            if index < len(transitions) - 1 and "guard" not in transition:
+                raise ValidationError("semantic_validation")
+            suffix = f"/{index}" if isinstance(transition_or_list, list) else ""
+            _validate_transition(
+                transition,
+                bundle=bundle,
+                bundle_model=bundle_model,
+                machine=machine,
+                source=state,
+                scope=scope,
+                scope_declarations=scope_declarations,
+                events=events,
+                event_name=event_name,
+                pointer=f"{state.pointer}/on_events/{_escape_pointer(event_name)}{suffix}",
+                context="event",
+                graph=graph,
+            )
+    if state.is_choice:
+        branches = state.raw["choice"]
+        defaults = [index for index, branch in enumerate(branches) if "guard" not in branch]
+        if defaults != [len(branches) - 1]:
+            raise ValidationError("semantic_validation")
+        for index, branch in enumerate(branches):
+            _validate_transition(
+                branch,
+                bundle=bundle,
+                bundle_model=bundle_model,
+                machine=machine,
+                source=state,
+                scope=scope,
+                scope_declarations=scope_declarations,
+                events=events,
+                event_name=None,
+                pointer=f"{state.pointer}/choice/{index}",
+                context="choice",
+                graph=graph,
+            )
+    for index, placement in enumerate(state.raw.get("components") or []):
+        component_id = str(placement["component_id"])
+        if component_id in component_ids:
+            raise ValidationError("semantic_validation")
+        component_ids.add(component_id)
+        pointer = f"{state.pointer}/components/{index}"
+        if "machine_id" in placement:
+            component_machine = bundle_model.machine(str(placement["machine_id"]))
+            graph[machine.machine_id].add(component_machine.machine_id)
+        else:
+            component_machine = bundle_model.inline_component(machine, placement, pointer)
+            _validate_inline_machine(bundle, bundle_model, component_machine, graph)
+        _validate_bindings(
+            placement.get("with") or {},
+            component_machine,
+            scope={},
+            owner_fields=scope,
+            allow_owner=True,
         )
 
 
-def _walk_state(path: str, state: Any, errors: list[ErrorRecord]) -> None:
-    """Recurse a StateNode, flagging reserved state/esv names.
+def _validate_inline_machine(
+    bundle: Bundle,
+    bundle_model: BundleModel,
+    machine: MachineModel,
+    graph: dict[str, set[str]],
+) -> None:
+    events = _event_declarations(bundle, machine)
+    component_ids: set[str] = set()
+    for state in machine.states.values():
+        _validate_variable_literals(state)
+        _validate_state_structure(
+            bundle, bundle_model, machine, state, events, component_ids, graph
+        )
+    _validate_reachability(machine)
 
-    State and esv names are checked against the structural/intrinsic reserved
-    set only; reserved event names live in a different namespace and may be
-    reused (e.g. a state named ``done``).
-    """
-    if not isinstance(state, dict):
+
+def _validate_transition(
+    transition: dict[str, Any],
+    *,
+    bundle: Bundle,
+    bundle_model: BundleModel,
+    machine: MachineModel,
+    source: StateNode,
+    scope: dict[str, cel.StaticType],
+    scope_declarations: dict[str, tuple[StateNode, dict[str, Any], str]],
+    events: dict[str, dict[str, Any]],
+    event_name: str | None,
+    pointer: str,
+    context: str,
+    graph: dict[str, set[str]],
+) -> None:
+    event_declaration = events.get(event_name) if event_name is not None else None
+    event_fields = _payload_types(event_declaration, event_name or "")
+    if event_name == "env":
+        external_fields = tuple(
+            (name, cel.type_from_declaration(declaration))
+            for name, declaration in (machine.root.raw.get("variables") or {}).items()
+            if declaration.get("external") is True
+        )
+        event_fields = {
+            "changed": cel.StaticType(
+                "map", element=cel.DYNAMIC, fields=external_fields
+            )
+        }
+    guard = transition.get("guard")
+    if guard is not None:
+        _check_expression(
+            guard,
+            scope=scope,
+            expected="bool",
+            event_fields=event_fields if context == "event" else None,
+            owner_fields=None,
+            allow_event=context == "event",
+            allow_owner=False,
+        )
+    target = transition.get("transition_to")
+    target_state = machine.resolve(target, source) if target is not None else None
+    if target_state is not None:
+        assert isinstance(target, str | dict)
+        _validate_target_shape(machine, source, target_state, target, transition)
+    _validate_actions(
+        transition.get("action") or [],
+        bundle=bundle,
+        bundle_model=bundle_model,
+        machine=machine,
+        state=source,
+        scope=scope,
+        scope_declarations=scope_declarations,
+        events=events,
+        event_name=event_name if context == "event" else None,
+        owner_fields=None,
+        context=context,
+        graph=graph,
+    )
+    if target_state is not None:
+        _validate_destroyed_destinations(
+            machine, source, target_state, transition, scope_declarations
+        )
+
+
+def _validate_target_shape(
+    machine: MachineModel,
+    source: StateNode,
+    target: StateNode,
+    target_spec: str | dict[str, str],
+    transition: dict[str, Any],
+) -> None:
+    if target is machine.root:
+        raise ValidationError("root_reentry")
+    local = transition.get("local") is True
+    if local:
+        if source is machine.root:
+            raise ValidationError("root_local_transition")
+        if source.type != "composite" or not source.is_ancestor_of(target, strict=True):
+            raise ValidationError("semantic_validation")
+    if isinstance(target_spec, dict):
+        if target.type != "composite" or target.raw.get("history", "none") == "none":
+            raise ValidationError("semantic_validation")
+        if target.is_ancestor_of(source, strict=True):
+            raise ValidationError("semantic_validation")
+
+
+def _transition_boundary(
+    machine: MachineModel, source: StateNode, target: StateNode, local: bool
+) -> StateNode:
+    if source is target:
+        assert source.parent is not None
+        return source.parent
+    if source.is_ancestor_of(target, strict=True):
+        if local or source is machine.root:
+            return source
+        assert source.parent is not None
+        return source.parent
+    if target.is_ancestor_of(source, strict=True):
+        return target
+    target_ancestors = {node.path: node for node in target.ancestors(include_self=True)}
+    for node in source.ancestors(include_self=True):
+        if node.path in target_ancestors:
+            return node
+    return machine.root
+
+
+def _validate_destroyed_destinations(
+    machine: MachineModel,
+    source: StateNode,
+    target: StateNode,
+    transition: dict[str, Any],
+    declarations: dict[str, tuple[StateNode, dict[str, Any], str]],
+) -> None:
+    boundary = _transition_boundary(machine, source, target, transition.get("local") is True)
+    for action in transition.get("action") or []:
+        if "assign" in action:
+            name = next(iter(action["assign"]))
+            declaration_state = declarations[name][0]
+            if boundary.is_ancestor_of(declaration_state, strict=True):
+                raise ValidationError("destroyed_variable_write")
+        if "refresh" in action and target.type == "final" and target.parent is machine.root:
+            raise ValidationError("destroyed_variable_write")
+        if "spawn" in action and "bind_to" in action["spawn"]:
+            name = action["spawn"]["bind_to"]
+            declaration_state = declarations[name][0]
+            if boundary.is_ancestor_of(declaration_state, strict=True):
+                raise ValidationError("destroyed_reference_binding")
+
+
+def _validate_actions(
+    actions: list[dict[str, Any]],
+    *,
+    bundle: Bundle,
+    bundle_model: BundleModel,
+    machine: MachineModel,
+    state: StateNode,
+    scope: dict[str, cel.StaticType],
+    scope_declarations: dict[str, tuple[StateNode, dict[str, Any], str]],
+    events: dict[str, dict[str, Any]],
+    event_name: str | None,
+    owner_fields: dict[str, cel.StaticType] | None,
+    context: str,
+    graph: dict[str, set[str]],
+) -> None:
+    event_fields = _payload_types(events.get(event_name), event_name or "") if event_name else None
+    for action in actions:
+        if "assign" in action:
+            name, expression = next(iter(action["assign"].items()))
+            if name not in scope_declarations or scope_declarations[name][1].get("external"):
+                raise ValidationError("semantic_validation")
+            _check_expression(
+                expression,
+                scope=scope,
+                expected=scope[name],
+                event_fields=event_fields,
+                owner_fields=owner_fields,
+                allow_event=event_name is not None,
+                allow_owner=owner_fields is not None,
+            )
+        elif "send" in action:
+            _validate_send(
+                action["send"],
+                bundle=bundle,
+                bundle_model=bundle_model,
+                machine=machine,
+                state=state,
+                scope=scope,
+                events=events,
+                event_fields=event_fields,
+                allow_event=event_name is not None,
+            )
+        elif "spawn" in action:
+            spawn = action["spawn"]
+            target = bundle_model.machine(str(spawn["machine_id"]))
+            if context in {"entry", "initial", "choice"}:
+                graph[machine.machine_id].add(target.machine_id)
+            _validate_bindings(
+                spawn.get("bindings") or {},
+                target,
+                scope=scope,
+                owner_fields=None,
+                allow_owner=False,
+            )
+            bind_to = spawn.get("bind_to")
+            if bind_to is not None:
+                if bind_to not in scope_declarations:
+                    raise ValidationError("semantic_validation")
+                declaration = scope_declarations[bind_to][1]
+                if declaration["type"] != "instance_reference":
+                    raise ValidationError("semantic_validation")
+                constraint = declaration.get("machine_id")
+                if constraint is not None and constraint != target.machine_id:
+                    raise ValidationError("semantic_validation")
+        elif "cancel" in action:
+            _check_expression(
+                action["cancel"]["instance"],
+                scope=scope,
+                expected="instance_reference",
+                event_fields=event_fields,
+                owner_fields=None,
+                allow_event=event_name is not None,
+                allow_owner=False,
+            )
+        elif "refresh" in action:
+            if event_name != "env":
+                raise ValidationError("semantic_validation")
+
+
+def _validate_send(
+    send: dict[str, Any],
+    *,
+    bundle: Bundle,
+    bundle_model: BundleModel,
+    machine: MachineModel,
+    state: StateNode,
+    scope: dict[str, cel.StaticType],
+    events: dict[str, dict[str, Any]],
+    event_fields: dict[str, cel.StaticType] | None,
+    allow_event: bool,
+) -> None:
+    event_name = str(send["event"])
+    declaration = events.get(event_name)
+    targets = send.get("targets") or [send.get("to", {"self": True})]
+    external = any(target.get("external") is True for target in targets)
+    if event_name == "env":
+        if len(targets) != 1 or "component" not in targets[0]:
+            raise ValidationError("semantic_validation")
+        changed = (send.get("payload") or {}).get("changed")
+        if not isinstance(changed, str) or not changed.strip().startswith("{"):
+            raise ValidationError("semantic_validation")
+        if changed.strip() == "{}" or "correlation_id" in send:
+            raise ValidationError("semantic_validation")
+        component_id = targets[0]["component"]
+        placement = next(
+            (
+                item
+                for item in state.raw.get("components") or []
+                if item["component_id"] == component_id
+            ),
+            None,
+        )
+        if placement is None:
+            raise ValidationError("semantic_validation")
+        pointer = (
+            f"{state.pointer}/components/{(state.raw.get('components') or []).index(placement)}"
+        )
+        target_machine = (
+            bundle_model.machine(placement["machine_id"])
+            if "machine_id" in placement
+            else bundle_model.inline_component(machine, placement, pointer)
+        )
+        external_variables = {
+            name: cel.type_from_declaration(declaration)
+            for name, declaration in (target_machine.root.raw.get("variables") or {}).items()
+            if declaration.get("external") is True
+        }
+        try:
+            cel.check_map_literal(
+                changed,
+                external_variables,
+                scope=scope,
+                event_fields=event_fields,
+            )
+        except cel.CelProfileError as exc:
+            raise ValidationError("cel_profile_error", message=str(exc)) from exc
+        except CelError as exc:
+            raise ValidationError("semantic_validation", message=str(exc)) from exc
         return
-    choice = state.get("choice")
-    if isinstance(choice, list):
-        _check_choice(path, choice, errors)
-    on_events = state.get("on_events")
-    if isinstance(on_events, dict):
-        for ev, spec in on_events.items():
-            if isinstance(spec, list):
-                _check_transition_list(f"{path}/on_events/{ev}", spec, errors)
-    esvs = state.get("esvs")
-    if isinstance(esvs, dict):
-        for name in esvs:
-            _forbid(name, RESERVED_NAMES, f"{path}/esvs/{name}", errors)
-    states = state.get("states")
-    if isinstance(states, dict):
-        for name, child in states.items():
-            _forbid(name, RESERVED_NAMES, f"{path}/states/{name}", errors)
-            _walk_state(f"{path}/states/{name}", child, errors)
-    regions = state.get("regions")
-    if isinstance(regions, list):
-        for i, region in enumerate(regions):
-            if isinstance(region, dict):
-                rstates = region.get("states")
-                if isinstance(rstates, dict):
-                    for name, child in rstates.items():
-                        _forbid(name, RESERVED_NAMES, f"{path}/regions/{i}/states/{name}", errors)
-                        _walk_state(
-                            f"{path}/regions/{i}/states/{name}", child, errors
-                        )
+    if declaration is None or event_name in _RESERVED_EVENTS:
+        raise ValidationError("semantic_validation")
+    expected_direction = "output" if external else "internal"
+    if declaration["direction"] != expected_direction:
+        raise ValidationError("semantic_validation")
+    if external and "correlation_id" not in send:
+        raise ValidationError("semantic_validation")
+    payload_types = _payload_types(declaration, event_name)
+    supplied = send.get("payload") or {}
+    if set(supplied) - set(payload_types):
+        raise ValidationError("semantic_validation")
+    required = {
+        name
+        for name, field in (declaration.get("payload") or {}).items()
+        if field.get("required") is True and "default" not in field
+    }
+    if required - set(supplied):
+        raise ValidationError("semantic_validation")
+    for name, expression in supplied.items():
+        _check_expression(
+            expression,
+            scope=scope,
+            expected=payload_types[name],
+            event_fields=event_fields,
+            owner_fields=None,
+            allow_event=allow_event,
+            allow_owner=False,
+        )
+    if "correlation_id" in send:
+        _check_expression(
+            send["correlation_id"],
+            scope=scope,
+            expected="string",
+            event_fields=event_fields,
+            owner_fields=None,
+            allow_event=allow_event,
+            allow_owner=False,
+        )
+    for target in targets:
+        if "instance" in target:
+            _check_expression(
+                target["instance"],
+                scope=scope,
+                expected="instance_reference",
+                event_fields=event_fields,
+                owner_fields=None,
+                allow_event=allow_event,
+                allow_owner=False,
+            )
+
+def _validate_bindings(
+    bindings: dict[str, Any],
+    target: MachineModel,
+    *,
+    scope: dict[str, cel.StaticType],
+    owner_fields: dict[str, cel.StaticType] | None,
+    allow_owner: bool,
+) -> None:
+    root_variables = target.root.raw.get("variables") or {}
+    for kind in ("input", "external"):
+        expected = {
+            name: declaration
+            for name, declaration in root_variables.items()
+            if declaration.get(kind) is True
+        }
+        supplied = bindings.get(kind) or {}
+        if set(supplied) - set(expected):
+            raise ValidationError("invalid_binding")
+        missing = {
+            name
+            for name, declaration in expected.items()
+            if name not in supplied and "init" not in declaration
+        }
+        if missing:
+            raise ValidationError("invalid_binding")
+        for name, expression in supplied.items():
+            _check_expression(
+                expression,
+                scope=scope,
+                expected=cel.type_from_declaration(expected[name]),
+                event_fields=None,
+                owner_fields=owner_fields,
+                allow_event=False,
+                allow_owner=allow_owner,
+            )
+
+
+def _validate_reachability(machine: MachineModel) -> None:
+    reachable: set[str] = set()
+
+    def enter(state: StateNode) -> None:
+        if state.path in reachable:
+            return
+        reachable.add(state.path)
+        for ancestor in state.ancestors():
+            reachable.add(ancestor.path)
+        if state.is_choice:
+            for branch in state.raw["choice"]:
+                enter(machine.resolve(branch["transition_to"], state))
+        elif state.type == "composite":
+            enter(machine.resolve(state.raw["initial"]["transition_to"], state))
+
+    enter(machine.root)
+    changed = True
+    while changed:
+        before = len(reachable)
+        for path in list(reachable):
+            state = machine.states[path]
+            for transition_or_list in (state.raw.get("on_events") or {}).values():
+                transitions = (
+                    transition_or_list
+                    if isinstance(transition_or_list, list)
+                    else [transition_or_list]
+                )
+                for transition in transitions:
+                    if "transition_to" in transition:
+                        enter(machine.resolve(transition["transition_to"], state))
+        changed = len(reachable) != before
+    unreachable = [state for state in machine.states.values() if state.path not in reachable]
+    if unreachable:
+        raise ValidationError("semantic_validation", path=unreachable[0].pointer)
+
+
+def _reject_initialization_cycles(graph: dict[str, set[str]]) -> None:
+    visiting: set[str] = set()
+    visited: set[str] = set()
+
+    def visit(machine_id: str) -> None:
+        if machine_id in visiting:
+            raise ValidationError("semantic_validation")
+        if machine_id in visited:
+            return
+        visiting.add(machine_id)
+        for target in graph[machine_id]:
+            visit(target)
+        visiting.remove(machine_id)
+        visited.add(machine_id)
+
+    for machine_id in graph:
+        visit(machine_id)

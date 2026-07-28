@@ -1,110 +1,61 @@
-"""Conformance suite gates.
-
-Two layers:
-
-1. **Step-1 gate** — every machine definition in the upstream suite MUST load
-   and validate (SPEC §2/§9), and the bundled schema must not drift from the
-   spec repo's.
-2. **Engine gate** — each supported case is run end-to-end (create root,
-   ``send`` to quiescence, check ``expect``). Unsupported cases are skipped
-   until their features land; see ``harness.SUPPORTED``.
-"""
+"""Full format-1 core conformance gate."""
 
 from __future__ import annotations
 
 import json
 import os
-import urllib.error
-import urllib.request
 from pathlib import Path
 
 import pytest
+from jsonschema import Draft202012Validator
 
-import determa.state as ds
-from determa.state import load_definitions
+from determa.state import load_bundle
 from determa.state.validator import schema as bundled_schema
 
-from .harness import (
-    CONFORMANCE_DIR,
-    SUPPORTED,
-    cli_cases,
-    engine_cases,
-    run_cli_case,
-    run_engine_case,
-)
+from .harness import CORE_DIR, CoreCase, core_cases, run_case
 
 
 def _spec_schema() -> dict | None:
-    """The normative schema from fruwehq/determa-state-spec at the matching tag (or an override).
-
-    Returns ``None`` when offline and no ``DETERMA_SPEC_DIR`` override is set, so the
-    drift test can skip rather than fail.
-    """
     override = os.environ.get("DETERMA_SPEC_DIR")
-    if override:
-        p = Path(override) / "schema" / "machine.schema.json"
-        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else None
-    for ref in (f"v{ds.__version__}", "main"):
-        url = f"https://raw.githubusercontent.com/fruwehq/determa-state-spec/{ref}/schema/machine.schema.json"
-        try:
-            with urllib.request.urlopen(url, timeout=10) as resp:  # noqa: S310 (fixed host)
-                return json.loads(resp.read())
-        except (urllib.error.URLError, OSError, ValueError):
-            continue
-    return None
+    if not override:
+        return None
+    path = Path(override) / "schema" / "machine.schema.json"
+    return json.loads(path.read_text(encoding="utf-8")) if path.exists() else None
 
 
-def _each_machine_file() -> list[pytest.Param]:
-    import yaml
-
-    params: list[pytest.Param] = []
-    for case in engine_cases():
-        # A `static: { valid: false }` case may hold a deliberately invalid machine
-        # (it must NOT load cleanly), so exclude it from the "loads and validates" gate.
-        test = yaml.safe_load(case.test_file.read_text(encoding="utf-8")) or {}
-        if test.get("static", {}).get("valid") is False:
-            continue
-        for mf in case.machine_files:
-            params.append(pytest.param(mf, id=f"{case.name}:{mf.name}"))
-    for case in cli_cases():
-        mf = case / "machine.yaml"
-        if mf.exists():
-            params.append(pytest.param(mf, id=f"cli/{case.name}"))
-    return params
-
-
-@pytest.mark.parametrize("path", _each_machine_file())
-def test_machine_file_loads_and_validates(path: Path) -> None:
-    defs = load_definitions(path.read_text(encoding="utf-8"))
-    assert defs, f"{path}: no definitions loaded"
-    for d in defs:
-        assert d.id == d.raw["id"]
-
-
-def test_bundled_schema_matches_spec() -> None:
-    """The engine's bundled schema must equal the spec repo's schema (no drift)."""
-    upstream = _spec_schema()
-    if upstream is None:
-        pytest.skip(
-            "spec schema unavailable (offline; set DETERMA_SPEC_DIR to a local checkout)"
-        )
-    assert upstream == bundled_schema()
+def _spec_root() -> Path | None:
+    override = os.environ.get("DETERMA_SPEC_DIR")
+    if not override:
+        return None
+    root = Path(override)
+    return root if root.exists() else None
 
 
 def test_suite_present() -> None:
-    if not CONFORMANCE_DIR.exists():
-        pytest.skip("conformance suite not fetched (offline; set DETERMA_CONFORMANCE_DIR)")
-    assert len(engine_cases()) == 31, "expected 31 engine cases"
-    assert len(cli_cases()) == 3, "expected 3 CLI cases"
+    assert CORE_DIR.exists(), "pinned conformance suite is unavailable"
+    assert len(core_cases()) == 75
 
 
-@pytest.mark.parametrize("case", engine_cases(), ids=lambda c: c.name)
-def test_engine_case(case) -> None:  # type: ignore[no-untyped-def]
-    if case.name not in SUPPORTED:
-        pytest.skip(f"not yet supported: {case.name}")
-    run_engine_case(case)
+def test_bundled_schema_matches_pinned_spec() -> None:
+    upstream = _spec_schema()
+    assert upstream is not None, "pinned specification is unavailable"
+    assert bundled_schema() == upstream
 
 
-@pytest.mark.parametrize("case", cli_cases(), ids=lambda c: f"cli/{c.name}")
-def test_cli_case(case) -> None:  # type: ignore[no-untyped-def]
-    run_cli_case(case)
+def test_bundled_schema_is_valid_draft_2020_12() -> None:
+    Draft202012Validator.check_schema(bundled_schema())
+
+
+@pytest.mark.parametrize("name", ["minimal.yaml", "full.yaml"])
+def test_authoritative_spec_examples_load_semantically(name: str) -> None:
+    root = _spec_root()
+    assert root is not None, "pinned specification is unavailable"
+
+    bundle = load_bundle((root / "examples" / name).read_text(encoding="utf-8"))
+
+    assert bundle.raw["format"] == 1
+
+
+@pytest.mark.parametrize("case", core_cases(), ids=lambda case: case.name)
+def test_core_case(case: CoreCase) -> None:
+    run_case(case)

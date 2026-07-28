@@ -1,0 +1,26 @@
+format: 1
+namespace: example.counter
+events:
+  increment:
+    direction: input
+    payload:
+      amount: { type: int, required: true }
+  reset:
+    direction: input
+machines:
+  - machine_id: counter
+    version: 1
+    root:
+      type: composite
+      variables:
+        count: { type: int, init: 0 }
+      initial: { transition_to: running }
+      states:
+        running:
+          on_events:
+            increment:
+              action:
+                - assign: { count: "count + event.payload.amount" }
+            reset:
+              action:
+                - assign: { count: "0" }

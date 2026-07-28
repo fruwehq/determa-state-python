@@ -1,312 +1,488 @@
-"""Conformance-suite harness helpers.
-
-The language-agnostic suite (SPEC §9) lives in ``fruwehq/determa-state-conformance`` and is
-fetched at the matching release tag by ``conftest.py`` (no git submodule). These helpers
-locate the fetched suite, enumerate cases, and run engine cases against this
-implementation (create the root as id ``root``, per step ``send``/``advance``, run all
-instances to quiescence, then check ``expect``).
-"""
+"""Driver for the language-neutral format-1 core conformance cases."""
 
 from __future__ import annotations
 
-import importlib.util
+import copy
 import os
-import sys
 from dataclasses import dataclass
 from pathlib import Path
-from types import ModuleType
 from typing import Any
 
-from determa.state import Host
+import yaml
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
+from determa.state import ValidationError, create, dispatch, load_bundle
+
+from .pins import CONFORMANCE_CACHE
 
 
 def conformance_root() -> Path:
-    """Root of the fetched ``determa-state-conformance`` checkout.
-
-    ``DETERMA_CONFORMANCE_DIR`` overrides with a local checkout (offline/dev); otherwise
-    the cache populated by ``conftest.py`` is used.
-    """
-    env = os.environ.get("DETERMA_CONFORMANCE_DIR")
-    return Path(env) if env else REPO_ROOT / ".cache" / "determa-state-conformance"
+    override = os.environ.get("DETERMA_CONFORMANCE_DIR")
+    return Path(override) if override else CONFORMANCE_CACHE
 
 
-CONFORMANCE_DIR = conformance_root() / "conformance"
-
-# Cases the engine is known to pass. Others are skipped until their features
-# land; extend this set as build-order steps are completed.
-SUPPORTED = frozenset(
-    {
-        "01-guarded-leaf",
-        "02-hierarchy-bubbling",
-        "03-initial-action",
-        "04-defer",
-        "05-esvs-scope",
-        "06-payload-typing",
-        "07-internal-external",
-        "08-local-vs-external",
-        "09-orthogonal",
-        "10-history-deep",
-        "11-history-shallow",
-        "12-guarded-list",
-        "13-spawn-publish",
-        "14-subscription",
-        "15-external-env-refresh",
-        "16-timer",
-        "17-fault-handled",
-        "18-fault-unhandled",
-        "19-contract-pass",
-        "20-contract-fail",
-        "21-snapshot-roundtrip",
-        "22-migration",
-        "23-choice",
-        "24-choice-chain",
-        "25-choice-invalid",
-        "26-unreachable",
-        "27-dead-branch",
-        "28-reachable-ok",
-        "29-submachine",
-        "30-submachine-interrupt",
-        "31-enabled-events",
-    }
-)
+CORE_DIR = conformance_root() / "conformance" / "core"
 
 
 @dataclass(frozen=True)
-class EngineCase:
+class CoreCase:
     name: str
     path: Path
-    machine_files: list[Path]
-    test_file: Path
+
+    @property
+    def machine_file(self) -> Path | None:
+        path = self.path / "machine.yaml"
+        return path if path.exists() else None
+
+    @property
+    def test_file(self) -> Path:
+        return self.path / "test.yaml"
 
 
-def _machine_files(case_dir: Path) -> list[Path]:
-    """The machine-definition file(s) for a case.
-
-    Most cases have ``machine.yaml``; migration cases have versioned
-    ``v1.yaml``/``v2.yaml``/… files instead (SPEC §9).
-    """
-    single = case_dir / "machine.yaml"
-    if single.exists():
-        return [single]
-    versioned = sorted(case_dir.glob("v*.yaml"))
-    if versioned:
-        return versioned
-    return []
-
-
-def engine_cases() -> list[EngineCase]:
-    """All engine conformance cases (``conformance/01``–``22``), sorted."""
-    if not CONFORMANCE_DIR.exists():
+def core_cases() -> list[CoreCase]:
+    if not CORE_DIR.exists():
         return []
-    cases: list[EngineCase] = []
-    for case_dir in sorted(p for p in CONFORMANCE_DIR.iterdir() if p.is_dir()):
-        machine_files = _machine_files(case_dir)
-        if not machine_files:
-            continue
-        test_file = case_dir / "test.yaml"
-        cases.append(
-            EngineCase(
-                name=case_dir.name,
-                path=case_dir,
-                machine_files=machine_files,
-                test_file=test_file,
-            )
-        )
-    return cases
+    return [
+        CoreCase(path.name, path)
+        for path in sorted(CORE_DIR.iterdir())
+        if path.is_dir() and (path / "test.yaml").exists()
+    ]
 
 
-def cli_cases() -> list[Path]:
-    """All CLI conformance case directories (``conformance/cli/*``)."""
-    cli_dir = CONFORMANCE_DIR / "cli"
-    if not cli_dir.exists():
-        return []
-    return sorted(p for p in cli_dir.iterdir() if p.is_dir())
+def _load_test(path: Path) -> dict[str, Any]:
+    return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
 
 
-# --- CLI case runner (SPEC §13.6): true black box via the spec repo's runner --
-def run_cli_case(case_dir: Path) -> None:
-    """Run a CLI case **black-box** via the spec repo's reference runner (§13.6).
+def _materialize_driver_value(value: Any) -> Any:
+    if isinstance(value, dict) and set(value) == {"invalid_unicode_scalar"}:
+        return chr(int(value["invalid_unicode_scalar"], 16))
+    if isinstance(value, dict):
+        return {key: _materialize_driver_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_materialize_driver_value(item) for item in value]
+    return value
 
-    Invokes this package as a subprocess (``python -m determa.state``), so packaging and
-    entry-point regressions are caught — not an in-process import. Delegating to the
-    suite's ``conformance/run_cli.py`` also avoids harness drift.
-    """
-    runner = _load_cli_runner()
-    rc = runner.main(
-        [
-            "--cmd",
-            f"{sys.executable} -m determa.state",
-            "--conformance-dir",
-            str(CONFORMANCE_DIR / "cli"),
-            case_dir.name,
-        ]
+
+def run_case(case: CoreCase) -> None:
+    test = _load_test(case.test_file)
+    _run_static_documents(case, test)
+    machine_file = case.machine_file
+    static = test.get("static") or {}
+    primary_invalid = (
+        isinstance(static, dict) and "documents" not in static and static.get("valid") is False
     )
-    assert rc == 0, f"cli/{case_dir.name}: black-box CLI runner reported failure"
-
-
-def _load_cli_runner() -> ModuleType:
-    path = CONFORMANCE_DIR / "run_cli.py"
-    spec = importlib.util.spec_from_file_location("determa_cli_runner", path)
-    assert spec is not None and spec.loader is not None, f"runner not found: {path}"
-    mod = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(mod)
-    return mod
-
-
-# --- engine case runner -----------------------------------------------------
-def run_engine_case(case: EngineCase) -> None:
-    """Execute one engine conformance case, asserting every ``expect`` (SPEC §9)."""
-    from determa.state import collect_errors, load_definition, load_definitions
-    from determa.state.contracts import load_contract, validate_contracts
-
-    test = _load_yaml(case.test_file)
-    assert case.machine_files, f"{case.name}: no machine files"
-
-    if "static" in test:
-        from determa.state import ValidationError
-
-        expected = bool(test["static"]["valid"])
-        try:
-            root_raw = load_definitions(case.machine_files[0].read_text(encoding="utf-8"))[0].raw
-        except ValidationError:
-            # invalid at load time (schema / structural / choice rules)
-            assert expected is False, f"{case.name}: expected valid but load failed"
-            return
-        errors = list(collect_errors(root_raw))
-        contracts: dict[str, dict[str, Any]] = {}
-        cdir = case.path / "contracts"
-        if cdir.exists():
-            for cf in sorted(cdir.glob("*.yaml")):
-                c = load_contract(cf.read_text(encoding="utf-8"))
-                contracts[c["id"]] = c
-        errors.extend(validate_contracts(root_raw, contracts))
-        valid = not errors
-        assert valid is expected, (
-            f"{case.name}: static valid={valid} != {expected} ({errors})"
-        )
+    if machine_file is None or primary_invalid:
         return
-
-    external = test.get("external") or {}
-    host = Host()
-    files = case.machine_files
-    versioned = bool(files) and all(
-        f.name[:1] == "v" and f.stem[1:].isdigit() for f in files
+    source = machine_file.read_text(encoding="utf-8")
+    try:
+        bundle = load_bundle(source)
+    except ValidationError:
+        documents = static.get("documents") if isinstance(static, dict) else None
+        primary_declared_invalid = isinstance(documents, list) and any(
+            document.get("file") == "machine.yaml" and document.get("valid") is False
+            for document in documents
+        )
+        if primary_declared_invalid and not (
+            test.get("steps") or test.get("create") or test.get("load")
+        ):
+            return
+        raise
+    if "load" in test:
+        assert test["load"].get("valid", True) is True
+    create_spec = test.get("create") or {}
+    machine_id = bundle.raw["machines"][0]["machine_id"]
+    root_instance_id = _materialize_driver_value(
+        create_spec.get("root_instance_id", f"conformance:{case.name}:root")
     )
-    if versioned:
-        ordered = sorted(files)
-        for f in ordered:
-            host.register(load_definition(f.read_text(encoding="utf-8")))
-        root_id = load_definition(ordered[0].read_text(encoding="utf-8")).id
-        lowest = min(v for (iid, v) in host.versions if iid == root_id)
-        root_machine = host.versions[(root_id, lowest)]
-    else:
-        defs = load_definitions(files[0].read_text(encoding="utf-8"))
-        host.register_all(defs)
-        root_machine = host.machines[defs[0].id]
-    host.create_root(root_machine, "root", external=external)
-    host.run_to_quiescence()
-
-    roundtrip = bool(test.get("roundtrip"))
-    for i, step in enumerate(test.get("steps", [])):
-        step_label = f"{case.name} step {i}"
-        before_pub, before_sp = len(host.published), len(host.spawned)
+    creation_id = _materialize_driver_value(
+        create_spec.get("creation_id", f"conformance:{case.name}:create")
+    )
+    bindings = _materialize_driver_value(create_spec.get("bindings") or {})
+    result = create(
+        bundle,
+        machine_id,
+        root_instance_id,
+        creation_id,
+        bindings,
+    )
+    _assert_result(result, create_spec.get("expect") or {}, None, {})
+    if result["state"] is None:
+        assert not test.get("steps")
+        return
+    state = result["state"]
+    captures: dict[str, list[dict[str, Any]]] = {}
+    for index, step in enumerate(test.get("steps") or []):
+        prior_state = state
+        prior_state_snapshot = copy.deepcopy(state)
+        target_runtime_id = state["root_runtime_id"]
+        dispatch_bundle = bundle
         if "send" in step:
-            delivered = _do_send(host, step["send"], step_label)
-            host.run_to_quiescence()
-        elif "advance" in step:
-            host.advance(step["advance"])
-            delivered = True
-            host.run_to_quiescence()
-        elif "upgrade" in step:
-            host.upgrade(int(step["upgrade"]), root_machine.id)
-            delivered = True
-            host.run_to_quiescence()
+            send = _materialize_driver_value(step["send"])
+            if "bundle" in send:
+                dispatch_bundle = load_bundle(
+                    (case.path / send["bundle"]).read_text(encoding="utf-8")
+                )
+            target = _root_target(state)
+            if "bound_instance" in send:
+                reference = _visible_variables(state, state["runtimes"][state["root_runtime_id"]])[
+                    send["bound_instance"]
+                ]
+                target = {"spawned_instance": copy.deepcopy(reference)}
+                target_runtime_id = reference["instance_id"]
+            envelope = {
+                "event": send["event"],
+                "event_id": send.get("event_id", f"conformance:{case.name}:step:{index}:input"),
+                "target": target,
+                "payload": copy.deepcopy(send.get("payload") or {}),
+            }
+            if "correlation_id" in send:
+                envelope["correlation_id"] = send["correlation_id"]
+            envelope_snapshot = copy.deepcopy(envelope)
+            result = dispatch(dispatch_bundle, state, {"input": envelope})
+        elif "deliver" in step:
+            delivery = step["deliver"]
+            envelope = copy.deepcopy(captures[delivery["captured"]][delivery["index"]])
+            target_runtime_id = _target_runtime_id(envelope["target"])
+            envelope_snapshot = copy.deepcopy(envelope)
+            result = dispatch(dispatch_bundle, state, {"internal": envelope})
         else:
-            raise AssertionError(f"{step_label}: unsupported step {list(step)}")
-        _check_expect(
-            host,
+            raise AssertionError(f"{case.name} step {index}: unsupported driver step")
+        _assert_result(
+            result,
             step.get("expect") or {},
-            step_label,
-            delivered=delivered,
-            published=host.published[before_pub:],
-            spawned=host.spawned[before_sp:],
+            target_runtime_id,
+            captures,
+            prior_state=prior_state,
+            prior_state_snapshot=prior_state_snapshot,
+            input_envelope=envelope,
+            input_envelope_snapshot=envelope_snapshot,
         )
-        if roundtrip:
-            host.restore_all(host.snapshot_all())
+        state = result["state"]
+        if "capture_emissions_as" in step:
+            captures[step["capture_emissions_as"]] = copy.deepcopy(result["emissions"])
 
 
-def _do_send(host: Host, send: dict[str, Any], label: str) -> bool:
-    instance = send.get("instance", "root")
-    event = send["event"]
-    payload = send.get("payload")
-    return host.deliver(instance, event, payload)
+def _run_static_documents(case: CoreCase, test: dict[str, Any]) -> None:
+    documents: list[dict[str, Any]] = []
+    static = test.get("static")
+    if isinstance(static, dict):
+        if "documents" in static:
+            documents = static["documents"]
+        elif case.machine_file is not None:
+            documents = [{"file": "machine.yaml", **static}]
+    for document in documents:
+        source = (case.path / document["file"]).read_text(encoding="utf-8")
+        try:
+            load_bundle(source)
+            actual = (True, None)
+        except ValidationError as error:
+            actual = (False, error.code)
+        assert actual == (document["valid"], document.get("error")), (
+            f"{case.name}/{document['file']}: {actual}"
+        )
 
 
-def _check_expect(
-    host: Host,
-    expect: dict[str, Any],
-    label: str,
-    delivered: bool,
-    published: list[str],
-    spawned: list[str],
+def _assert_result(
+    result: dict[str, Any],
+    expected: dict[str, Any],
+    target_runtime_id: str | None,
+    captures: dict[str, list[dict[str, Any]]],
+    *,
+    prior_state: dict[str, Any] | None = None,
+    prior_state_snapshot: dict[str, Any] | None = None,
+    input_envelope: dict[str, Any] | None = None,
+    input_envelope_snapshot: dict[str, Any] | None = None,
 ) -> None:
-    if "rejected" in expect:
-        rejected = bool(expect["rejected"])
-        assert delivered is (not rejected), (
-            f"{label}: rejected={delivered} != expected {rejected}"
+    del captures
+    supported = {
+        "status",
+        "disposition",
+        "rejection",
+        "fault",
+        "caller_still_owns_input",
+        "state",
+        "config",
+        "variables",
+        "history",
+        "components",
+        "owned_instances",
+        "emissions",
+    }
+    assert set(expected) <= supported, set(expected) - supported
+    for name in ("status", "disposition"):
+        if name in expected:
+            assert result[name] == expected[name], (name, result[name], expected[name])
+    if "state" in expected:
+        assert result["state"] == expected["state"]
+    if "rejection" in expected:
+        _assert_partial(result["rejection"], expected["rejection"], state=result["state"])
+    if "fault" in expected:
+        _assert_partial(result["fault"], expected["fault"], state=result["state"])
+    if expected.get("caller_still_owns_input"):
+        assert input_envelope is not None
+        assert input_envelope_snapshot is not None
+        assert input_envelope == input_envelope_snapshot
+        assert prior_state is not None
+        assert prior_state_snapshot is not None
+        assert prior_state == prior_state_snapshot
+        assert result["state"] is not None
+        assert not {"queue", "timers", "dead_letters"} & set(result["state"])
+        assert all(
+            not {"queue", "timers", "dead_letters"} & set(runtime)
+            for runtime in result["state"]["runtimes"].values()
         )
-    instance_id = expect.get("instance", "root")
-    inst = host.instances.get(instance_id)
-    if "config" in expect:
-        assert inst is not None, f"{label}: instance {instance_id} missing"
-        assert inst.active_leaf_names() == sorted(expect["config"]), (
-            f"{label}: config {inst.active_leaf_names()} != {sorted(expect['config'])}"
-        )
-    if "esvs" in expect and inst is not None:
-        actual = inst.resolved_esvs()
-        for name, val in expect["esvs"].items():
-            assert actual.get(name) == val, (
-                f"{label}: esv {name}={actual.get(name)!r} != {val!r}"
+        if result["disposition"] == "rejected":
+            assert result["state"] is prior_state
+    if result["state"] is None:
+        return
+    state = result["state"]
+    runtime = state["runtimes"][state["root_runtime_id"]]
+    _assert_runtime(state, runtime, expected)
+    if "emissions" in expected:
+        assert len(result["emissions"]) == len(expected["emissions"])
+        for actual, wanted in zip(result["emissions"], expected["emissions"], strict=True):
+            _assert_emission(
+                state,
+                runtime,
+                target_runtime_id,
+                prior_state,
+                actual,
+                wanted,
             )
-    if "enabled" in expect:
-        assert inst is not None, f"{label}: instance {instance_id} missing"
-        assert host.enabled_events(inst) == sorted(expect["enabled"]), (
-            f"{label}: enabled {host.enabled_events(inst)} != {sorted(expect['enabled'])}"
+
+
+def _assert_runtime(
+    state: dict[str, Any], runtime: dict[str, Any], expected: dict[str, Any]
+) -> None:
+    if "config" in expected:
+        actual = _config(runtime)
+        assert actual == expected["config"], (actual, expected["config"])
+    if "variables" in expected:
+        _assert_partial(_visible_variables(state, runtime), expected["variables"], state=state)
+    if "history" in expected:
+        assert runtime["history"] == expected["history"], (
+            runtime["history"],
+            expected["history"],
         )
-    if "status" in expect:
-        assert inst is not None
-        assert inst.status.value == expect["status"], (
-            f"{label}: status {inst.status.value} != {expect['status']}"
+    if "components" in expected:
+        wanted = expected["components"]
+        assert set(runtime["components"]) == set(wanted)
+        for component_id, component_expected in wanted.items():
+            child = state["runtimes"][runtime["components"][component_id]]
+            if "status" in component_expected:
+                _assert_partial(child, {"status": component_expected["status"]})
+            _assert_runtime(state, child, component_expected)
+    if "owned_instances" in expected:
+        children = sorted(
+            [
+                child
+                for child in state["runtimes"].values()
+                if child.get("role") == "spawned" and _is_descendant_runtime(state, child, runtime)
+            ],
+            key=lambda child: (
+                child["owner_runtime_id"].encode("utf-8"),
+                child["spawn_sequence"],
+            ),
         )
-    if "published" in expect:
-        assert published == expect["published"], (
-            f"{label}: published {published} != {expect['published']}"
-        )
-    if "spawned" in expect:
-        assert spawned == expect["spawned"], (
-            f"{label}: spawned {spawned} != {expect['spawned']}"
-        )
-    if expect.get("dead_letter"):
-        assert inst is not None
-        assert inst.dead_letter, f"{label}: expected a dead-letter record"
-    if expect.get("instances"):
-        for iid, sub in expect["instances"].items():
-            target = host.instances.get(iid)
-            if "status" in sub and target is not None:
-                assert target.status.value == sub["status"], (
-                    f"{label}: {iid} status {target.status.value} != {sub['status']}"
+        assert len(children) == len(expected["owned_instances"])
+        for child, child_expected in zip(children, expected["owned_instances"], strict=True):
+            key = child_expected["key"]
+            if "owner" in key:
+                assert key["owner"] == "root"
+                assert child["owner_runtime_id"] == state["root_runtime_id"]
+            if "spawn_sequence" in key:
+                assert child["spawn_sequence"] == key["spawn_sequence"]
+            if "machine_id" in child_expected:
+                assert child["machine_id"] == child_expected["machine_id"]
+            _assert_runtime(state, child, child_expected)
+    if isinstance(expected.get("fault"), dict) and "code" in expected["fault"]:
+        _assert_partial(runtime["fault"], expected["fault"])
+
+
+def _assert_emission(
+    state: dict[str, Any],
+    runtime: dict[str, Any],
+    processed_runtime_id: str | None,
+    prior_state: dict[str, Any] | None,
+    actual: dict[str, Any],
+    expected: dict[str, Any],
+) -> None:
+    for key, value in expected.items():
+        if key == "target":
+            if value == "external":
+                assert actual["target"] == "external"
+            elif value == "root":
+                assert actual["target"] == _root_target(state)
+            elif value == "owner":
+                emitter = _emitting_runtime(state, prior_state, processed_runtime_id, actual)
+                if emitter is not None and emitter.get("owner_runtime_id") is not None:
+                    owner = _runtime_from_either(state, prior_state, emitter["owner_runtime_id"])
+                    assert owner is not None
+                    owner_target = _runtime_target(state, owner)
+                else:
+                    owner_target = _root_target(state)
+                assert actual["target"] == owner_target
+            elif isinstance(value, dict) and "component" in value:
+                component = next(
+                    (
+                        candidate
+                        for candidate in state["runtimes"].values()
+                        if candidate.get("role") == "component"
+                        and candidate.get("component_id") == value["component"]
+                        and (
+                            processed_runtime_id is None
+                            or candidate.get("owner_runtime_id") == processed_runtime_id
+                            or candidate.get("owner_runtime_id") == runtime["runtime_id"]
+                        )
+                    ),
+                    None,
                 )
-            if "config" in sub and target is not None:
-                assert target.active_leaf_names() == sorted(sub["config"]), (
-                    f"{label}: {iid} config mismatch"
+                assert component is not None
+                assert actual["target"] == component["target"]
+            elif isinstance(value, dict) and "bound_instance" in value:
+                reference = _visible_variables(state, runtime)[value["bound_instance"]]
+                assert actual["target"] == {"spawned_instance": reference}
+            else:
+                raise AssertionError(f"unsupported target assertion: {value!r}")
+        elif key == "payload":
+            _assert_partial(actual["payload"], value, state=state)
+        else:
+            assert actual.get(key) == value, (key, actual.get(key), value)
+
+
+def _assert_partial(actual: Any, expected: Any, *, state: dict[str, Any] | None = None) -> None:
+    if isinstance(expected, dict):
+        assert isinstance(actual, dict), (actual, expected)
+        if set(expected) == {"instance_reference"}:
+            assertion = expected["instance_reference"]
+            assert set(assertion) <= {"machine_id", "targetable"}
+            assert _is_reference(actual)
+            if "machine_id" in assertion:
+                assert actual["machine_id"] == assertion["machine_id"]
+            if "targetable" in assertion:
+                assert state is not None
+                target = state["runtimes"].get(actual["instance_id"])
+                targetable = (
+                    state["status"] == "running"
+                    and target is not None
+                    and target.get("role") == "spawned"
+                    and target.get("status") == "running"
+                    and target.get("instance_reference") == actual
+                    and not _has_faulted_ancestor(state, target)
                 )
+                assert targetable is assertion["targetable"]
+            return
+        for key, value in expected.items():
+            assert key in actual, (key, actual)
+            _assert_partial(actual[key], value, state=state)
+    elif isinstance(expected, list):
+        assert isinstance(actual, list) and len(actual) == len(expected)
+        for left, right in zip(actual, expected, strict=True):
+            _assert_partial(left, right, state=state)
+    else:
+        assert type(actual) is type(expected) and actual == expected, (actual, expected)
 
 
-def _load_yaml(path: Path) -> dict[str, Any]:
-    import yaml  # conformance test.yaml is a scenario, not a machine; core schema ok
+def _is_reference(value: Any) -> bool:
+    return isinstance(value, dict) and set(value) == {
+        "root_instance_id",
+        "instance_id",
+        "machine_id",
+        "machine_version",
+    }
 
-    with path.open(encoding="utf-8") as fh:
-        data = yaml.safe_load(fh)
-    return data or {}
+
+def _config(runtime: dict[str, Any]) -> list[str]:
+    if not runtime["active"]:
+        return []
+    leaf = runtime["active"][-1]
+    return [] if leaf == "root" else [leaf]
+
+
+def _visible_variables(state: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+    del state
+    result: dict[str, Any] = {}
+    for path in runtime["active"]:
+        result.update(runtime["scopes"].get(path, {}))
+    return copy.deepcopy(result)
+
+
+def _root_target(state: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "root": {
+            "root_instance_id": state["root_instance_id"],
+            "root_runtime_id": state["root_runtime_id"],
+        }
+    }
+
+
+def _target_runtime_id(target: dict[str, Any]) -> str:
+    if "root" in target:
+        return target["root"]["root_runtime_id"]
+    if "component" in target:
+        return target["component"]["component_runtime_id"]
+    return target["spawned_instance"]["instance_id"]
+
+
+def _runtime_from_either(
+    state: dict[str, Any],
+    prior_state: dict[str, Any] | None,
+    runtime_id: str,
+) -> dict[str, Any] | None:
+    runtime = state["runtimes"].get(runtime_id)
+    if runtime is not None or prior_state is None:
+        return runtime
+    return prior_state["runtimes"].get(runtime_id)
+
+
+def _emitting_runtime(
+    state: dict[str, Any],
+    prior_state: dict[str, Any] | None,
+    processed_runtime_id: str | None,
+    emission: dict[str, Any],
+) -> dict[str, Any] | None:
+    payload = emission.get("payload") or {}
+    source_id = payload.get("component_runtime_id")
+    if source_id is None and emission.get("event") in {
+        "done",
+        "determa.spawned_instance_failed",
+    }:
+        source_id = payload.get("instance_id")
+    if not isinstance(source_id, str):
+        source_id = processed_runtime_id
+    if source_id is None:
+        return None
+    return _runtime_from_either(state, prior_state, source_id)
+
+
+def _runtime_target(state: dict[str, Any], runtime: dict[str, Any]) -> dict[str, Any]:
+    if runtime["role"] == "root":
+        return _root_target(state)
+    if runtime["role"] == "component":
+        return copy.deepcopy(runtime["target"])
+    return {"spawned_instance": copy.deepcopy(runtime["instance_reference"])}
+
+
+def _is_descendant_runtime(
+    state: dict[str, Any],
+    candidate: dict[str, Any],
+    owner: dict[str, Any],
+) -> bool:
+    owner_id = candidate.get("owner_runtime_id")
+    while owner_id is not None:
+        if owner_id == owner["runtime_id"]:
+            return True
+        parent = state["runtimes"].get(owner_id)
+        owner_id = parent.get("owner_runtime_id") if parent is not None else None
+    return False
+
+
+def _has_faulted_ancestor(state: dict[str, Any], runtime: dict[str, Any]) -> bool:
+    owner_id = runtime.get("owner_runtime_id")
+    while owner_id is not None:
+        owner = state["runtimes"].get(owner_id)
+        if owner is None:
+            return True
+        if owner.get("status") == "faulted":
+            return True
+        owner_id = owner.get("owner_runtime_id")
+    return False

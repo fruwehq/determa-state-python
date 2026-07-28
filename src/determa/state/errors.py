@@ -1,45 +1,46 @@
-"""Exception types for the Determa State engine (SPEC §2, §13.2/§13.4).
-
-Validation errors carry a structured list of ``{"path": str, "message": str}``
-records, matching the JSON shape the CLI emits for ``validate`` (SPEC §13.4).
-"""
+"""Structured errors for format-1 loading and foreground execution."""
 
 from __future__ import annotations
 
-from typing import TypedDict
-
-
-class ErrorRecord(TypedDict):
-    """A single validation error, in the §13.4 ``{path, message}`` shape."""
-
-    path: str
-    message: str
+from dataclasses import dataclass
 
 
 class DetermaError(Exception):
-    """Base class for all Determa State errors."""
+    """Base class for Determa State errors."""
+
+
+@dataclass(frozen=True)
+class ErrorRecord:
+    """One load-time diagnostic."""
+
+    code: str
+    path: str = ""
+    message: str = ""
 
 
 class ValidationError(DetermaError):
-    """A machine definition failed schema or semantic validation.
+    """A source, schema, or semantic validation failure."""
 
-    ``errors`` is the structured list (one record per problem). When raised
-    without records it still signals failure (e.g. a malformed document).
-    """
-
-    def __init__(
-        self,
-        errors: list[ErrorRecord] | None = None,
-        message: str | None = None,
-    ) -> None:
-        self.errors: list[ErrorRecord] = list(errors) if errors else []
-        if message is None:
-            message = (
-                "; ".join(f"{e['path']}: {e['message']}" for e in self.errors)
-                or "validation failed"
-            )
-        super().__init__(message)
+    def __init__(self, code: str, path: str = "", message: str = "") -> None:
+        self.code = code
+        self.path = path
+        self.message = message or code
+        self.errors = [ErrorRecord(code=code, path=path, message=self.message)]
+        super().__init__(self.message)
 
 
 class SchemaError(DetermaError):
-    """The bundled JSON Schema itself is unusable (should not happen)."""
+    """The bundled normative schema is unusable."""
+
+
+class CelError(DetermaError):
+    """A portable CEL expression failed to compile or evaluate."""
+
+
+class StepFault(DetermaError):
+    """Internal control flow for one atomic RTC fault."""
+
+    def __init__(self, code: str, source_locator: str) -> None:
+        self.code = code
+        self.source_locator = source_locator
+        super().__init__(f"{code} at {source_locator}")

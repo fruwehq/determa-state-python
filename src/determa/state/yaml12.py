@@ -1,97 +1,212 @@
-"""YAML 1.2 core-schema loading (SPEC §2).
-
-Determa State YAML MUST be parsed under the **YAML 1.2 core schema**, where only
-``true``/``false`` (and capitalisations) are booleans. PyYAML defaults to YAML
-1.1, in which ``yes``/``no``/``on``/``off``/``y``/``n`` are also booleans and
-leading-zero / sexagesimal integers are parsed oddly. This module provides a
-PyYAML loader that resolves scalars and constructs values strictly per the
-YAML 1.2 core schema (https://yaml.org/spec/1.2.2/#102-core-schema).
-
-Only the implicit resolvers and the int/float constructors are replaced; the
-parser, composer, and (de)serialiser machinery are PyYAML's own.
-"""
+"""Strict portable YAML/JSON source parsing from specification section 2."""
 
 from __future__ import annotations
 
+import math
 import re
 from typing import Any
 
 import yaml
 
-# --- YAML 1.2 core-schema scalar patterns ----------------------------------
-# Canonical regexes from the YAML 1.2 core schema resolution table.
-_NULL_RE = re.compile(r"^(?:~|null|Null|NULL|)$")
-_BOOL_RE = re.compile(r"^(?:true|True|TRUE|false|False|FALSE)$")
-_INT_RE = re.compile(r"^(?:[-+]?[0-9]+|[-+]?0o[0-7]+|[-+]?0x[0-9a-fA-F]+)$")
-_FLOAT_RE = re.compile(
-    r"^(?:"
-    r"[-+]?(?:\.[0-9]+|[0-9]+(?:\.[0-9]*)?)(?:[eE][-+]?[0-9]+)?"
-    r"|[-+]?\.(?:inf|Inf|INF)"
-    r"|\.(?:nan|NaN|NAN)"
-    r")$"
+from .errors import ValidationError
+
+_JSON_NUMBER = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\Z")
+_INTEGER = re.compile(r"-?(?:0|[1-9][0-9]*)\Z")
+_NONPORTABLE_YAML_NUMBER = re.compile(
+    r"""
+    [+-]?(?:
+        0[xX][0-9a-fA-F_]+
+        |0[oO][0-7_]+
+        |(?:[0-9][0-9_]*)(?:\.[0-9_]*)?(?:[eE][+-]?[0-9_]+)?
+        |\.[0-9][0-9_]*(?:[eE][+-]?[0-9_]+)?
+        |\.(?:inf|nan)
+    )\Z
+    """,
+    re.IGNORECASE | re.VERBOSE,
 )
+_INVALID_BOOLEAN = frozenset({"True", "TRUE", "False", "FALSE"})
+_INVALID_NULL = frozenset({"Null", "NULL", "~", ""})
+_STRING_BOOLEAN_LIKE = frozenset(
+    value
+    for word in ("yes", "no", "on", "off", "y", "n")
+    for value in (word, word.upper(), word.title())
+)
+_INT_MIN = -(2**63)
+_INT_MAX = 2**63 - 1
 
 
-class _CoreLoader(yaml.SafeLoader):
-    """A SafeLoader whose implicit resolvers + int/float ctors are 1.2-core."""
+def _has_invalid_unicode(value: str) -> bool:
+    return any(0xD800 <= ord(char) <= 0xDFFF for char in value)
 
 
-# Replace the inherited (YAML 1.1) implicit-resolver table with a fresh one.
-_CoreLoader.yaml_implicit_resolvers = {}
-
-# Registration order matters: for a given first character, resolvers are tried
-# in registration order and the first match wins.
+def validate_unicode(value: Any) -> bool:
+    """Return whether every recursively contained string is a Unicode scalar sequence."""
+    return _validate_unicode(value, set())
 
 
-def _add_resolver(tag: str, rx: re.Pattern[str], first: list[str]) -> None:
-    _CoreLoader.add_implicit_resolver(tag, rx, first)  # type: ignore[no-untyped-call]
+def _validate_unicode(value: Any, ancestors: set[int]) -> bool:
+    if isinstance(value, str):
+        return not _has_invalid_unicode(value)
+    if isinstance(value, list):
+        identity = id(value)
+        if identity in ancestors:
+            return False
+        ancestors.add(identity)
+        valid = all(_validate_unicode(item, ancestors) for item in value)
+        ancestors.remove(identity)
+        return valid
+    if isinstance(value, dict):
+        identity = id(value)
+        if identity in ancestors:
+            return False
+        ancestors.add(identity)
+        valid = all(
+            isinstance(key, str)
+            and _validate_unicode(key, ancestors)
+            and _validate_unicode(item, ancestors)
+            for key, item in value.items()
+        )
+        ancestors.remove(identity)
+        return valid
+    return True
 
 
-_add_resolver("tag:yaml.org,2002:null", _NULL_RE, list("~nN") + [""])
-_add_resolver("tag:yaml.org,2002:bool", _BOOL_RE, list("tTfF"))
-_add_resolver("tag:yaml.org,2002:int", _INT_RE, list("-+0123456789"))
-_add_resolver("tag:yaml.org,2002:float", _FLOAT_RE, list("-+0123456789."))
+def validate_portable_values(value: Any) -> None:
+    """Reject host values outside the portable JSON scalar domain."""
+    _validate_portable_values(value, set())
 
 
-def _construct_int(loader: yaml.Loader, node: yaml.ScalarNode) -> int:
-    """YAML 1.2 core int: decimal, ``0o`` octal, ``0x`` hex. No leading-zero
-    octal, no sexagesimals."""
+def _validate_portable_values(value: Any, ancestors: set[int]) -> None:
+    if value is None or isinstance(value, (str, bool)):
+        return
+    if isinstance(value, int):
+        if not _INT_MIN <= value <= _INT_MAX:
+            raise ValidationError("numeric_value_out_of_range")
+        return
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            raise ValidationError("numeric_value_out_of_range")
+        return
+    if isinstance(value, list):
+        identity = id(value)
+        if identity in ancestors:
+            raise ValidationError("non_json_value")
+        ancestors.add(identity)
+        for item in value:
+            _validate_portable_values(item, ancestors)
+        ancestors.remove(identity)
+        return
+    if isinstance(value, dict):
+        identity = id(value)
+        if identity in ancestors:
+            raise ValidationError("non_json_value")
+        ancestors.add(identity)
+        for key, item in value.items():
+            if not isinstance(key, str):
+                raise ValidationError("non_string_map_key")
+            _validate_portable_values(item, ancestors)
+        ancestors.remove(identity)
+        return
+    raise ValidationError("non_json_value")
+
+
+def _resolve_plain(value: str) -> Any:
+    if value == "true":
+        return True
+    if value == "false":
+        return False
+    if value in _INVALID_BOOLEAN:
+        raise ValidationError("invalid_boolean_syntax")
+    if value == "null":
+        return None
+    if value in _INVALID_NULL:
+        raise ValidationError("invalid_null_syntax")
+    if value in _STRING_BOOLEAN_LIKE:
+        return value
+    if _JSON_NUMBER.fullmatch(value):
+        if _INTEGER.fullmatch(value):
+            integer = int(value, 10)
+            if not _INT_MIN <= integer <= _INT_MAX:
+                raise ValidationError("numeric_value_out_of_range")
+            return integer
+        try:
+            double = float(value)
+        except ValueError as exc:
+            raise ValidationError("invalid_numeric_syntax") from exc
+        if not math.isfinite(double):
+            raise ValidationError("numeric_value_out_of_range")
+        return 0.0 if double == 0.0 else double
+    if _NONPORTABLE_YAML_NUMBER.fullmatch(value):
+        raise ValidationError("invalid_numeric_syntax")
+    return value
+
+
+class _PortableLoader(yaml.BaseLoader):
+    """A non-coercing loader with format-1 scalar and mapping construction."""
+
+
+def _construct_scalar(loader: _PortableLoader, node: yaml.ScalarNode) -> Any:
     value = loader.construct_scalar(node)
-    sign = ""
-    if value[:1] in "+-":
-        sign, value = value[0], value[1:]
-    body = value.lower()
-    if body[:2] == "0x":
-        n = int(value, 16)
-    elif body[:2] == "0o":
-        n = int(value, 8)
-    else:
-        n = int(value, 10)
-    return -n if sign == "-" else n
+    if _has_invalid_unicode(value):
+        raise ValidationError("invalid_unicode")
+    if node.style is None:
+        return _resolve_plain(value)
+    return value
 
 
-def _construct_float(loader: yaml.Loader, node: yaml.ScalarNode) -> float:
-    """YAML 1.2 core float, including ``.inf``/``.nan`` forms."""
-    value = loader.construct_scalar(node)
-    lower = value.lower()
-    if lower in {".inf", "+.inf"}:
-        return float("inf")
-    if lower == "-.inf":
-        return float("-inf")
-    if lower == ".nan":
-        return float("nan")
-    return float(value)
+def _construct_mapping(
+    loader: _PortableLoader, node: yaml.MappingNode, deep: bool = False
+) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key_node, value_node in node.value:
+        key = loader.construct_object(key_node, deep=deep)
+        if not isinstance(key, str):
+            raise ValidationError("non_string_map_key")
+        if key in result:
+            raise ValidationError("duplicate_key")
+        result[key] = loader.construct_object(value_node, deep=deep)
+    return result
 
 
-_CoreLoader.add_constructor("tag:yaml.org,2002:int", _construct_int)
-_CoreLoader.add_constructor("tag:yaml.org,2002:float", _construct_float)
+_PortableLoader.add_constructor("tag:yaml.org,2002:str", _construct_scalar)
+_PortableLoader.add_constructor("tag:yaml.org,2002:map", _construct_mapping)
+
+
+def _construct_sequence(loader: _PortableLoader, node: yaml.SequenceNode) -> list[Any]:
+    return list(loader.construct_sequence(node))
+
+
+_PortableLoader.add_constructor("tag:yaml.org,2002:seq", _construct_sequence)
+
+
+def _reject_yaml_features(text: str) -> None:
+    try:
+        tokens = yaml.scan(text, Loader=_PortableLoader)
+        for token in tokens:
+            if isinstance(
+                token, (yaml.tokens.AliasToken, yaml.tokens.AnchorToken, yaml.tokens.TagToken)
+            ):
+                raise ValidationError("unsupported_yaml_feature")
+    except ValidationError:
+        raise
+    except (yaml.YAMLError, UnicodeError) as exc:
+        raise ValidationError("non_json_value", message=str(exc)) from exc
 
 
 def load(text: str) -> Any:
-    """Load a single YAML 1.2 document (``None`` if the stream is empty)."""
-    return yaml.load(text, Loader=_CoreLoader)
-
-
-def load_all(text: str) -> list[Any]:
-    """Load all ``---``-separated YAML 1.2 documents (empty docs dropped)."""
-    return [doc for doc in yaml.load_all(text, Loader=_CoreLoader) if doc is not None]
+    """Parse exactly one portable format-1 source document."""
+    if _has_invalid_unicode(text):
+        raise ValidationError("invalid_unicode")
+    _reject_yaml_features(text)
+    try:
+        documents = list(yaml.load_all(text, Loader=_PortableLoader))
+    except ValidationError:
+        raise
+    except (yaml.YAMLError, UnicodeError) as exc:
+        raise ValidationError("non_json_value", message=str(exc)) from exc
+    if len(documents) != 1:
+        raise ValidationError("non_json_value", message="source must contain exactly one document")
+    document = documents[0]
+    if not validate_unicode(document):
+        raise ValidationError("invalid_unicode")
+    return document
