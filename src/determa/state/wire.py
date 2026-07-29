@@ -795,9 +795,95 @@ def _machine_for_binding(
     )
 
 
+def _origin_machine(
+    resolver: DefinitionResolver, origin: Mapping[str, Any]
+) -> tuple[Bundle, MachineModel]:
+    definition = origin.get("definition")
+    if not isinstance(definition, Mapping):
+        raise ArtifactError("invalid_aggregate_state")
+    fingerprint = definition.get("validated_bundle_fingerprint")
+    if not isinstance(fingerprint, str):
+        raise ArtifactError("invalid_aggregate_state")
+    bundle = _bundle_from_resolver(resolver, fingerprint, source=True, require_trust=True)
+    return bundle, _machine_for_binding(bundle, BundleModel(bundle), definition)
+
+
+def _validate_immutable_identity(
+    resolver: DefinitionResolver,
+    aggregate: Mapping[str, Any],
+    document: Mapping[str, Any],
+    role: str,
+    target: Mapping[str, Any],
+) -> None:
+    origin = document["identity_origin"]
+    if not isinstance(origin, Mapping) or origin.get("kind") != {
+        "root": "root",
+        "component": "component",
+        "spawned": "owned_spawned_instance",
+    }[role]:
+        raise ArtifactError("invalid_aggregate_state")
+    origin_bundle, origin_machine = _origin_machine(resolver, origin)
+    root_instance_id = aggregate["root_instance_id"]
+    runtime_id = document["runtime_id"]
+    if role == "root":
+        if (
+            origin.get("root_instance_id") != root_instance_id
+            or target
+            != {
+                "root": {
+                    "root_instance_id": root_instance_id,
+                    "root_runtime_id": runtime_id,
+                }
+            }
+        ):
+            raise ArtifactError("invalid_aggregate_state")
+        return
+    if role == "component":
+        component = target.get("component")
+        if not isinstance(component, Mapping):
+            raise ArtifactError("invalid_aggregate_state")
+        pointer = origin.get("component_definition_pointer")
+        if not isinstance(pointer, str):
+            raise ArtifactError("invalid_aggregate_state")
+        try:
+            from .engine import _pointer_get
+
+            placement = _pointer_get(origin_bundle.raw, pointer)
+            declaration_index = int(pointer.rsplit("/", 1)[1])
+        except (IndexError, KeyError, TypeError, ValueError):
+            raise ArtifactError("invalid_aggregate_state") from None
+        if (
+            not isinstance(placement, dict)
+            or decimal(origin.get("declaration_index")) != declaration_index
+            or component
+            != {
+                "root_instance_id": root_instance_id,
+                "owner_runtime_id": origin.get("owner_runtime_id"),
+                "component_id": placement.get("component_id"),
+                "component_runtime_id": runtime_id,
+                "activation_sequence": decimal(origin.get("activation_sequence")),
+            }
+        ):
+            raise ArtifactError("invalid_aggregate_state")
+        return
+    spawned = target.get("spawned_instance")
+    if (
+        not isinstance(spawned, Mapping)
+        or spawned
+        != {
+            "root_instance_id": root_instance_id,
+            "instance_id": runtime_id,
+            "machine_id": origin_machine.machine_id,
+            "machine_version": origin_machine.version,
+        }
+    ):
+        raise ArtifactError("invalid_aggregate_state")
+
+
 def _runtime_from_wire(
     bundle: Bundle,
     models: BundleModel,
+    resolver: DefinitionResolver,
     aggregate: Mapping[str, Any],
     document: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -877,13 +963,7 @@ def _runtime_from_wire(
         target["spawned_instance"]["machine_version"] = decimal(
             target["spawned_instance"]["machine_version"], positive=True
         )
-    if role == "root" and target != {
-        "root": {
-            "root_instance_id": aggregate["root_instance_id"],
-            "root_runtime_id": aggregate["root_runtime_id"],
-        }
-    }:
-        raise ArtifactError("invalid_aggregate_state")
+    _validate_immutable_identity(resolver, aggregate, document, role, target)
     runtime: dict[str, Any] = {
         "runtime_id": document["runtime_id"],
         "role": role,
@@ -1029,13 +1109,23 @@ def restore_aggregate(
         ],
     }
     for runtime_document in document["runtimes"]:
-        runtime = _runtime_from_wire(bundle, models, document, runtime_document)
+        runtime = _runtime_from_wire(
+            bundle, models, definition_resolver, document, runtime_document
+        )
         if runtime["runtime_id"] in state["runtimes"]:
             raise ArtifactError("invalid_aggregate_state")
         state["runtimes"][runtime["runtime_id"]] = runtime
     _finish_relationships(bundle, state, models)
     root = state["runtimes"].get(state["root_runtime_id"])
     if root is None or root["role"] != "root":
+        raise ArtifactError("invalid_aggregate_state")
+    if (
+        document["root_machine_id"] != root["machine_id"]
+        or decimal(document["root_machine_version"], positive=True)
+        != root["machine_version"]
+        or root["_current_definition"]["machine"]["root_definition_pointer"]
+        != root["root_pointer"]
+    ):
         raise ArtifactError("invalid_aggregate_state")
     state["status"] = root["status"]
     state["fault"] = copy.deepcopy(root["fault"])

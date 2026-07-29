@@ -153,7 +153,7 @@ def _check_shape_limits(
     if len(canonical_bytes(aggregate)) > limits.maximum_aggregate_bytes:
         raise ArtifactError("migration_resource_limit_exceeded")
     if any(
-        len(canonical_bytes(bundle.raw)) > limits.maximum_definition_bytes
+        len(canonical_bytes(typed_value(bundle.raw))) > limits.maximum_definition_bytes
         for bundle in definitions
     ):
         raise ArtifactError("migration_resource_limit_exceeded")
@@ -861,6 +861,7 @@ def _apply_descriptor(
     source_bundle: Bundle,
     target_bundle: Bundle,
     descriptor: dict[str, Any],
+    artifact_resolver: ArtifactResolver,
     limits: MigrationLimits,
     maintenance_mode: bool,
 ) -> dict[str, Any]:
@@ -882,20 +883,8 @@ def _apply_descriptor(
             source, source_bundle, target_bundle, descriptor, limits
         )
     )
-    resolver = _SingleDefinitionResolver(target_bundle)
-    restore_aggregate(canonical_bytes(candidate), resolver)
+    restore_aggregate(canonical_bytes(candidate), artifact_resolver)
     return candidate
-
-
-class _SingleDefinitionResolver:
-    def __init__(self, bundle: Bundle) -> None:
-        self.bundle = bundle
-
-    def resolve_definition(self, fingerprint: str) -> Bundle | None:
-        return self.bundle if fingerprint == self.bundle.fingerprint else None
-
-    def definition_is_trusted(self, fingerprint: str) -> bool:
-        return fingerprint == self.bundle.fingerprint
 
 
 def migrate_aggregate(
@@ -978,6 +967,7 @@ def migrate_aggregate(
                 definitions[index],
                 definitions[index + 1],
                 descriptor,
+                artifact_resolver,
                 limits,
                 maintenance_mode,
             )
