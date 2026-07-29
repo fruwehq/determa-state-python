@@ -3,10 +3,10 @@
 Python implementation of [Determa State](https://github.com/fruwehq/determa-state-spec),
 a language-agnostic statechart engine with a shared normative conformance suite.
 
-This pre-release implements Determa State `format: 1` at the approved specification
-commit `1502a58a780d837e05bfacb37680dfc92e3488b5`. Correctness is determined by the
+This release implements Determa State `format: 1` at the synchronized specification
+commit `c1635d74e6a216301a8986d37be8ce7e7111dfd7`. Correctness is determined by the
 110-case core suite and persistence profiles at conformance commit
-`707a49ce01c6f57f673c1959cdfe078bc8d0fc9a`.
+`600523ca08c3b8a6ee790439a32dc4ce47f71b95`.
 
 The package metadata is `0.1.0` for the next synchronized release of the specification,
 conformance suite, Python engine, and Rust engine.
@@ -15,7 +15,7 @@ conformance suite, Python engine, and Rust engine.
 
 The published `0.0.7` distribution predates portable persistence and definition
 migration. Until the synchronized `0.1.0` Determa State release is published, install
-this pre-release implementation from a checkout:
+this release candidate from a checkout:
 
 ```sh
 git clone https://github.com/fruwehq/determa-state-python.git
@@ -190,10 +190,6 @@ pytest conformance -q
 Unit tests are hermetic and offline. The conformance harness uses the immutable commits
 listed above, cached under `.cache/`; local checkouts can be supplied with
 `DETERMA_CONFORMANCE_DIR` and `DETERMA_SPEC_DIR`.
-
-Before this release is ready, the exact pre-release specification and conformance
-commit pins must be replaced with and verified against the real synchronized `v0.1.0`
-tags after those tags are created.
 
 ## License
 

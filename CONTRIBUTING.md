@@ -58,9 +58,8 @@ behavior.
 specification, conformance, Python, and Rust versions are synchronized. The package
 metadata is `0.1.0` for the next synchronized format 1 release.
 
-The current exact specification and conformance commit pins remain authoritative while
-the release is prepared. Before this release is ready, they must be replaced with and
-verified against the real synchronized `v0.1.0` tags after those tags are created.
+The exact synchronized 0.1.0 specification and conformance commits recorded in
+`conformance/pins.py` are the authoritative release inputs.
 
 A `vX.Y.Z` tag triggers `release.yml` and publishes to PyPI through Trusted Publishing,
 gated by the manually approved `pypi` environment. Version bumps, tags, and publication

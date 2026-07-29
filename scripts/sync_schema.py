@@ -25,7 +25,7 @@ SCHEMAS = (
     "migration-descriptor.schema.json",
     "aggregate-state-package.schema.json",
 )
-SPEC_COMMIT = "1502a58a780d837e05bfacb37680dfc92e3488b5"
+SPEC_COMMIT = "c1635d74e6a216301a8986d37be8ce7e7111dfd7"
 
 
 def _fetch(name: str) -> str:
