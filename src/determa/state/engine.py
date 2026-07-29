@@ -486,6 +486,7 @@ def _is_prior_counter_path(path: tuple[str | int, ...]) -> bool:
         ("fault", "step_sequence"),
         ("holder", "state_activation_sequence"),
         ("target", "component", "activation_sequence"),
+        ("_target_identity", "component", "activation_sequence"),
     }:
         return True
     return len(suffix) == 2 and suffix[0] in {
@@ -583,17 +584,33 @@ def _validate_prior_state(state: dict[str, Any], bundle: Bundle) -> bool:
         return False
     if root.get("owner_runtime_id") is not None or root.get("status") != state["status"]:
         return False
-    expected_root_id = _identity(
-        [
-            "determa-root-runtime-identity-2",
-            "1",
-            state["validated_bundle_fingerprint"],
-            state["namespace"],
-            root.get("machine_id"),
-            str(root.get("machine_version")),
-            state["root_instance_id"],
-        ]
-    )
+    origin = root.get("_identity_origin")
+    if isinstance(origin, dict) and origin.get("kind") == "root":
+        definition = origin.get("definition", {})
+        machine = definition.get("machine", {})
+        expected_root_id = _identity(
+            [
+                "determa-root-runtime-identity-2",
+                "1",
+                definition.get("validated_bundle_fingerprint"),
+                machine.get("namespace"),
+                machine.get("machine_id"),
+                str(machine.get("machine_version")),
+                origin.get("root_instance_id"),
+            ]
+        )
+    else:
+        expected_root_id = _identity(
+            [
+                "determa-root-runtime-identity-2",
+                "1",
+                state["validated_bundle_fingerprint"],
+                state["namespace"],
+                root.get("machine_id"),
+                str(root.get("machine_version")),
+                state["root_instance_id"],
+            ]
+        )
     if root.get("runtime_id") != expected_root_id or root["runtime_id"] != state["root_runtime_id"]:
         return False
     if root.get("machine_id") != state["root_machine_id"]:
@@ -830,55 +847,111 @@ def _valid_component_identity(state: dict[str, Any], runtime: dict[str, Any]) ->
         or not _logical_counter(runtime["owning_state_activation_sequence"])
     ):
         return False
-    expected_id = _identity(
-        [
-            "determa-component-runtime-identity-1",
-            "1",
-            state["root_instance_id"],
-            runtime["owner_runtime_id"],
-            runtime["component_definition_pointer"],
-            str(runtime["component_activation_sequence"]),
-            state["namespace"],
-            runtime["machine_id"],
-            str(runtime["machine_version"]),
-        ]
-    )
-    expected_target = {
-        "component": {
-            "root_instance_id": state["root_instance_id"],
-            "owner_runtime_id": runtime["owner_runtime_id"],
-            "component_id": runtime["component_id"],
-            "component_runtime_id": runtime["runtime_id"],
-            "activation_sequence": runtime["component_activation_sequence"],
+    origin = runtime.get("_identity_origin")
+    if isinstance(origin, dict) and origin.get("kind") == "component":
+        definition = origin.get("definition", {})
+        machine = definition.get("machine", {})
+        expected_id = _identity(
+            [
+                "determa-component-runtime-identity-1",
+                "1",
+                state["root_instance_id"],
+                origin.get("owner_runtime_id"),
+                origin.get("component_definition_pointer"),
+                str(origin.get("activation_sequence")),
+                machine.get("namespace"),
+                machine.get("machine_id"),
+                str(machine.get("machine_version")),
+            ]
+        )
+        expected_target = runtime.get("_target_identity")
+    else:
+        expected_id = _identity(
+            [
+                "determa-component-runtime-identity-1",
+                "1",
+                state["root_instance_id"],
+                runtime["owner_runtime_id"],
+                runtime["component_definition_pointer"],
+                str(runtime["component_activation_sequence"]),
+                state["namespace"],
+                runtime["machine_id"],
+                str(runtime["machine_version"]),
+            ]
+        )
+        expected_target = {
+            "component": {
+                "root_instance_id": state["root_instance_id"],
+                "owner_runtime_id": runtime["owner_runtime_id"],
+                "component_id": runtime["component_id"],
+                "component_runtime_id": runtime["runtime_id"],
+                "activation_sequence": runtime["component_activation_sequence"],
+            }
         }
-    }
     return bool(runtime["runtime_id"] == expected_id and runtime["target"] == expected_target)
 
 
 def _valid_spawned_identity(state: dict[str, Any], runtime: dict[str, Any]) -> bool:
+    origin = runtime.get("_identity_origin")
+    target = runtime.get("_target_identity")
+    migrated = (
+        isinstance(origin, dict)
+        and origin.get("kind") == "owned_spawned_instance"
+        and isinstance(target, dict)
+        and target.get("spawned_instance") == runtime.get("instance_reference")
+    )
     if (
         not _logical_counter(runtime.get("spawn_sequence"))
         or not isinstance(runtime.get("spawn_action_pointer"), str)
         or not _is_instance_reference(runtime.get("instance_reference"))
         or runtime["instance_reference"].get("root_instance_id") != state["root_instance_id"]
         or runtime["instance_reference"].get("instance_id") != runtime["runtime_id"]
-        or runtime["instance_reference"].get("machine_id") != runtime["machine_id"]
-        or runtime["instance_reference"].get("machine_version") != runtime["machine_version"]
+        or (
+            not migrated
+            and runtime["instance_reference"].get("machine_id") != runtime["machine_id"]
+        )
+        or (
+            not migrated
+            and runtime["instance_reference"].get("machine_version")
+            != runtime["machine_version"]
+        )
     ):
         return False
-    expected_id = _identity(
-        [
-            "determa-spawned-runtime-identity-1",
-            "1",
-            state["root_instance_id"],
-            runtime["owner_runtime_id"],
-            runtime["spawn_action_pointer"],
-            str(runtime["spawn_sequence"]),
-            state["namespace"],
-            runtime["machine_id"],
-            str(runtime["machine_version"]),
-        ]
-    )
+    if migrated:
+        assert isinstance(origin, dict)
+        definition = origin.get("definition")
+        if not isinstance(definition, dict):
+            return False
+        machine = definition.get("machine")
+        if not isinstance(machine, dict):
+            return False
+        expected_id = _identity(
+            [
+                "determa-spawned-runtime-identity-1",
+                "1",
+                state["root_instance_id"],
+                origin.get("owner_runtime_id"),
+                origin.get("spawn_action_pointer"),
+                str(origin.get("spawn_sequence")),
+                machine.get("namespace"),
+                machine.get("machine_id"),
+                str(machine.get("machine_version")),
+            ]
+        )
+    else:
+        expected_id = _identity(
+            [
+                "determa-spawned-runtime-identity-1",
+                "1",
+                state["root_instance_id"],
+                runtime["owner_runtime_id"],
+                runtime["spawn_action_pointer"],
+                str(runtime["spawn_sequence"]),
+                state["namespace"],
+                runtime["machine_id"],
+                str(runtime["machine_version"]),
+            ]
+        )
     holder = runtime.get("holder")
     if holder is not None and (
         not isinstance(holder, dict)

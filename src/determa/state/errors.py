@@ -37,6 +37,16 @@ class CelError(DetermaError):
     """A portable CEL expression failed to compile or evaluate."""
 
 
+class ArtifactError(DetermaError):
+    """A portable persistence artifact is invalid or unsupported."""
+
+    def __init__(self, code: str, path: str = "", message: str = "") -> None:
+        self.code = code
+        self.path = path
+        self.message = message or code
+        super().__init__(self.message)
+
+
 class StepFault(DetermaError):
     """Internal control flow for one atomic RTC fault."""
 

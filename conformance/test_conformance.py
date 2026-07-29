@@ -11,8 +11,14 @@ from jsonschema import Draft202012Validator
 
 from determa.state import load_bundle
 from determa.state.validator import schema as bundled_schema
+from determa.state.wire import artifact_schema
 
 from .harness import CORE_DIR, CoreCase, core_cases, run_case
+from .persistence import persistence_vector_cases, run_persistence_vectors
+from .persistence_profiles import (
+    persistence_profile_cases,
+    run_persistence_profile,
+)
 
 
 def _spec_schema() -> dict | None:
@@ -33,13 +39,35 @@ def _spec_root() -> Path | None:
 
 def test_suite_present() -> None:
     assert CORE_DIR.exists(), "pinned conformance suite is unavailable"
-    assert len(core_cases()) == 88
+    assert len(core_cases()) == 110
 
 
 def test_bundled_schema_matches_pinned_spec() -> None:
     upstream = _spec_schema()
     assert upstream is not None, "pinned specification is unavailable"
     assert bundled_schema() == upstream
+
+
+@pytest.mark.parametrize(
+    ("name", "kind"),
+    [
+        ("aggregate-state.schema.json", "aggregate_state"),
+        ("migration-descriptor.schema.json", "migration_descriptor"),
+        ("aggregate-state-package.schema.json", "aggregate_state_package"),
+    ],
+)
+def test_bundled_artifact_schemas_match_pinned_spec(name: str, kind: str) -> None:
+    root = _spec_root()
+    assert root is not None, "pinned specification is unavailable"
+    upstream = json.loads((root / "schema" / name).read_text(encoding="utf-8"))
+    assert artifact_schema(kind) == upstream
+
+
+@pytest.mark.parametrize(
+    "kind", ["aggregate_state", "migration_descriptor", "aggregate_state_package"]
+)
+def test_bundled_artifact_schema_is_valid_draft_2020_12(kind: str) -> None:
+    Draft202012Validator.check_schema(artifact_schema(kind))
 
 
 def test_bundled_schema_is_valid_draft_2020_12() -> None:
@@ -59,3 +87,17 @@ def test_authoritative_spec_examples_load_semantically(name: str) -> None:
 @pytest.mark.parametrize("case", core_cases(), ids=lambda case: case.name)
 def test_core_case(case: CoreCase) -> None:
     run_case(case)
+
+
+@pytest.mark.parametrize(
+    "case", persistence_vector_cases(core_cases()), ids=lambda case: case.name
+)
+def test_persistence_vectors(case: CoreCase) -> None:
+    run_persistence_vectors(case)
+
+
+@pytest.mark.parametrize(
+    "case", persistence_profile_cases(), ids=lambda case: case.name
+)
+def test_persistence_profile(case) -> None:
+    run_persistence_profile(case)

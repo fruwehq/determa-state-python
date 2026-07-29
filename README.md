@@ -4,9 +4,9 @@ Python implementation of [Determa State](https://github.com/fruwehq/determa-stat
 a language-agnostic statechart engine with a shared normative conformance suite.
 
 This pre-release implements Determa State `format: 1` at the approved specification
-commit `4bd4d9588d11b75d376380b6120676a056a4bc45`. Correctness is determined by the
-88-case core suite at conformance commit
-`ffbc65cbce49733803119a7dabf02a9727819ba8`.
+commit `1502a58a780d837e05bfacb37680dfc92e3488b5`. Correctness is determined by the
+110-case core suite and persistence profiles at conformance commit
+`707a49ce01c6f57f673c1959cdfe078bc8d0fc9a`.
 
 The package metadata is `0.0.7` for the next synchronized release of the specification,
 conformance suite, Python engine, and Rust engine.
@@ -121,6 +121,30 @@ the exact supplied state object.
 semantic validation path. Native values must satisfy the same portable Unicode and
 numeric domain as source documents.
 
+## Persist And Migrate
+
+`serialize_aggregate` produces the canonical §16 aggregate artifact. Restoration
+resolves its exact validated definition by fingerprint and fails closed when the
+definition is absent or untrusted:
+
+```python
+resolver = ds.MemoryArtifactResolver(definitions={bundle.fingerprint: bundle})
+encoded = ds.serialize_aggregate(bundle, state)
+restored = ds.restore_aggregate(encoded, resolver)
+```
+
+`restore_aggregate_package` verifies a self-contained transport package and seeds a
+mutable resolver without replacing existing content. `migrate_aggregate` applies an
+exact trusted descriptor route as a pure operation. `migrate_and_dispatch` returns one
+commit-ready migration, audit, dispatch, aggregate, and outbox-intent boundary. Failed
+migrations return a deterministic `MigrationFailure` and do not mutate the supplied
+artifact or resolver.
+
+Definition and descriptor resolvers are protocols, so applications can back them with
+an immutable registry or a transaction-local cache. Database schemas, broker
+acknowledgement, retries, and quarantine remain host responsibilities; the conformance
+persistence profile verifies the required transaction ordering.
+
 ## Implemented Core
 
 - strict format-1 loading, default materialization, bundle fingerprinting, and exact
@@ -133,13 +157,14 @@ numeric domain as source documents.
 - owned spawn, nominal instance references, binding, cancellation, completion,
   failure propagation, and cleanup cascades;
 - atomic RTC rollback, deterministic identities/counters, pure inspection, and
-  incompatible or malformed prior-state rejection.
+  incompatible or malformed prior-state rejection;
+- canonical aggregate serialization/restoration, portable typed values, package
+  attachments, exact definition resolution, trusted lazy migration, deterministic
+  audits, resource limits, and atomic migrate-and-dispatch results.
 
 Format 1 deliberately does not define native queues, timers, deferral, dead letters,
-stores, snapshot wire encoding, machine hot-swap/migration, package imports,
-standardized enabled-event inspection, or a standardized execution CLI. Hosts may
-persist the returned logical aggregate in their own transaction, but portable
-serialization and definition migration remain separate specification work.
+database schemas, package imports, standardized enabled-event inspection, or a
+standardized execution CLI.
 
 The implementation-local CLI only validates a bundle:
 
