@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Refresh the bundled JSON Schema from the approved immutable specification commit.
+"""Refresh bundled JSON Schemas from the approved immutable specification commit.
 
-Writes ``src/determa/state/data/machine.schema.json`` from Determa State's
-``schema/machine.schema.json`` at the format-1 pre-release pin, or from a local checkout
-via ``DETERMA_SPEC_DIR``. The schema-drift conformance test guards that they match.
+Writes the machine and persistence artifact schemas from Determa State's ``schema/``
+directory, or from a local checkout via ``DETERMA_SPEC_DIR``. Schema-drift conformance
+tests guard that all copies match.
 
 Usage: ``python scripts/sync_schema.py``  (or ``make sync-schema``).
 """
@@ -18,17 +18,23 @@ import urllib.request
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-DEST = ROOT / "src" / "determa" / "state" / "data" / "machine.schema.json"
-SPEC_COMMIT = "4bd4d9588d11b75d376380b6120676a056a4bc45"
+DEST = ROOT / "src" / "determa" / "state" / "data"
+SCHEMAS = (
+    "machine.schema.json",
+    "aggregate-state.schema.json",
+    "migration-descriptor.schema.json",
+    "aggregate-state-package.schema.json",
+)
+SPEC_COMMIT = "1502a58a780d837e05bfacb37680dfc92e3488b5"
 
 
-def _fetch() -> str:
+def _fetch(name: str) -> str:
     override = os.environ.get("DETERMA_SPEC_DIR")
     if override:
-        return (Path(override) / "schema" / "machine.schema.json").read_text(encoding="utf-8")
+        return (Path(override) / "schema" / name).read_text(encoding="utf-8")
     url = (
         "https://raw.githubusercontent.com/fruwehq/determa-state-spec/"
-        f"{SPEC_COMMIT}/schema/machine.schema.json"
+        f"{SPEC_COMMIT}/schema/{name}"
     )
     try:
         with urllib.request.urlopen(url, timeout=10) as response:  # noqa: S310 (fixed host)
@@ -38,13 +44,15 @@ def _fetch() -> str:
 
 
 def main() -> int:
-    text = _fetch()
-    json.loads(text)  # sanity check: valid JSON before overwriting
-    if DEST.read_text(encoding="utf-8") == text:
-        print(f"{DEST.relative_to(ROOT)} already up to date")
-        return 0
-    DEST.write_text(text, encoding="utf-8")
-    print(f"updated {DEST.relative_to(ROOT)}")
+    for name in SCHEMAS:
+        text = _fetch(name)
+        json.loads(text)
+        destination = DEST / name
+        if destination.read_text(encoding="utf-8") == text:
+            print(f"{destination.relative_to(ROOT)} already up to date")
+            continue
+        destination.write_text(text, encoding="utf-8")
+        print(f"updated {destination.relative_to(ROOT)}")
     return 0
 
 
