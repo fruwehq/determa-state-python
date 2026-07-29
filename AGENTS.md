@@ -11,11 +11,16 @@ package so it can coexist with the umbrella `determa` launcher.
 The implementation is conformant only when it passes the language-neutral suite.
 Format-1 work currently uses these immutable pre-release inputs:
 
-- specification: `4bd4d9588d11b75d376380b6120676a056a4bc45`;
-- conformance: `ffbc65cbce49733803119a7dabf02a9727819ba8` (88 core cases).
+- specification: `1502a58a780d837e05bfacb37680dfc92e3488b5`;
+- conformance: `707a49ce01c6f57f673c1959cdfe078bc8d0fc9a` (110 core cases plus
+  persistence profiles).
 
-The package metadata is `0.0.7` for the next synchronized release; the specification,
+The package metadata is `0.1.0` for the next synchronized release; the specification,
 conformance suite, Python engine, and Rust engine version together.
+
+Before this release is ready, replace the exact pre-release commit pins with and verify
+them against the real synchronized specification and conformance `v0.1.0` tags after
+those tags are created. Do not invent those tags or weaken pin checks.
 
 ## Boundaries
 

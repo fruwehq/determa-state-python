@@ -8,14 +8,14 @@ commit `1502a58a780d837e05bfacb37680dfc92e3488b5`. Correctness is determined by 
 110-case core suite and persistence profiles at conformance commit
 `707a49ce01c6f57f673c1959cdfe078bc8d0fc9a`.
 
-The package metadata is `0.0.7` for the next synchronized release of the specification,
+The package metadata is `0.1.0` for the next synchronized release of the specification,
 conformance suite, Python engine, and Rust engine.
 
 ## Install
 
-The published `0.0.6` distribution predates format 1. Until the synchronized `0.0.7`
-Determa State release is published, install this pre-release implementation from a
-checkout:
+The published `0.0.7` distribution predates portable persistence and definition
+migration. Until the synchronized `0.1.0` Determa State release is published, install
+this pre-release implementation from a checkout:
 
 ```sh
 git clone https://github.com/fruwehq/determa-state-python.git
@@ -190,6 +190,10 @@ pytest conformance -q
 Unit tests are hermetic and offline. The conformance harness uses the immutable commits
 listed above, cached under `.cache/`; local checkouts can be supplied with
 `DETERMA_CONFORMANCE_DIR` and `DETERMA_SPEC_DIR`.
+
+Before this release is ready, the exact pre-release specification and conformance
+commit pins must be replaced with and verified against the real synchronized `v0.1.0`
+tags after those tags are created.
 
 ## License
 

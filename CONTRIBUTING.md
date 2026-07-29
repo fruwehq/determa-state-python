@@ -56,7 +56,11 @@ behavior.
 
 `src/determa/state/__about__.py` is the single package version source. Determa State
 specification, conformance, Python, and Rust versions are synchronized. The package
-metadata is `0.0.7` for the next synchronized format 1 release.
+metadata is `0.1.0` for the next synchronized format 1 release.
+
+The current exact specification and conformance commit pins remain authoritative while
+the release is prepared. Before this release is ready, they must be replaced with and
+verified against the real synchronized `v0.1.0` tags after those tags are created.
 
 A `vX.Y.Z` tag triggers `release.yml` and publishes to PyPI through Trusted Publishing,
 gated by the manually approved `pypi` environment. Version bumps, tags, and publication
