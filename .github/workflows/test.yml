@@ -36,13 +36,13 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: fruwehq/determa-state-conformance
-          ref: 707a49ce01c6f57f673c1959cdfe078bc8d0fc9a
+          ref: 600523ca08c3b8a6ee790439a32dc4ce47f71b95
           path: .pinned/determa-state-conformance
       - name: Check out pinned specification
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: fruwehq/determa-state-spec
-          ref: 1502a58a780d837e05bfacb37680dfc92e3488b5
+          ref: c1635d74e6a216301a8986d37be8ce7e7111dfd7
           path: .pinned/determa-state-spec
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:

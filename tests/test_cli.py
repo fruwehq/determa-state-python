@@ -9,7 +9,7 @@ from determa.state.cli import main
 
 
 def test_version_matches_release_metadata() -> None:
-    assert __version__ == "0.0.7"
+    assert __version__ == "0.1.0"
 
 
 def test_validate_command_reports_fingerprint(tmp_path, capsys) -> None:

@@ -9,12 +9,13 @@ This is the Python implementation of Determa State. The distribution is
 package so it can coexist with the umbrella `determa` launcher.
 
 The implementation is conformant only when it passes the language-neutral suite.
-Format-1 work currently uses these immutable pre-release inputs:
+The synchronized 0.1.0 release uses these immutable inputs:
 
-- specification: `4bd4d9588d11b75d376380b6120676a056a4bc45`;
-- conformance: `ffbc65cbce49733803119a7dabf02a9727819ba8` (88 core cases).
+- specification: `c1635d74e6a216301a8986d37be8ce7e7111dfd7`;
+- conformance: `600523ca08c3b8a6ee790439a32dc4ce47f71b95` (110 core cases plus
+  persistence profiles).
 
-The package metadata is `0.0.7` for the next synchronized release; the specification,
+The package metadata is `0.1.0` for the next synchronized release; the specification,
 conformance suite, Python engine, and Rust engine version together.
 
 ## Boundaries

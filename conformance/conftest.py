@@ -1,4 +1,4 @@
-"""Fetch the immutable pre-release conformance and specification inputs."""
+"""Fetch the immutable synchronized conformance and specification inputs."""
 
 from __future__ import annotations
 
