@@ -27,6 +27,8 @@ from .errors import (
 from .host import (
     ExecutionHost,
     ExecutionHostError,
+    SharedExecutionTransaction,
+    StagedExecutionResult,
     creation_request_digest,
     delivery_request_digest,
     maintenance_migration_request_digest,
@@ -125,7 +127,9 @@ __all__ = [
     "SHARED_APPLICATION_TRANSACTION",
     "STANDARD_CAPABILITIES",
     "SchemaError",
+    "SharedExecutionTransaction",
     "SQLiteExecutionStore",
+    "StagedExecutionResult",
     "ValidationError",
     "__version__",
     "aggregate_envelope",

@@ -47,6 +47,11 @@ class ExecutionStoreError(DetermaError):
 class ExecutionStoreTransaction(ABC):
     """One exclusive or serializable transaction for a single root."""
 
+    @property
+    @abstractmethod
+    def root_instance_id(self) -> str:
+        """The exact root identity bound to this transaction."""
+
     @abstractmethod
     def load(self) -> bytes | None:
         """Read the current checkpoint bytes."""
@@ -73,32 +78,51 @@ class ExecutionStore(ABC):
     def capabilities(self) -> frozenset[str]:
         """Capabilities proved by this configured instance."""
 
+    @property
+    def checkpoint_retention_mode(self) -> str:
+        """Configured replay-retention mode used for profile validation."""
+        return "permanent"
+
     @abstractmethod
     def transaction(
         self,
         root_instance_id: str,
-        *,
-        native_transaction: Any | None = None,
     ) -> AbstractContextManager[ExecutionStoreTransaction]:
         """Open one root transaction."""
+
+    def shared_transaction(
+        self,
+        root_instance_id: str,
+    ) -> AbstractContextManager[tuple[Any, ExecutionStoreTransaction]]:
+        """Open one host-owned native transaction for application composition."""
+        del root_instance_id
+        raise ExecutionStoreError("adapter_capability_mismatch")
 
     @abstractmethod
     def setup_schema(self) -> None:
         """Explicitly create the adapter's storage schema."""
+
+    def validate_schema(self) -> None:
+        """Validate the configured adapter schema before durable host use."""
+        return None
 
     @abstractmethod
     def health(self) -> Mapping[str, Any]:
         """Return adapter health without mutating checkpoint storage."""
 
 
-def checkpoint_metadata(source: bytes) -> tuple[str, str]:
+def checkpoint_metadata(source: bytes) -> tuple[str, str, str]:
     """Extract CAS metadata from structurally closed checkpoint bytes."""
     try:
         document, _ = strict_json(source)
+        root_instance_id = document["root_instance_id"]
         revision = document["revision"]
         digest = document["execution_checkpoint_digest"]
     except (ArtifactError, KeyError, TypeError) as exc:
         raise ExecutionStoreError("invalid_execution_checkpoint") from exc
-    if not isinstance(revision, str) or not isinstance(digest, str):
+    if not all(
+        isinstance(value, str)
+        for value in (root_instance_id, revision, digest)
+    ):
         raise ExecutionStoreError("invalid_execution_checkpoint")
-    return revision, digest
+    return root_instance_id, revision, digest

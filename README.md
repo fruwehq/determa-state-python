@@ -5,8 +5,8 @@ a language-agnostic statechart engine with a shared normative conformance suite.
 
 This release implements Determa State `format: 1` at the synchronized specification
 commit `318ef1f16ae024770090bd338c8b70056df2855b`. Correctness is determined by the
-110-case core suite, persistence profiles, and 83-vector execution-checkpoint profile
-at conformance commit `c6637066c1923e451edad62b7dc2ae73babfbec0`.
+110-case core suite, persistence profiles, and 85-vector execution-checkpoint profile
+at conformance commit `86cb08a98267371b96b8f4908409aee022e4b4fe`.
 
 The package metadata is `0.1.0` for the next synchronized release of the specification,
 conformance suite, Python engine, and Rust engine.
@@ -175,8 +175,43 @@ checkpoint = host.read_checkpoint("counter-42").document
 `MemoryExecutionStore` is ephemeral. `FileExecutionStore` provides locked atomic
 replacement and restart persistence only. SQLite advertises durable single-writer
 storage only with its verified transaction, journal, and synchronization settings.
-The optional PostgreSQL adapter provides concurrent CAS and can join a caller-owned
-native transaction. File and database schema setup is never implicit.
+The optional PostgreSQL adapter provides concurrent CAS and host-owned shared
+application transactions. Every store transaction is bound to one exact root.
+
+SQLite and PostgreSQL accept explicit `replay_retention="permanent"` and
+`outbox_retention="strict" | "compact"` configuration. These settings add only the
+retention capabilities they actually enforce. `ExecutionHost` validates required
+capabilities and composed profiles against the injected store:
+
+```python
+store = ds.SQLiteExecutionStore(
+    "bank.db",
+    replay_retention="permanent",
+    outbox_retention="strict",
+)
+store.setup_schema()
+host = ds.ExecutionHost(
+    store,
+    resolver,
+    required_capabilities={
+        ds.DURABLE_SINGLE_WRITER,
+        ds.ROOT_IDENTITY_RETENTION,
+        ds.PERMANENT_RECEIPT_RETENTION,
+    },
+    profile="exactly_once_committed_processing",
+)
+```
+
+For PostgreSQL application composition, `run_shared_transaction` opens and owns one
+native transaction. Its callback receives the Psycopg connection plus a root-bound
+staging surface for exactly one host operation. That operation returns only
+`StagedExecutionResult`; the portable committed or pending response is returned by
+`run_shared_transaction` after the native transaction commits. Callback failure rolls
+back both application writes and checkpoint work.
+
+File and database schema setup is never implicit. SQLite and PostgreSQL validate an
+explicit schema version and the exact required tables, columns, types, nullability,
+primary keys, indexes, and triggers before checkpoint use.
 
 `ExecutionStoreRegistry` starts empty. `register_bundled_execution_stores` registers
 `memory`, `file`, `sqlite`, and `postgresql` through the same public operation used by

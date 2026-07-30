@@ -23,6 +23,7 @@ from .wire import (
 )
 
 _DECIMAL = re.compile(r"(?:0|[1-9][0-9]*)\Z")
+_MAX_DECIMAL_DIGITS = 4096
 
 
 @dataclass(frozen=True)
@@ -76,9 +77,16 @@ def validate_execution_checkpoint_member(name: str, value: Any) -> bool:
 
 
 def _decimal(value: Any) -> int:
-    if not isinstance(value, str) or _DECIMAL.fullmatch(value) is None:
+    if (
+        not isinstance(value, str)
+        or len(value) > _MAX_DECIMAL_DIGITS
+        or _DECIMAL.fullmatch(value) is None
+    ):
         raise _invalid()
-    return int(value)
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise _invalid() from exc
 
 
 def _ordered_unique(values: list[int]) -> bool:
@@ -427,15 +435,64 @@ def _validate_audit_and_root(
         ):
             raise _invalid()
 
+    final_digest = (
+        root_record["final_aggregate_state_digest"]
+        if root_record["status"] == "tombstone"
+        else root_record["aggregate_state"]["aggregate_state_digest"]
+    )
+    retention = document["replay_retention"]
+    cutoff = retention["pruned_through_receipt_sequence"]
+    last_receipt = document["operation_receipts"][-1]
+    has_final_receipt_evidence = (
+        cutoff is None or last_receipt["receipt_sequence"] != "0"
+    )
+    if (
+        has_final_receipt_evidence
+        and last_receipt["resulting_aggregate_state_digest"] != final_digest
+    ):
+        raise _invalid()
+
+    status_evidence = next(
+        (
+            receipt
+            for receipt in reversed(document["operation_receipts"])
+            if receipt["operation_kind"] in {"creation", "delivery"}
+        ),
+        None,
+    )
+    if (
+        status_evidence is None
+        or (
+            cutoff is not None
+            and status_evidence["receipt_sequence"] == "0"
+        )
+    ):
+        return
+    if status_evidence["operation_kind"] == "creation":
+        status = status_evidence["status"]
+        fault = status_evidence["fault"]
+    else:
+        status = status_evidence["outcome"]["status"]
+        fault = status_evidence["outcome"]["fault"]
+
     if root_record["status"] == "tombstone":
-        final_digest = document["operation_receipts"][-1][
-            "resulting_aggregate_state_digest"
-        ]
-        if root_record["final_aggregate_state_digest"] != final_digest:
+        if status != root_record["terminal_status"]:
             raise _invalid()
-    elif (
-        root_record["aggregate_state"]["aggregate_state_digest"]
-        != document["operation_receipts"][-1]["resulting_aggregate_state_digest"]
+        return
+
+    aggregate = root_record["aggregate_state"]
+    root_runtime = next(
+        (
+            runtime
+            for runtime in aggregate["runtimes"]
+            if runtime["runtime_id"] == aggregate["root_runtime_id"]
+        ),
+        None,
+    )
+    if (
+        root_runtime is None
+        or root_runtime["status"] != status
+        or root_runtime["fault"] != fault
     ):
         raise _invalid()
 

@@ -46,7 +46,7 @@ def _spec_root() -> Path | None:
 def test_suite_present() -> None:
     assert CORE_DIR.exists(), "pinned conformance suite is unavailable"
     assert len(core_cases()) == 110
-    assert len(execution_checkpoint_vectors()) == 83
+    assert len(execution_checkpoint_vectors()) == 85
 
 
 def test_bundled_schema_matches_pinned_spec() -> None:

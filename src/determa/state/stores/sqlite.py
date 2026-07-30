@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -10,7 +11,10 @@ from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from .base import (
+    COMPACT_EFFECT_IDENTITY_RETENTION,
     DURABLE_SINGLE_WRITER,
+    PERMANENT_OUTBOX_TERMINAL_RETENTION,
+    PERMANENT_RECEIPT_RETENTION,
     ROOT_IDENTITY_RETENTION,
     ExecutionStore,
     ExecutionStoreError,
@@ -19,8 +23,17 @@ from .base import (
 )
 
 _TABLE = "determa_execution_checkpoints"
+_METADATA_TABLE = "determa_execution_store_metadata"
 _JOURNAL_MODES = {"DELETE", "WAL"}
 _SYNCHRONOUS_MODES = {"FULL"}
+_REPLAY_RETENTION_MODES = {"bounded", "permanent"}
+_OUTBOX_RETENTION_MODES = {"none", "strict", "compact"}
+_SCHEMA_KEY = "execution_checkpoint"
+_SCHEMA_VERSION = 1
+
+
+def _schema_tokens(source: str) -> list[str]:
+    return re.findall(r"[a-z_][a-z0-9_]*|[(),]", source.lower())
 
 
 class _SQLiteTransaction(ExecutionStoreTransaction):
@@ -30,6 +43,10 @@ class _SQLiteTransaction(ExecutionStoreTransaction):
         self._connection = connection
         self._root_instance_id = root_instance_id
 
+    @property
+    def root_instance_id(self) -> str:
+        return self._root_instance_id
+
     def load(self) -> bytes | None:
         row = self._connection.execute(
             f"SELECT checkpoint FROM {_TABLE} WHERE root_instance_id = ?",
@@ -38,7 +55,9 @@ class _SQLiteTransaction(ExecutionStoreTransaction):
         return None if row is None else bytes(row[0])
 
     def insert(self, checkpoint: bytes) -> bool:
-        revision, digest = checkpoint_metadata(checkpoint)
+        root_instance_id, revision, digest = checkpoint_metadata(checkpoint)
+        if root_instance_id != self._root_instance_id:
+            raise ExecutionStoreError("transaction_root_mismatch")
         try:
             self._connection.execute(
                 f"""
@@ -58,7 +77,9 @@ class _SQLiteTransaction(ExecutionStoreTransaction):
         expected_checkpoint_digest: str,
         checkpoint: bytes,
     ) -> bool:
-        revision, digest = checkpoint_metadata(checkpoint)
+        root_instance_id, revision, digest = checkpoint_metadata(checkpoint)
+        if root_instance_id != self._root_instance_id:
+            raise ExecutionStoreError("transaction_root_mismatch")
         cursor = self._connection.execute(
             f"""
             UPDATE {_TABLE}
@@ -89,23 +110,40 @@ class SQLiteExecutionStore(ExecutionStore):
         journal_mode: str = "WAL",
         synchronous: str = "FULL",
         timeout: float = 30.0,
+        replay_retention: str = "bounded",
+        outbox_retention: str = "none",
     ) -> None:
         self.path = str(path)
         self.journal_mode = journal_mode.upper()
         self.synchronous = synchronous.upper()
         self.timeout = timeout
+        self.replay_retention = replay_retention
+        self.outbox_retention = outbox_retention
         if (
             not self.path
             or self.path == ":memory:"
             or self.journal_mode not in _JOURNAL_MODES
             or self.synchronous not in _SYNCHRONOUS_MODES
             or timeout <= 0
+            or replay_retention not in _REPLAY_RETENTION_MODES
+            or outbox_retention not in _OUTBOX_RETENTION_MODES
         ):
             raise ExecutionStoreError("invalid_adapter_configuration")
 
     @property
     def capabilities(self) -> frozenset[str]:
-        return frozenset({DURABLE_SINGLE_WRITER, ROOT_IDENTITY_RETENTION})
+        capabilities = {DURABLE_SINGLE_WRITER, ROOT_IDENTITY_RETENTION}
+        if self.replay_retention == "permanent":
+            capabilities.add(PERMANENT_RECEIPT_RETENTION)
+        if self.outbox_retention == "strict":
+            capabilities.add(PERMANENT_OUTBOX_TERMINAL_RETENTION)
+        elif self.outbox_retention == "compact":
+            capabilities.add(COMPACT_EFFECT_IDENTITY_RETENTION)
+        return frozenset(capabilities)
+
+    @property
+    def checkpoint_retention_mode(self) -> str:
+        return self.replay_retention
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
@@ -127,27 +165,116 @@ class SQLiteExecutionStore(ExecutionStore):
             raise ExecutionStoreError("invalid_adapter_configuration")
         return connection
 
+    def _validate_table(
+        self,
+        connection: sqlite3.Connection,
+        table: str,
+        expected_columns: list[tuple[str, str, int, Any, int, int]],
+        expected_sql: str,
+    ) -> None:
+        columns = [
+            (row[1], str(row[2]).upper(), row[3], row[4], row[5], row[6])
+            for row in connection.execute(f"PRAGMA table_xinfo({table})")
+        ]
+        if columns != expected_columns:
+            raise ExecutionStoreError("execution_store_schema_mismatch")
+        schema_row = connection.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+            (table,),
+        ).fetchone()
+        if (
+            schema_row is None
+            or not isinstance(schema_row[0], str)
+            or _schema_tokens(schema_row[0]) != _schema_tokens(expected_sql)
+        ):
+            raise ExecutionStoreError("execution_store_schema_mismatch")
+        indexes = [
+            (row[2], row[3], row[4])
+            for row in connection.execute(f"PRAGMA index_list({table})")
+        ]
+        if indexes != [(1, "pk", 0)]:
+            raise ExecutionStoreError("execution_store_schema_mismatch")
+        foreign_keys = connection.execute(
+            f"PRAGMA foreign_key_list({table})"
+        ).fetchall()
+        triggers = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?",
+            (table,),
+        ).fetchone()
+        if foreign_keys or triggers is not None:
+            raise ExecutionStoreError("execution_store_schema_mismatch")
+
+    def _validate_schema(self, connection: sqlite3.Connection) -> None:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?, ?)",
+                (_TABLE, _METADATA_TABLE),
+            )
+        }
+        if not tables:
+            raise ExecutionStoreError("execution_store_schema_unavailable")
+        if tables != {_TABLE, _METADATA_TABLE}:
+            raise ExecutionStoreError("execution_store_schema_mismatch")
+        self._validate_table(
+            connection,
+            _TABLE,
+            [
+                ("root_instance_id", "TEXT", 1, None, 1, 0),
+                ("revision", "TEXT", 1, None, 0, 0),
+                ("checkpoint_digest", "TEXT", 1, None, 0, 0),
+                ("checkpoint", "BLOB", 1, None, 0, 0),
+            ],
+            f"""
+            CREATE TABLE {_TABLE} (
+                root_instance_id TEXT PRIMARY KEY NOT NULL,
+                revision TEXT NOT NULL,
+                checkpoint_digest TEXT NOT NULL,
+                checkpoint BLOB NOT NULL
+            )
+            """,
+        )
+        self._validate_table(
+            connection,
+            _METADATA_TABLE,
+            [
+                ("schema_key", "TEXT", 1, None, 1, 0),
+                ("schema_version", "INTEGER", 1, None, 0, 0),
+            ],
+            f"""
+            CREATE TABLE {_METADATA_TABLE} (
+                schema_key TEXT PRIMARY KEY NOT NULL,
+                schema_version INTEGER NOT NULL
+            )
+            """,
+        )
+        rows = connection.execute(
+            f"SELECT schema_key, schema_version FROM {_METADATA_TABLE}"
+        ).fetchall()
+        if rows != [(_SCHEMA_KEY, _SCHEMA_VERSION)]:
+            raise ExecutionStoreError("execution_store_schema_mismatch")
+
+    def validate_schema(self) -> None:
+        connection = self._connect()
+        try:
+            self._validate_schema(connection)
+        finally:
+            connection.close()
+
     @contextmanager
     def transaction(
         self,
         root_instance_id: str,
-        *,
-        native_transaction: Any | None = None,
     ) -> Iterator[ExecutionStoreTransaction]:
-        if native_transaction is not None:
-            raise ValueError("sqlite does not expose shared application transactions")
         connection = self._connect()
         try:
+            self._validate_schema(connection)
             connection.execute("BEGIN IMMEDIATE")
             transaction = _SQLiteTransaction(connection, root_instance_id)
             yield transaction
             connection.commit()
-        except sqlite3.OperationalError as exc:
+        except sqlite3.OperationalError:
             connection.rollback()
-            if "no such table" in str(exc):
-                raise ExecutionStoreError(
-                    "execution_store_schema_unavailable"
-                ) from exc
             raise
         except BaseException:
             connection.rollback()
@@ -159,16 +286,39 @@ class SQLiteExecutionStore(ExecutionStore):
         connection = self._connect()
         try:
             connection.execute("BEGIN IMMEDIATE")
-            connection.execute(
-                f"""
-                CREATE TABLE IF NOT EXISTS {_TABLE} (
-                    root_instance_id TEXT PRIMARY KEY NOT NULL,
-                    revision TEXT NOT NULL,
-                    checkpoint_digest TEXT NOT NULL,
-                    checkpoint BLOB NOT NULL
+            tables = {
+                row[0]
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'table' AND name IN (?, ?)",
+                    (_TABLE, _METADATA_TABLE),
                 )
-                """
-            )
+            }
+            if not tables:
+                connection.execute(
+                    f"""
+                    CREATE TABLE {_METADATA_TABLE} (
+                        schema_key TEXT PRIMARY KEY NOT NULL,
+                        schema_version INTEGER NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    f"""
+                    CREATE TABLE {_TABLE} (
+                        root_instance_id TEXT PRIMARY KEY NOT NULL,
+                        revision TEXT NOT NULL,
+                        checkpoint_digest TEXT NOT NULL,
+                        checkpoint BLOB NOT NULL
+                    )
+                    """
+                )
+                connection.execute(
+                    f"INSERT INTO {_METADATA_TABLE} (schema_key, schema_version) "
+                    "VALUES (?, ?)",
+                    (_SCHEMA_KEY, _SCHEMA_VERSION),
+                )
+            self._validate_schema(connection)
             connection.commit()
         except BaseException:
             connection.rollback()
@@ -179,15 +329,13 @@ class SQLiteExecutionStore(ExecutionStore):
     def health(self) -> Mapping[str, Any]:
         try:
             connection = self._connect()
-            row = connection.execute(
-                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-                (_TABLE,),
-            ).fetchone()
-            connection.close()
+            try:
+                self._validate_schema(connection)
+            finally:
+                connection.close()
         except (OSError, sqlite3.Error, ExecutionStoreError):
             return {"healthy": False, "schema_ready": False}
-        ready = row is not None
-        return {"healthy": ready, "schema_ready": ready}
+        return {"healthy": True, "schema_ready": True, "schema_version": 1}
 
 
 def _single_query(query: Mapping[str, list[str]], key: str, default: str) -> str:
@@ -215,11 +363,19 @@ def sqlite_execution_store_factory(
     if not path or not Path(path).is_absolute():
         raise ExecutionStoreError("invalid_adapter_configuration")
     query = parse_qs(parsed.query, keep_blank_values=True)
-    if set(query) - {"journal_mode", "synchronous", "timeout"}:
+    if set(query) - {
+        "journal_mode",
+        "synchronous",
+        "timeout",
+        "replay_retention",
+        "outbox_retention",
+    }:
         raise ExecutionStoreError("invalid_adapter_configuration")
     journal_mode = _single_query(query, "journal_mode", "WAL")
     synchronous = _single_query(query, "synchronous", "FULL")
     timeout_text = _single_query(query, "timeout", "30")
+    replay_retention = _single_query(query, "replay_retention", "bounded")
+    outbox_retention = _single_query(query, "outbox_retention", "none")
     try:
         timeout = float(timeout_text)
     except ValueError as exc:
@@ -229,4 +385,6 @@ def sqlite_execution_store_factory(
         journal_mode=journal_mode,
         synchronous=synchronous,
         timeout=timeout,
+        replay_retention=replay_retention,
+        outbox_retention=outbox_retention,
     )

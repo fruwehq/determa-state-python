@@ -18,16 +18,12 @@ from determa.state import (
     ExecutionStore,
     ExecutionStoreError,
     ExecutionStoreRegistry,
-    FileExecutionStore,
     MemoryArtifactResolver,
     MemoryExecutionStore,
-    PostgreSQLExecutionStore,
-    SQLiteExecutionStore,
     load_bundle,
-    memory_execution_store_factory,
+    register_bundled_execution_stores,
     restore_execution_checkpoint,
     serialize_execution_checkpoint,
-    validate_host_profile,
 )
 
 from .harness import conformance_root
@@ -222,20 +218,25 @@ def _invoke_host(
 
 
 class _StaticStore(ExecutionStore):
-    def __init__(self, capabilities: list[str]) -> None:
+    def __init__(
+        self, capabilities: list[str], checkpoint_retention_mode: str = "permanent"
+    ) -> None:
         self._capabilities = frozenset(capabilities)
+        self._checkpoint_retention_mode = checkpoint_retention_mode
 
     @property
     def capabilities(self) -> frozenset[str]:
         return self._capabilities
 
+    @property
+    def checkpoint_retention_mode(self) -> str:
+        return self._checkpoint_retention_mode
+
     def transaction(
         self,
         root_instance_id: str,
-        *,
-        native_transaction: Any | None = None,
     ) -> Any:
-        del root_instance_id, native_transaction
+        del root_instance_id
         raise AssertionError("profile-only store must not process roots")
 
     def setup_schema(self) -> None:
@@ -253,12 +254,11 @@ def _adapter_operation(vector: dict[str, Any]) -> dict[str, Any]:
     capabilities = vector.get("advertised_capabilities", [])
     requested = set(vector.get("requested_capabilities", []))
     if operation == "validate_host_profile":
-        if not requested.issubset(capabilities):
-            raise ExecutionHostError("adapter_capability_mismatch")
-        validate_host_profile(
-            frozenset(capabilities),
-            vector["host_profile"],
-            checkpoint_retention_mode=vector["checkpoint_retention_mode"],
+        ExecutionHost(
+            _StaticStore(capabilities, vector["checkpoint_retention_mode"]),
+            MemoryArtifactResolver(),
+            required_capabilities=requested,
+            profile=vector["host_profile"],
             host_features=frozenset(vector["host_features"]),
         )
         return {"result": "accepted"}
@@ -274,52 +274,107 @@ def _adapter_operation(vector: dict[str, Any]) -> dict[str, Any]:
 
     if operation == "register_adapter":
         if identifier == "memory":
-            registry.register(identifier, memory_execution_store_factory)
-            registry.resolve(
+            register_bundled_execution_stores(registry)
+            store = registry.resolve(
                 "memory:", required_capabilities=frozenset(requested)
             )
+            assert store.capabilities == frozenset(capabilities)
         else:
             registry.register(identifier, static_factory)
             registry.register(identifier, static_factory)
         return {"result": "accepted"}
 
-    def bundled_factory(
-        _uri: str, _configuration: dict[str, Any]
-    ) -> ExecutionStore:
-        if identifier == "memory":
-            return MemoryExecutionStore()
-        if identifier == "file":
-            return FileExecutionStore("/tmp/unused")
-        if identifier == "sqlite":
-            return SQLiteExecutionStore("/tmp/unused.sqlite")
-        if identifier == "postgresql":
-            return PostgreSQLExecutionStore("postgresql://unused")
-        return static_factory(_uri, _configuration)
-
-    factory = bundled_factory
     uri = {
         "memory": "memory:",
         "file": "file:///tmp/unused",
         "sqlite": "sqlite:///tmp/unused.sqlite",
         "postgresql": "postgresql://unused",
     }.get(identifier, f"{identifier}:")
-    if identifier != "absent-store":
-        registry.register(identifier, factory)
-    registry.resolve(uri, required_capabilities=frozenset(requested))
+    if vector["registration_source"] == "bundled":
+        register_bundled_execution_stores(registry)
+    elif identifier != "absent-store":
+        registry.register(identifier, static_factory)
+    store = registry.resolve(uri, required_capabilities=frozenset(requested))
+    assert store.capabilities == frozenset(capabilities)
     return {"result": "accepted"}
 
 
-def _assert_response(vector: dict[str, Any], response: dict[str, Any]) -> None:
+def _expected_response(
+    vector: dict[str, Any],
+    checkpoint: dict[str, Any] | None,
+    request: dict[str, Any],
+) -> dict[str, Any]:
     expected = vector["expect"]
-    assert response["result"] == expected["result"]
-    if "receipt_sequence" in expected and "receipt" in response:
-        assert response["receipt"]["receipt_sequence"] == expected["receipt_sequence"]
-    if "delivery_sequence" in expected:
-        assert response["delivery_sequence"] == expected["delivery_sequence"]
-    if "accepted_revision" in expected:
-        assert response["accepted_revision"] == expected["accepted_revision"]
-    if "code" in expected:
-        assert response["failure"]["code"] == expected["code"]
+    result = expected["result"]
+    if result in {"failure", "response_lost", "not_accepted", "unsupported"}:
+        return {"result": result, "failure": {"code": expected["code"]}}
+    if result == "accepted":
+        return {"result": "accepted"}
+    assert checkpoint is not None
+    if result == "pending":
+        pending = next(
+            item
+            for item in checkpoint["pending_deliveries"]
+            if item["delivery_sequence"] == expected["delivery_sequence"]
+        )
+        return {
+            "result": "pending",
+            "event_id": pending["envelope"]["event_id"],
+            "delivery_sequence": pending["delivery_sequence"],
+            "accepted_revision": pending["accepted_revision"],
+        }
+    if result == "tombstoned":
+        return {
+            "result": "tombstoned",
+            "tombstone": copy.deepcopy(checkpoint["root_record"]),
+        }
+    assert result == "committed"
+    operation = vector["operation"]
+    if "receipt_sequence" in expected:
+        receipt = next(
+            item
+            for item in checkpoint["operation_receipts"]
+            if item["receipt_sequence"] == expected["receipt_sequence"]
+        )
+        return {"result": "committed", "receipt": copy.deepcopy(receipt)}
+    if operation == "update_pending_outbox":
+        record = next(
+            item
+            for item in checkpoint["pending_outbox_intents"]
+            if item["intent"]["effect_id"] == request["effect_id"]
+        )
+        return {"result": "committed", "record": copy.deepcopy(record)}
+    if operation == "terminalize_outbox":
+        records = [
+            *checkpoint["terminal_outbox_records"],
+            *checkpoint["outbox_effect_tombstones"],
+        ]
+        record = next(
+            item
+            for item in records
+            if (
+                item["intent"]["effect_id"]
+                if "intent" in item
+                else item["effect_id"]
+            )
+            == request["effect_id"]
+        )
+        return {"result": "committed", "record": copy.deepcopy(record)}
+    if operation == "compact_outbox":
+        record = next(
+            item
+            for item in checkpoint["outbox_effect_tombstones"]
+            if item["effect_id"] == request["effect_id"]
+        )
+        return {"result": "committed", "record": copy.deepcopy(record)}
+    if operation == "update_replay_retention":
+        return {
+            "result": "committed",
+            "replay_retention": copy.deepcopy(checkpoint["replay_retention"]),
+        }
+    if operation == "delete_outbox_record":
+        return {"result": "committed"}
+    raise AssertionError(f"no exact response projection for {operation}")
 
 
 def run_execution_checkpoint_vector(item: ExecutionCheckpointVector) -> None:
@@ -338,7 +393,7 @@ def run_execution_checkpoint_vector(item: ExecutionCheckpointVector) -> None:
             response = _adapter_operation(vector)
         except (ExecutionHostError, ExecutionStoreError) as exc:
             response = {"result": "failure", "failure": {"code": exc.code}}
-        _assert_response(vector, response)
+        assert response == _expected_response(vector, None, {})
         return
 
     initial = {}
@@ -415,14 +470,13 @@ def run_execution_checkpoint_vector(item: ExecutionCheckpointVector) -> None:
             host_module.core_dispatch,
             host_module.migrate_aggregate,
         ) = originals
-    _assert_response(vector, response)
-    assert calls == ([] if expected["core_call"] == "none" else [expected["core_call"]])
-
     restored = host.read_checkpoint(root_instance_id)
     actual_checkpoint = None if restored is None else restored.document
     expected_checkpoint = (
         None if after_name is None else _json(case.path / after_name)
     )
+    assert response == _expected_response(vector, expected_checkpoint, request)
+    assert calls == ([] if expected["core_call"] == "none" else [expected["core_call"]])
     assert actual_checkpoint == expected_checkpoint
 
 

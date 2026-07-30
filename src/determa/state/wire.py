@@ -25,6 +25,7 @@ SHA256_PREFIX = "sha256:"
 _DATA = Path(__file__).parent / "data"
 _INT_MIN = -(2**63)
 _INT_MAX = 2**63 - 1
+_MAX_DECIMAL_DIGITS = 4096
 
 
 class DefinitionResolver(Protocol):
@@ -291,9 +292,18 @@ def _signed_decimal(value: str) -> int:
         return 0
     negative = value.startswith("-")
     digits = value[1:] if negative else value
-    if not digits or not digits.isascii() or not digits.isdigit() or digits.startswith("0"):
+    if (
+        not digits
+        or len(digits) > _MAX_DECIMAL_DIGITS
+        or not digits.isascii()
+        or not digits.isdigit()
+        or digits.startswith("0")
+    ):
         raise ArtifactError("invalid_aggregate_state")
-    return int(value)
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ArtifactError("invalid_aggregate_state") from exc
 
 
 def decimal(value: Any, *, positive: bool = False) -> int:

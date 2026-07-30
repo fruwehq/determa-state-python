@@ -12,8 +12,8 @@ The implementation is conformant only when it passes the language-neutral suite.
 The synchronized 0.1.0 release uses these immutable inputs:
 
 - specification: `318ef1f16ae024770090bd338c8b70056df2855b`;
-- conformance: `c6637066c1923e451edad62b7dc2ae73babfbec0` (110 core cases,
-  persistence profiles, and the 83-vector execution-checkpoint profile).
+- conformance: `86cb08a98267371b96b8f4908409aee022e4b4fe` (110 core cases,
+  persistence profiles, and the 85-vector execution-checkpoint profile).
 
 The package metadata is `0.1.0` for the next synchronized release; the specification,
 conformance suite, Python engine, and Rust engine version together.
@@ -55,6 +55,11 @@ Layout:
 - Preserve lazy CEL and JSON Schema imports where practical.
 - Preserve lazy Psycopg import and explicit file/database schema setup. Never add
   checkpoint or root-marker deletion.
+- Every execution-store transaction is root-bound. Shared application transactions
+  use the host-owned callback API; never expose raw native/store transaction injection
+  on portable host operations or return committed/pending responses before commit.
+- Durable and retention profile checks use the configured store instance. SQLite and
+  PostgreSQL schema health requires the exact explicit schema version and shape.
 
 ## Gates
 

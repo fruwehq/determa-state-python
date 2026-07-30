@@ -23,7 +23,8 @@ _SCHEMA_MARKER = ".determa-execution-store-v1"
 
 
 class _FileTransaction(ExecutionStoreTransaction):
-    def __init__(self, checkpoint_path: Path) -> None:
+    def __init__(self, root_instance_id: str, checkpoint_path: Path) -> None:
+        self._root_instance_id = root_instance_id
         self._checkpoint_path = checkpoint_path
         self._current: bytes | None
         try:
@@ -32,10 +33,17 @@ class _FileTransaction(ExecutionStoreTransaction):
             self._current = None
         self._candidate: bytes | None = self._current
 
+    @property
+    def root_instance_id(self) -> str:
+        return self._root_instance_id
+
     def load(self) -> bytes | None:
         return self._current
 
     def insert(self, checkpoint: bytes) -> bool:
+        root_instance_id, _, _ = checkpoint_metadata(checkpoint)
+        if root_instance_id != self._root_instance_id:
+            raise ExecutionStoreError("transaction_root_mismatch")
         if self._current is not None:
             return False
         self._candidate = bytes(checkpoint)
@@ -49,7 +57,14 @@ class _FileTransaction(ExecutionStoreTransaction):
     ) -> bool:
         if self._current is None:
             return False
-        if checkpoint_metadata(self._current) != (
+        root_instance_id, revision, digest = checkpoint_metadata(self._current)
+        candidate_root, _, _ = checkpoint_metadata(checkpoint)
+        if (
+            root_instance_id != self._root_instance_id
+            or candidate_root != self._root_instance_id
+        ):
+            raise ExecutionStoreError("transaction_root_mismatch")
+        if (revision, digest) != (
             expected_revision,
             expected_checkpoint_digest,
         ):
@@ -106,11 +121,7 @@ class FileExecutionStore(ExecutionStore):
     def transaction(
         self,
         root_instance_id: str,
-        *,
-        native_transaction: Any | None = None,
     ) -> Iterator[ExecutionStoreTransaction]:
-        if native_transaction is not None:
-            raise ValueError("file does not accept a native transaction")
         self._require_schema()
         import fcntl
 
@@ -121,7 +132,7 @@ class FileExecutionStore(ExecutionStore):
         with lock_path.open("a+b") as lock:
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             try:
-                transaction = _FileTransaction(checkpoint_path)
+                transaction = _FileTransaction(root_instance_id, checkpoint_path)
                 yield transaction
                 transaction.commit()
             finally:
