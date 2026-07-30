@@ -311,6 +311,7 @@ def artifact_schema(kind: str) -> dict[str, Any]:
         "aggregate_state": "aggregate-state.schema.json",
         "migration_descriptor": "migration-descriptor.schema.json",
         "aggregate_state_package": "aggregate-state-package.schema.json",
+        "execution_checkpoint": "execution-checkpoint.schema.json",
     }[kind]
     return cast(
         dict[str, Any], json.loads((_DATA / filename).read_text(encoding="utf-8"))
@@ -326,6 +327,7 @@ def _schema_registry() -> Any:
         "aggregate_state",
         "migration_descriptor",
         "aggregate_state_package",
+        "execution_checkpoint",
     ):
         document = artifact_schema(kind)
         registry = registry.with_resource(
@@ -362,6 +364,14 @@ def _format_code(document: Any, kind: str) -> str | None:
             "unsupported_aggregate_state_package_format",
             "unsupported_aggregate_state_package_schema_version",
         ),
+        "execution_checkpoint": (
+            "execution_checkpoint_format",
+            "determa.execution_checkpoint",
+            "execution_checkpoint_schema_version",
+            1,
+            "unsupported_execution_checkpoint_format",
+            "unsupported_execution_checkpoint_schema_version",
+        ),
     }
     format_member, expected_format, version_member, expected_version, format_code, version_code = (
         definitions[kind]
@@ -384,6 +394,7 @@ def load_json_artifact(
             "aggregate_state": "invalid_aggregate_state",
             "migration_descriptor": "invalid_migration_descriptor",
             "aggregate_state_package": "invalid_aggregate_state_package",
+            "execution_checkpoint": "invalid_execution_checkpoint",
         }[kind]
         raise ArtifactError(code) from exc
     unsupported = _format_code(document, kind)
@@ -399,6 +410,7 @@ def load_json_artifact(
             "aggregate_state": "invalid_aggregate_state",
             "migration_descriptor": "invalid_migration_descriptor",
             "aggregate_state_package": "invalid_aggregate_state_package",
+            "execution_checkpoint": "invalid_execution_checkpoint",
         }[kind]
         raise ArtifactError(code)
     return document, raw

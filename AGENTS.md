@@ -11,27 +11,31 @@ package so it can coexist with the umbrella `determa` launcher.
 The implementation is conformant only when it passes the language-neutral suite.
 The synchronized 0.1.0 release uses these immutable inputs:
 
-- specification: `c1635d74e6a216301a8986d37be8ce7e7111dfd7`;
-- conformance: `600523ca08c3b8a6ee790439a32dc4ce47f71b95` (110 core cases plus
-  persistence profiles).
+- specification: `318ef1f16ae024770090bd338c8b70056df2855b`;
+- conformance: `c6637066c1923e451edad62b7dc2ae73babfbec0` (110 core cases,
+  persistence profiles, and the 83-vector execution-checkpoint profile).
 
 The package metadata is `0.1.0` for the next synchronized release; the specification,
 conformance suite, Python engine, and Rust engine version together.
 
 ## Boundaries
 
-The implemented public API is `load_bundle`, `create`, and `dispatch`, plus validation
-and error types exported by `determa.state`. It implements the exact `format: 1`
+The pure public API remains `load_bundle`, `create`, and `dispatch`, plus validation
+and error types exported by `determa.state`. The optional synchronous `ExecutionHost`
+and execution-store APIs wrap that core without changing its exact `format: 1`
 grammar. Do not restore abandoned draft field names or compatibility aliases.
 
 The core is a pure foreground transform over one root ownership aggregate. It has no
-hidden queues, timers, stores, snapshots, migration, enabled-event inspection, or
-standardized execution CLI. Snapshot portability, machine definition migration or
-hot-swap, package imports, and living tutorials are separate initiatives.
+hidden queues, timers, stores, or standardized execution CLI. Portable aggregate
+migration remains pure. The optional host owns checkpoint transactions, accepted
+pending delivery, receipts, outbox state, retention, and tombstones. The CLI remains
+validation-only.
 
 Layout:
 
 - `src/determa/state/` — loader, validator, CEL profile, model, and engine;
+- `src/determa/state/checkpoint.py`, `host.py`, and `stores/` — optional portable
+  checkpoint validation, synchronous host orchestration, registry, and adapters;
 - `src/determa/state/data/machine.schema.json` — exact pinned normative schema;
 - `tests/` — hermetic implementation tests;
 - `conformance/` — black-box format-1 harness and immutable pins;
@@ -49,6 +53,8 @@ Layout:
 - Keep JSON/public identifiers unabbreviated and use only exact normative grammar.
 - Unit tests remain hermetic and offline. Conformance may use its immutable checkouts.
 - Preserve lazy CEL and JSON Schema imports where practical.
+- Preserve lazy Psycopg import and explicit file/database schema setup. Never add
+  checkpoint or root-marker deletion.
 
 ## Gates
 
@@ -60,6 +66,9 @@ pytest -q
 DETERMA_CONFORMANCE_DIR=/path/to/conformance \
 DETERMA_SPEC_DIR=/path/to/spec \
 pytest conformance -q
+
+# Optional, only with a configured service and installed postgresql extra
+DETERMA_POSTGRESQL_DSN=postgresql://... pytest tests/test_postgresql_store.py -q
 ```
 
 `make check` runs lint, type checking, and unit tests. `make conformance` fetches or

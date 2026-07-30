@@ -38,7 +38,11 @@ def test_package_import_keeps_heavy_validators_lazy() -> None:
             "-c",
             (
                 "import sys; import determa.state; "
-                "print('celpy' in sys.modules, 'jsonschema' in sys.modules)"
+                "print("
+                "'celpy' in sys.modules, "
+                "'jsonschema' in sys.modules, "
+                "'psycopg' in sys.modules"
+                ")"
             ),
         ],
         check=True,
@@ -46,4 +50,4 @@ def test_package_import_keeps_heavy_validators_lazy() -> None:
         text=True,
     )
 
-    assert result.stdout.strip() == "False False"
+    assert result.stdout.strip() == "False False False"
