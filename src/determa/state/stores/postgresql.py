@@ -146,8 +146,10 @@ class PostgreSQLExecutionStore(ExecutionStore):
         capabilities = {
             DURABLE_CONCURRENT,
             SHARED_APPLICATION_TRANSACTION,
-            ROOT_IDENTITY_RETENTION,
         }
+        if not self._policy_is_valid():
+            return frozenset(capabilities)
+        capabilities.add(ROOT_IDENTITY_RETENTION)
         if self.replay_retention == "permanent":
             capabilities.add(PERMANENT_RECEIPT_RETENTION)
         if self.outbox_retention == "strict":
@@ -158,7 +160,14 @@ class PostgreSQLExecutionStore(ExecutionStore):
 
     @property
     def checkpoint_retention_mode(self) -> str:
-        return self.replay_retention
+        return self.replay_retention if self._policy_is_valid() else "unverified"
+
+    def _policy_is_valid(self) -> bool:
+        try:
+            self.validate_schema()
+        except Exception:
+            return False
+        return True
 
     def _metadata_rows(self) -> list[tuple[str, str]]:
         return [

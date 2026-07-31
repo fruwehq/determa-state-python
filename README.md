@@ -183,7 +183,9 @@ SQLite and PostgreSQL accept explicit `replay_retention="permanent"` and
 retention capabilities they actually enforce. Database setup records that policy
 immutably; reopening with a different policy is rejected, and database guards reject
 native root-checkpoint deletion or policy mutation. `ExecutionHost` validates required
-capabilities and composed profiles against the injected store:
+capabilities and composed profiles against the injected store. Strong retention
+capabilities are withheld before schema setup and whenever policy or guard validation
+fails:
 
 ```python
 store = ds.SQLiteExecutionStore(

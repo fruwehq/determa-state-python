@@ -23,6 +23,7 @@ from determa.state import (
     FileExecutionStore,
     MemoryArtifactResolver,
     MemoryExecutionStore,
+    PostgreSQLExecutionStore,
     SQLiteExecutionStore,
     bundled_execution_store_registry,
     load_bundle,
@@ -30,6 +31,13 @@ from determa.state import (
 )
 
 from .test_checkpoint_host import MACHINE
+
+_STRONG_RETENTION_CAPABILITIES = {
+    ROOT_IDENTITY_RETENTION,
+    PERMANENT_RECEIPT_RETENTION,
+    PERMANENT_OUTBOX_TERMINAL_RETENTION,
+    COMPACT_EFFECT_IDENTITY_RETENTION,
+}
 
 
 def _resolver() -> MemoryArtifactResolver:
@@ -229,11 +237,18 @@ def test_bundled_adapters_use_public_registration_and_exact_capabilities(
         f"sqlite://{tmp_path / 'strict.sqlite'}"
         "?replay_retention=permanent&outbox_retention=strict"
     )
+    assert configured_sqlite.capabilities == frozenset({DURABLE_SINGLE_WRITER})
+    assert configured_sqlite.checkpoint_retention_mode == "unverified"
     assert {
         PERMANENT_RECEIPT_RETENTION,
         PERMANENT_OUTBOX_TERMINAL_RETENTION,
-    }.issubset(configured_sqlite.capabilities)
+    }.isdisjoint(configured_sqlite.capabilities)
     configured_sqlite.setup_schema()
+    assert {
+        ROOT_IDENTITY_RETENTION,
+        PERMANENT_RECEIPT_RETENTION,
+        PERMANENT_OUTBOX_TERMINAL_RETENTION,
+    }.issubset(configured_sqlite.capabilities)
     reopened_sqlite = registry.resolve(
         f"sqlite://{tmp_path / 'strict.sqlite'}"
         "?replay_retention=permanent&outbox_retention=strict"
@@ -249,10 +264,9 @@ def test_bundled_adapters_use_public_registration_and_exact_capabilities(
             "outbox_retention": "compact",
         },
     )
-    assert {
-        PERMANENT_RECEIPT_RETENTION,
-        COMPACT_EFFECT_IDENTITY_RETENTION,
-    }.issubset(configured_postgresql.capabilities)
+    assert isinstance(configured_postgresql, PostgreSQLExecutionStore)
+    assert configured_postgresql.replay_retention == "permanent"
+    assert configured_postgresql.outbox_retention == "compact"
 
 
 def test_unknown_adapter_and_capability_mismatch_are_closed() -> None:
@@ -365,6 +379,12 @@ def test_sqlite_persists_policy_and_forbids_native_root_or_policy_mutation(
         outbox_retention="strict",
     )
     reopened.validate_schema()
+    assert {
+        ROOT_IDENTITY_RETENTION,
+        PERMANENT_RECEIPT_RETENTION,
+        PERMANENT_OUTBOX_TERMINAL_RETENTION,
+    }.issubset(reopened.capabilities)
+    assert reopened.checkpoint_retention_mode == "permanent"
     assert reopened.health() == {
         "healthy": True,
         "schema_ready": True,
@@ -375,19 +395,32 @@ def test_sqlite_persists_policy_and_forbids_native_root_or_policy_mutation(
         weaker.validate_schema()
     assert mismatch.value.code == "execution_store_schema_mismatch"
     assert weaker.health() == {"healthy": False, "schema_ready": False}
+    assert _STRONG_RETENTION_CAPABILITIES.isdisjoint(weaker.capabilities)
+    assert weaker.checkpoint_retention_mode == "unverified"
 
 
 def test_sqlite_health_requires_immutable_policy_and_root_guards(
     tmp_path: Path,
 ) -> None:
     path = tmp_path / "guarded.sqlite"
-    store = SQLiteExecutionStore(path)
+    store = SQLiteExecutionStore(
+        path,
+        replay_retention="permanent",
+        outbox_retention="strict",
+    )
     store.setup_schema()
+    assert {
+        ROOT_IDENTITY_RETENTION,
+        PERMANENT_RECEIPT_RETENTION,
+        PERMANENT_OUTBOX_TERMINAL_RETENTION,
+    }.issubset(store.capabilities)
     with sqlite3.connect(path) as connection:
         connection.execute(
             "DROP TRIGGER determa_execution_checkpoints_forbid_delete"
         )
     assert store.health() == {"healthy": False, "schema_ready": False}
+    assert _STRONG_RETENTION_CAPABILITIES.isdisjoint(store.capabilities)
+    assert store.checkpoint_retention_mode == "unverified"
 
 
 def test_direct_injection_checks_actual_store_capabilities() -> None:

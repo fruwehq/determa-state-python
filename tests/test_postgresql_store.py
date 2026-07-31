@@ -23,6 +23,13 @@ from determa.state import (
 
 from .test_checkpoint_host import MACHINE, _host
 
+_STRONG_RETENTION_CAPABILITIES = {
+    ROOT_IDENTITY_RETENTION,
+    PERMANENT_RECEIPT_RETENTION,
+    PERMANENT_OUTBOX_TERMINAL_RETENTION,
+    COMPACT_EFFECT_IDENTITY_RETENTION,
+}
+
 pytestmark = pytest.mark.skipif(
     not os.environ.get("DETERMA_POSTGRESQL_DSN"),
     reason="DETERMA_POSTGRESQL_DSN is not configured",
@@ -180,6 +187,8 @@ def test_postgresql_configured_permanent_strict_profile() -> None:
         replay_retention="permanent",
         outbox_retention="strict",
     )
+    assert _STRONG_RETENTION_CAPABILITIES.isdisjoint(store.capabilities)
+    assert store.checkpoint_retention_mode == "unverified"
     store.setup_schema()
     assert {
         DURABLE_CONCURRENT,
@@ -274,6 +283,12 @@ def test_postgresql_persists_policy_and_forbids_native_deletion(
         outbox_retention="strict",
     )
     reopened.validate_schema()
+    assert {
+        ROOT_IDENTITY_RETENTION,
+        PERMANENT_RECEIPT_RETENTION,
+        PERMANENT_OUTBOX_TERMINAL_RETENTION,
+    }.issubset(reopened.capabilities)
+    assert reopened.checkpoint_retention_mode == "permanent"
     assert reopened.health() == {
         "healthy": True,
         "schema_ready": True,
@@ -284,14 +299,28 @@ def test_postgresql_persists_policy_and_forbids_native_deletion(
         weaker.validate_schema()
     assert mismatch.value.code == "execution_store_schema_mismatch"
     assert weaker.health() == {"healthy": False, "schema_ready": False}
+    assert _STRONG_RETENTION_CAPABILITIES.isdisjoint(weaker.capabilities)
+    assert weaker.checkpoint_retention_mode == "unverified"
 
 
 def test_postgresql_health_requires_immutable_policy_and_root_guards() -> None:
     psycopg = pytest.importorskip("psycopg")
-    store = _store()
+    store = PostgreSQLExecutionStore(
+        os.environ["DETERMA_POSTGRESQL_DSN"],
+        table_name=f"determa_guard_health_{uuid.uuid4().hex[:16]}",
+        replay_retention="permanent",
+        outbox_retention="strict",
+    )
     store.setup_schema()
+    assert {
+        ROOT_IDENTITY_RETENTION,
+        PERMANENT_RECEIPT_RETENTION,
+        PERMANENT_OUTBOX_TERMINAL_RETENTION,
+    }.issubset(store.capabilities)
     with psycopg.connect(store.conninfo) as connection:
         connection.execute(
             f"DROP TRIGGER determa_execution_store_immutable ON {store.table_name}"
         )
     assert store.health() == {"healthy": False, "schema_ready": False}
+    assert _STRONG_RETENTION_CAPABILITIES.isdisjoint(store.capabilities)
+    assert store.checkpoint_retention_mode == "unverified"

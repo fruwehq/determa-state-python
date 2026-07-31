@@ -295,7 +295,17 @@ def _adapter_operation(vector: dict[str, Any]) -> dict[str, Any]:
     elif identifier != "absent-store":
         registry.register(identifier, static_factory)
     store = registry.resolve(uri, required_capabilities=frozenset(requested))
-    assert store.capabilities == frozenset(capabilities)
+    actual_capabilities = store.capabilities
+    expected_capabilities = frozenset(capabilities)
+    if (
+        vector["registration_source"] == "bundled"
+        and identifier in {"sqlite", "postgresql"}
+    ):
+        # An uninitialized database adapter must not claim persisted guarantees.
+        assert requested.issubset(actual_capabilities)
+        assert actual_capabilities.issubset(expected_capabilities)
+    else:
+        assert actual_capabilities == expected_capabilities
     return {"result": "accepted"}
 
 

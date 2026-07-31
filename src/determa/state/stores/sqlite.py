@@ -139,7 +139,10 @@ class SQLiteExecutionStore(ExecutionStore):
 
     @property
     def capabilities(self) -> frozenset[str]:
-        capabilities = {DURABLE_SINGLE_WRITER, ROOT_IDENTITY_RETENTION}
+        capabilities = {DURABLE_SINGLE_WRITER}
+        if not self._policy_is_valid():
+            return frozenset(capabilities)
+        capabilities.add(ROOT_IDENTITY_RETENTION)
         if self.replay_retention == "permanent":
             capabilities.add(PERMANENT_RECEIPT_RETENTION)
         if self.outbox_retention == "strict":
@@ -150,7 +153,16 @@ class SQLiteExecutionStore(ExecutionStore):
 
     @property
     def checkpoint_retention_mode(self) -> str:
-        return self.replay_retention
+        return self.replay_retention if self._policy_is_valid() else "unverified"
+
+    def _policy_is_valid(self) -> bool:
+        if not Path(self.path).is_file():
+            return False
+        try:
+            self.validate_schema()
+        except (OSError, sqlite3.Error, ExecutionStoreError):
+            return False
+        return True
 
     def _metadata_rows(self) -> list[tuple[str, str]]:
         return [

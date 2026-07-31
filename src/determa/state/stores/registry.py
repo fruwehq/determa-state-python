@@ -49,7 +49,9 @@ class ExecutionStoreRegistry:
             raise
         except (TypeError, ValueError) as exc:
             raise ExecutionStoreError("invalid_adapter_configuration") from exc
-        if not required_capabilities.issubset(store.capabilities):
+        if required_capabilities and not required_capabilities.issubset(
+            store.capabilities
+        ):
             raise ExecutionStoreError("adapter_capability_mismatch")
         return store
 
