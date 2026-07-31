@@ -25,8 +25,12 @@ from .base import (
 _IDENTIFIER = re.compile(r"[a-z_][a-z0-9_]*\Z")
 _REPLAY_RETENTION_MODES = {"bounded", "permanent"}
 _OUTBOX_RETENTION_MODES = {"none", "strict", "compact"}
-_SCHEMA_KEY = "execution_checkpoint"
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
+_SCHEMA_VERSION_KEY = "execution_checkpoint_schema_version"
+_REPLAY_RETENTION_KEY = "replay_retention"
+_OUTBOX_RETENTION_KEY = "outbox_retention"
+_TRIGGER_NAME = "determa_execution_store_immutable"
+_IMMUTABLE_MESSAGE = "execution_store_immutable"
 
 
 def _psycopg() -> Any:
@@ -120,9 +124,11 @@ class PostgreSQLExecutionStore(ExecutionStore):
         outbox_retention: str = "none",
     ) -> None:
         metadata_table = f"{table_name}_metadata"
+        guard_function = f"{table_name}_guard"
         if (
             not conninfo
             or len(metadata_table) > 63
+            or len(guard_function) > 63
             or _IDENTIFIER.fullmatch(table_name) is None
             or replay_retention not in _REPLAY_RETENTION_MODES
             or outbox_retention not in _OUTBOX_RETENTION_MODES
@@ -131,6 +137,7 @@ class PostgreSQLExecutionStore(ExecutionStore):
         self.conninfo = conninfo
         self.table_name = table_name
         self.metadata_table = metadata_table
+        self.guard_function = guard_function
         self.replay_retention = replay_retention
         self.outbox_retention = outbox_retention
 
@@ -152,6 +159,13 @@ class PostgreSQLExecutionStore(ExecutionStore):
     @property
     def checkpoint_retention_mode(self) -> str:
         return self.replay_retention
+
+    def _metadata_rows(self) -> list[tuple[str, str]]:
+        return [
+            (_SCHEMA_VERSION_KEY, str(_SCHEMA_VERSION)),
+            (_OUTBOX_RETENTION_KEY, self.outbox_retention),
+            (_REPLAY_RETENTION_KEY, self.replay_retention),
+        ]
 
     def _relation_state(self, connection: Any) -> tuple[Any, Any]:
         row = connection.execute(
@@ -213,20 +227,44 @@ class PostgreSQLExecutionStore(ExecutionStore):
             "SELECT count(*) FROM pg_index WHERE indrelid = to_regclass(%s)",
             (table_name,),
         ).fetchone()
-        trigger_count = connection.execute(
+        expected_trigger_type = 11 if table_name == self.table_name else 27
+        triggers = connection.execute(
             """
-            SELECT count(*)
+            SELECT tgname, tgtype, tgenabled,
+                   tgfoid = to_regprocedure(%s)
             FROM pg_trigger
             WHERE tgrelid = to_regclass(%s) AND NOT tgisinternal
+            ORDER BY tgname
             """,
-            (table_name,),
-        ).fetchone()
+            (f"{self.guard_function}()", table_name),
+        ).fetchall()
+        normalized_triggers = [
+            tuple(_database_value(value) for value in row) for row in triggers
+        ]
         if (
             [_database_value(row[0]) for row in constraint_types] != ["p"]
             or index_count is None
             or index_count[0] != 1
-            or trigger_count is None
-            or trigger_count[0] != 0
+            or normalized_triggers != [
+                (_TRIGGER_NAME, expected_trigger_type, "A", True)
+            ]
+        ):
+            raise ExecutionStoreError("execution_store_schema_mismatch")
+
+    def _validate_guard_function(self, connection: Any) -> None:
+        row = connection.execute(
+            """
+            SELECT prosrc
+            FROM pg_proc
+            WHERE oid = to_regprocedure(%s)
+            """,
+            (f"{self.guard_function}()",),
+        ).fetchone()
+        source = None if row is None else _database_value(row[0])
+        if (
+            not isinstance(source, str)
+            or " ".join(source.split())
+            != "BEGIN RAISE EXCEPTION 'execution_store_immutable'; END;"
         ):
             raise ExecutionStoreError("execution_store_schema_mismatch")
 
@@ -251,17 +289,19 @@ class PostgreSQLExecutionStore(ExecutionStore):
             self.metadata_table,
             [
                 ("schema_key", "text", "NO", None),
-                ("schema_version", "integer", "NO", None),
+                ("schema_value", "text", "NO", None),
             ],
         )
         rows = connection.execute(
-            f"SELECT schema_key, schema_version FROM {self.metadata_table}"
+            f"SELECT schema_key, schema_value FROM {self.metadata_table} "
+            "ORDER BY schema_key"
         ).fetchall()
         normalized_rows = [
             tuple(_database_value(value) for value in row) for row in rows
         ]
-        if normalized_rows != [(_SCHEMA_KEY, _SCHEMA_VERSION)]:
+        if normalized_rows != self._metadata_rows():
             raise ExecutionStoreError("execution_store_schema_mismatch")
+        self._validate_guard_function(connection)
 
     def validate_schema(self) -> None:
         psycopg = _psycopg()
@@ -304,7 +344,7 @@ class PostgreSQLExecutionStore(ExecutionStore):
                     f"""
                     CREATE TABLE {self.metadata_table} (
                         schema_key TEXT PRIMARY KEY NOT NULL,
-                        schema_version INTEGER NOT NULL
+                        schema_value TEXT NOT NULL
                     )
                     """
                 )
@@ -318,13 +358,48 @@ class PostgreSQLExecutionStore(ExecutionStore):
                     )
                     """
                 )
+                for metadata_row in self._metadata_rows():
+                    connection.execute(
+                        f"""
+                        INSERT INTO {self.metadata_table}
+                            (schema_key, schema_value)
+                        VALUES (%s, %s)
+                        """,
+                        metadata_row,
+                    )
                 connection.execute(
                     f"""
-                    INSERT INTO {self.metadata_table}
-                        (schema_key, schema_version)
-                    VALUES (%s, %s)
-                    """,
-                    (_SCHEMA_KEY, _SCHEMA_VERSION),
+                    CREATE FUNCTION {self.guard_function}()
+                    RETURNS trigger
+                    LANGUAGE plpgsql
+                    AS $$
+                    BEGIN
+                        RAISE EXCEPTION '{_IMMUTABLE_MESSAGE}';
+                    END;
+                    $$
+                    """
+                )
+                connection.execute(
+                    f"""
+                    CREATE TRIGGER {_TRIGGER_NAME}
+                    BEFORE DELETE ON {self.table_name}
+                    FOR EACH ROW EXECUTE FUNCTION {self.guard_function}()
+                    """
+                )
+                connection.execute(
+                    f"ALTER TABLE {self.table_name} ENABLE ALWAYS TRIGGER "
+                    f"{_TRIGGER_NAME}"
+                )
+                connection.execute(
+                    f"""
+                    CREATE TRIGGER {_TRIGGER_NAME}
+                    BEFORE UPDATE OR DELETE ON {self.metadata_table}
+                    FOR EACH ROW EXECUTE FUNCTION {self.guard_function}()
+                    """
+                )
+                connection.execute(
+                    f"ALTER TABLE {self.metadata_table} ENABLE ALWAYS TRIGGER "
+                    f"{_TRIGGER_NAME}"
                 )
             self._validate_schema(connection)
 
@@ -333,7 +408,11 @@ class PostgreSQLExecutionStore(ExecutionStore):
             self.validate_schema()
         except Exception:
             return {"healthy": False, "schema_ready": False}
-        return {"healthy": True, "schema_ready": True, "schema_version": 1}
+        return {
+            "healthy": True,
+            "schema_ready": True,
+            "schema_version": _SCHEMA_VERSION,
+        }
 
 
 def postgresql_execution_store_factory(

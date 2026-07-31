@@ -233,6 +233,15 @@ def test_bundled_adapters_use_public_registration_and_exact_capabilities(
         PERMANENT_RECEIPT_RETENTION,
         PERMANENT_OUTBOX_TERMINAL_RETENTION,
     }.issubset(configured_sqlite.capabilities)
+    configured_sqlite.setup_schema()
+    reopened_sqlite = registry.resolve(
+        f"sqlite://{tmp_path / 'strict.sqlite'}"
+        "?replay_retention=permanent&outbox_retention=strict"
+    )
+    reopened_sqlite.validate_schema()
+    with pytest.raises(ExecutionStoreError) as sqlite_policy_mismatch:
+        registry.resolve(f"sqlite://{tmp_path / 'strict.sqlite'}").validate_schema()
+    assert sqlite_policy_mismatch.value.code == "execution_store_schema_mismatch"
     configured_postgresql = registry.resolve(
         "postgresql://unused",
         configuration={
@@ -282,11 +291,11 @@ def test_sqlite_rejects_malformed_or_wrong_version_schema(tmp_path: Path) -> Non
     with sqlite3.connect(constrained_path) as connection:
         connection.execute(
             "CREATE TABLE determa_execution_store_metadata "
-            "(schema_key TEXT PRIMARY KEY NOT NULL, schema_version INTEGER NOT NULL)"
+            "(schema_key TEXT PRIMARY KEY NOT NULL, schema_value TEXT NOT NULL)"
         )
         connection.execute(
             "INSERT INTO determa_execution_store_metadata VALUES "
-            "('execution_checkpoint', 1)"
+            "('execution_checkpoint_schema_version', '2')"
         )
         connection.execute(
             "CREATE TABLE determa_execution_checkpoints ("
@@ -305,12 +314,80 @@ def test_sqlite_rejects_malformed_or_wrong_version_schema(tmp_path: Path) -> Non
     versioned.setup_schema()
     with sqlite3.connect(versioned_path) as connection:
         connection.execute(
-            "UPDATE determa_execution_store_metadata SET schema_version = 2"
+            "DROP TRIGGER determa_execution_metadata_forbid_update"
+        )
+        connection.execute(
+            "UPDATE determa_execution_store_metadata SET schema_value = '3' "
+            "WHERE schema_key = 'execution_checkpoint_schema_version'"
         )
     with pytest.raises(ExecutionStoreError) as version_error:
         versioned.validate_schema()
     assert version_error.value.code == "execution_store_schema_mismatch"
     assert versioned.health() == {"healthy": False, "schema_ready": False}
+
+
+def test_sqlite_persists_policy_and_forbids_native_root_or_policy_mutation(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "bank.sqlite"
+    store = SQLiteExecutionStore(
+        path,
+        replay_retention="permanent",
+        outbox_retention="strict",
+    )
+    store.setup_schema()
+    host = _create(store, "bank-root")
+
+    with sqlite3.connect(path) as connection:
+        with pytest.raises(sqlite3.IntegrityError, match="execution_store_immutable"):
+            connection.execute(
+                "DELETE FROM determa_execution_checkpoints "
+                "WHERE root_instance_id = ?",
+                ("bank-root",),
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="execution_store_immutable"):
+            connection.execute(
+                "UPDATE determa_execution_store_metadata "
+                "SET schema_value = 'bounded' "
+                "WHERE schema_key = 'replay_retention'"
+            )
+
+    assert host.read_checkpoint("bank-root") is not None
+    with pytest.raises(ExecutionHostError) as recreate:
+        host.create(
+            load_bundle(MACHINE), "counter", "bank-root", "replacement", {}
+        )
+    assert recreate.value.code == "creation_id_conflict"
+
+    reopened = SQLiteExecutionStore(
+        path,
+        replay_retention="permanent",
+        outbox_retention="strict",
+    )
+    reopened.validate_schema()
+    assert reopened.health() == {
+        "healthy": True,
+        "schema_ready": True,
+        "schema_version": 2,
+    }
+    weaker = SQLiteExecutionStore(path)
+    with pytest.raises(ExecutionStoreError) as mismatch:
+        weaker.validate_schema()
+    assert mismatch.value.code == "execution_store_schema_mismatch"
+    assert weaker.health() == {"healthy": False, "schema_ready": False}
+
+
+def test_sqlite_health_requires_immutable_policy_and_root_guards(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "guarded.sqlite"
+    store = SQLiteExecutionStore(path)
+    store.setup_schema()
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "DROP TRIGGER determa_execution_checkpoints_forbid_delete"
+        )
+    assert store.health() == {"healthy": False, "schema_ready": False}
 
 
 def test_direct_injection_checks_actual_store_capabilities() -> None:

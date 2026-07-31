@@ -28,8 +28,15 @@ _JOURNAL_MODES = {"DELETE", "WAL"}
 _SYNCHRONOUS_MODES = {"FULL"}
 _REPLAY_RETENTION_MODES = {"bounded", "permanent"}
 _OUTBOX_RETENTION_MODES = {"none", "strict", "compact"}
-_SCHEMA_KEY = "execution_checkpoint"
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
+_SCHEMA_VERSION_KEY = "execution_checkpoint_schema_version"
+_REPLAY_RETENTION_KEY = "replay_retention"
+_OUTBOX_RETENTION_KEY = "outbox_retention"
+_CHECKPOINT_DELETE_TRIGGER = "determa_execution_checkpoints_forbid_delete"
+_METADATA_INSERT_TRIGGER = "determa_execution_metadata_forbid_insert"
+_METADATA_UPDATE_TRIGGER = "determa_execution_metadata_forbid_update"
+_METADATA_DELETE_TRIGGER = "determa_execution_metadata_forbid_delete"
+_IMMUTABLE_MESSAGE = "execution_store_immutable"
 
 
 def _schema_tokens(source: str) -> list[str]:
@@ -145,6 +152,13 @@ class SQLiteExecutionStore(ExecutionStore):
     def checkpoint_retention_mode(self) -> str:
         return self.replay_retention
 
+    def _metadata_rows(self) -> list[tuple[str, str]]:
+        return [
+            (_SCHEMA_VERSION_KEY, str(_SCHEMA_VERSION)),
+            (_OUTBOX_RETENTION_KEY, self.outbox_retention),
+            (_REPLAY_RETENTION_KEY, self.replay_retention),
+        ]
+
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(
             self.path, timeout=self.timeout, isolation_level=None
@@ -197,12 +211,66 @@ class SQLiteExecutionStore(ExecutionStore):
         foreign_keys = connection.execute(
             f"PRAGMA foreign_key_list({table})"
         ).fetchall()
-        triggers = connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND tbl_name = ?",
-            (table,),
-        ).fetchone()
-        if foreign_keys or triggers is not None:
+        if foreign_keys:
             raise ExecutionStoreError("execution_store_schema_mismatch")
+
+    def _validate_triggers(self, connection: sqlite3.Connection) -> None:
+        expected = {
+            _CHECKPOINT_DELETE_TRIGGER: f"""
+                CREATE TRIGGER {_CHECKPOINT_DELETE_TRIGGER}
+                BEFORE DELETE ON {_TABLE}
+                BEGIN
+                    SELECT RAISE(ABORT, '{_IMMUTABLE_MESSAGE}');
+                END
+            """,
+            _METADATA_INSERT_TRIGGER: f"""
+                CREATE TRIGGER {_METADATA_INSERT_TRIGGER}
+                BEFORE INSERT ON {_METADATA_TABLE}
+                BEGIN
+                    SELECT RAISE(ABORT, '{_IMMUTABLE_MESSAGE}');
+                END
+            """,
+            _METADATA_UPDATE_TRIGGER: f"""
+                CREATE TRIGGER {_METADATA_UPDATE_TRIGGER}
+                BEFORE UPDATE ON {_METADATA_TABLE}
+                BEGIN
+                    SELECT RAISE(ABORT, '{_IMMUTABLE_MESSAGE}');
+                END
+            """,
+            _METADATA_DELETE_TRIGGER: f"""
+                CREATE TRIGGER {_METADATA_DELETE_TRIGGER}
+                BEFORE DELETE ON {_METADATA_TABLE}
+                BEGIN
+                    SELECT RAISE(ABORT, '{_IMMUTABLE_MESSAGE}');
+                END
+            """,
+        }
+        rows = connection.execute(
+            """
+            SELECT name, tbl_name, sql
+            FROM sqlite_master
+            WHERE type = 'trigger'
+              AND tbl_name IN (?, ?)
+            ORDER BY name
+            """,
+            (_TABLE, _METADATA_TABLE),
+        ).fetchall()
+        if len(rows) != len(expected):
+            raise ExecutionStoreError("execution_store_schema_mismatch")
+        for name, table, source in rows:
+            expected_source = expected.get(name)
+            expected_table = (
+                _TABLE
+                if name == _CHECKPOINT_DELETE_TRIGGER
+                else _METADATA_TABLE
+            )
+            if (
+                table != expected_table
+                or not isinstance(source, str)
+                or expected_source is None
+                or _schema_tokens(source) != _schema_tokens(expected_source)
+            ):
+                raise ExecutionStoreError("execution_store_schema_mismatch")
 
     def _validate_schema(self, connection: sqlite3.Connection) -> None:
         tables = {
@@ -239,20 +307,22 @@ class SQLiteExecutionStore(ExecutionStore):
             _METADATA_TABLE,
             [
                 ("schema_key", "TEXT", 1, None, 1, 0),
-                ("schema_version", "INTEGER", 1, None, 0, 0),
+                ("schema_value", "TEXT", 1, None, 0, 0),
             ],
             f"""
             CREATE TABLE {_METADATA_TABLE} (
                 schema_key TEXT PRIMARY KEY NOT NULL,
-                schema_version INTEGER NOT NULL
+                schema_value TEXT NOT NULL
             )
             """,
         )
         rows = connection.execute(
-            f"SELECT schema_key, schema_version FROM {_METADATA_TABLE}"
+            f"SELECT schema_key, schema_value FROM {_METADATA_TABLE} "
+            "ORDER BY schema_key"
         ).fetchall()
-        if rows != [(_SCHEMA_KEY, _SCHEMA_VERSION)]:
+        if rows != self._metadata_rows():
             raise ExecutionStoreError("execution_store_schema_mismatch")
+        self._validate_triggers(connection)
 
     def validate_schema(self) -> None:
         connection = self._connect()
@@ -299,7 +369,7 @@ class SQLiteExecutionStore(ExecutionStore):
                     f"""
                     CREATE TABLE {_METADATA_TABLE} (
                         schema_key TEXT PRIMARY KEY NOT NULL,
-                        schema_version INTEGER NOT NULL
+                        schema_value TEXT NOT NULL
                     )
                     """
                 )
@@ -313,11 +383,34 @@ class SQLiteExecutionStore(ExecutionStore):
                     )
                     """
                 )
-                connection.execute(
-                    f"INSERT INTO {_METADATA_TABLE} (schema_key, schema_version) "
+                connection.executemany(
+                    f"INSERT INTO {_METADATA_TABLE} (schema_key, schema_value) "
                     "VALUES (?, ?)",
-                    (_SCHEMA_KEY, _SCHEMA_VERSION),
+                    self._metadata_rows(),
                 )
+                connection.execute(
+                    f"""
+                    CREATE TRIGGER {_CHECKPOINT_DELETE_TRIGGER}
+                    BEFORE DELETE ON {_TABLE}
+                    BEGIN
+                        SELECT RAISE(ABORT, '{_IMMUTABLE_MESSAGE}');
+                    END
+                    """
+                )
+                for name, operation in (
+                    (_METADATA_INSERT_TRIGGER, "INSERT"),
+                    (_METADATA_UPDATE_TRIGGER, "UPDATE"),
+                    (_METADATA_DELETE_TRIGGER, "DELETE"),
+                ):
+                    connection.execute(
+                        f"""
+                        CREATE TRIGGER {name}
+                        BEFORE {operation} ON {_METADATA_TABLE}
+                        BEGIN
+                            SELECT RAISE(ABORT, '{_IMMUTABLE_MESSAGE}');
+                        END
+                        """
+                    )
             self._validate_schema(connection)
             connection.commit()
         except BaseException:
@@ -335,7 +428,11 @@ class SQLiteExecutionStore(ExecutionStore):
                 connection.close()
         except (OSError, sqlite3.Error, ExecutionStoreError):
             return {"healthy": False, "schema_ready": False}
-        return {"healthy": True, "schema_ready": True, "schema_version": 1}
+        return {
+            "healthy": True,
+            "schema_ready": True,
+            "schema_version": _SCHEMA_VERSION,
+        }
 
 
 def _single_query(query: Mapping[str, list[str]], key: str, default: str) -> str:

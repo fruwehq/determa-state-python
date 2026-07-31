@@ -180,7 +180,9 @@ application transactions. Every store transaction is bound to one exact root.
 
 SQLite and PostgreSQL accept explicit `replay_retention="permanent"` and
 `outbox_retention="strict" | "compact"` configuration. These settings add only the
-retention capabilities they actually enforce. `ExecutionHost` validates required
+retention capabilities they actually enforce. Database setup records that policy
+immutably; reopening with a different policy is rejected, and database guards reject
+native root-checkpoint deletion or policy mutation. `ExecutionHost` validates required
 capabilities and composed profiles against the injected store:
 
 ```python
@@ -211,7 +213,8 @@ back both application writes and checkpoint work.
 
 File and database schema setup is never implicit. SQLite and PostgreSQL validate an
 explicit schema version and the exact required tables, columns, types, nullability,
-primary keys, indexes, and triggers before checkpoint use.
+primary keys, indexes, immutable policy rows, and deletion-protection triggers before
+checkpoint use.
 
 `ExecutionStoreRegistry` starts empty. `register_bundled_execution_stores` registers
 `memory`, `file`, `sqlite`, and `postgresql` through the same public operation used by

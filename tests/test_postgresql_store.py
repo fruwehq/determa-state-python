@@ -223,3 +223,75 @@ def test_postgresql_configured_permanent_strict_profile() -> None:
             "retain_referenced_effect_tombstones",
         },
     )
+
+
+def test_postgresql_persists_policy_and_forbids_native_deletion(
+) -> None:
+    psycopg = pytest.importorskip("psycopg")
+    store = PostgreSQLExecutionStore(
+        os.environ["DETERMA_POSTGRESQL_DSN"],
+        table_name=f"determa_guarded_{uuid.uuid4().hex[:16]}",
+        replay_retention="permanent",
+        outbox_retention="strict",
+    )
+    store.setup_schema()
+    local_host, _ = _host()
+    host = ExecutionHost(
+        store,
+        local_host.artifact_resolver,
+        profile="exactly_once_committed_processing",
+    )
+    host.create(load_bundle(MACHINE), "counter", "bank-root", "create", {})
+
+    with psycopg.connect(store.conninfo) as connection:
+        with pytest.raises(psycopg.Error, match="execution_store_immutable"):
+            connection.execute(
+                f"DELETE FROM {store.table_name} WHERE root_instance_id = %s",
+                ("bank-root",),
+            )
+    assert host.read_checkpoint("bank-root") is not None
+    with pytest.raises(ExecutionHostError) as recreate:
+        host.create(
+            load_bundle(MACHINE), "counter", "bank-root", "replacement", {}
+        )
+    assert recreate.value.code == "creation_id_conflict"
+
+    def native_delete(connection, execution) -> None:
+        del execution
+        connection.execute(
+            f"DELETE FROM {store.table_name} WHERE root_instance_id = %s",
+            ("bank-root",),
+        )
+
+    with pytest.raises(psycopg.Error, match="execution_store_immutable"):
+        host.run_shared_transaction("bank-root", native_delete)
+    assert host.read_checkpoint("bank-root") is not None
+
+    reopened = PostgreSQLExecutionStore(
+        store.conninfo,
+        table_name=store.table_name,
+        replay_retention="permanent",
+        outbox_retention="strict",
+    )
+    reopened.validate_schema()
+    assert reopened.health() == {
+        "healthy": True,
+        "schema_ready": True,
+        "schema_version": 2,
+    }
+    weaker = PostgreSQLExecutionStore(store.conninfo, table_name=store.table_name)
+    with pytest.raises(ExecutionStoreError) as mismatch:
+        weaker.validate_schema()
+    assert mismatch.value.code == "execution_store_schema_mismatch"
+    assert weaker.health() == {"healthy": False, "schema_ready": False}
+
+
+def test_postgresql_health_requires_immutable_policy_and_root_guards() -> None:
+    psycopg = pytest.importorskip("psycopg")
+    store = _store()
+    store.setup_schema()
+    with psycopg.connect(store.conninfo) as connection:
+        connection.execute(
+            f"DROP TRIGGER determa_execution_store_immutable ON {store.table_name}"
+        )
+    assert store.health() == {"healthy": False, "schema_ready": False}
