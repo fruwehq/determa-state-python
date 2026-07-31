@@ -36,6 +36,9 @@ Specification = "https://github.com/fruwehq/determa-state-spec"
 Issues = "https://github.com/fruwehq/determa-state-python/issues"
 
 [project.optional-dependencies]
+postgresql = [
+  "psycopg[binary]>=3.1,<4",
+]
 dev = [
   "pytest>=8",
   "ruff",
@@ -61,6 +64,7 @@ packages = ["src/determa"]
 "src/determa/state/data/aggregate-state.schema.json" = "determa/state/data/aggregate-state.schema.json"
 "src/determa/state/data/migration-descriptor.schema.json" = "determa/state/data/migration-descriptor.schema.json"
 "src/determa/state/data/aggregate-state-package.schema.json" = "determa/state/data/aggregate-state-package.schema.json"
+"src/determa/state/data/execution-checkpoint.schema.json" = "determa/state/data/execution-checkpoint.schema.json"
 
 [tool.ruff]
 line-length = 100

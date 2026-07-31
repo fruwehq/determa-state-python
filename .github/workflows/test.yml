@@ -36,13 +36,13 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: fruwehq/determa-state-conformance
-          ref: 600523ca08c3b8a6ee790439a32dc4ce47f71b95
+          ref: 86cb08a98267371b96b8f4908409aee022e4b4fe
           path: .pinned/determa-state-conformance
       - name: Check out pinned specification
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: fruwehq/determa-state-spec
-          ref: c1635d74e6a216301a8986d37be8ce7e7111dfd7
+          ref: 318ef1f16ae024770090bd338c8b70056df2855b
           path: .pinned/determa-state-spec
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -55,3 +55,32 @@ jobs:
           DETERMA_CONFORMANCE_DIR: ${{ github.workspace }}/.pinned/determa-state-conformance
           DETERMA_SPEC_DIR: ${{ github.workspace }}/.pinned/determa-state-spec
         run: pytest conformance -q
+
+  postgresql:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: determa_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d determa_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install
+        run: pip install -e '.[dev,postgresql]'
+      - name: PostgreSQL adapter tests
+        env:
+          DETERMA_POSTGRESQL_DSN: postgresql://postgres:postgres@localhost:5432/determa_test
+        run: pytest tests/test_postgresql_store.py -q

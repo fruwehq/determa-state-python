@@ -25,6 +25,7 @@ SHA256_PREFIX = "sha256:"
 _DATA = Path(__file__).parent / "data"
 _INT_MIN = -(2**63)
 _INT_MAX = 2**63 - 1
+_MAX_DECIMAL_DIGITS = 4096
 
 
 class DefinitionResolver(Protocol):
@@ -291,9 +292,18 @@ def _signed_decimal(value: str) -> int:
         return 0
     negative = value.startswith("-")
     digits = value[1:] if negative else value
-    if not digits or not digits.isascii() or not digits.isdigit() or digits.startswith("0"):
+    if (
+        not digits
+        or len(digits) > _MAX_DECIMAL_DIGITS
+        or not digits.isascii()
+        or not digits.isdigit()
+        or digits.startswith("0")
+    ):
         raise ArtifactError("invalid_aggregate_state")
-    return int(value)
+    try:
+        return int(value)
+    except ValueError as exc:
+        raise ArtifactError("invalid_aggregate_state") from exc
 
 
 def decimal(value: Any, *, positive: bool = False) -> int:
@@ -311,6 +321,7 @@ def artifact_schema(kind: str) -> dict[str, Any]:
         "aggregate_state": "aggregate-state.schema.json",
         "migration_descriptor": "migration-descriptor.schema.json",
         "aggregate_state_package": "aggregate-state-package.schema.json",
+        "execution_checkpoint": "execution-checkpoint.schema.json",
     }[kind]
     return cast(
         dict[str, Any], json.loads((_DATA / filename).read_text(encoding="utf-8"))
@@ -326,6 +337,7 @@ def _schema_registry() -> Any:
         "aggregate_state",
         "migration_descriptor",
         "aggregate_state_package",
+        "execution_checkpoint",
     ):
         document = artifact_schema(kind)
         registry = registry.with_resource(
@@ -362,6 +374,14 @@ def _format_code(document: Any, kind: str) -> str | None:
             "unsupported_aggregate_state_package_format",
             "unsupported_aggregate_state_package_schema_version",
         ),
+        "execution_checkpoint": (
+            "execution_checkpoint_format",
+            "determa.execution_checkpoint",
+            "execution_checkpoint_schema_version",
+            1,
+            "unsupported_execution_checkpoint_format",
+            "unsupported_execution_checkpoint_schema_version",
+        ),
     }
     format_member, expected_format, version_member, expected_version, format_code, version_code = (
         definitions[kind]
@@ -384,6 +404,7 @@ def load_json_artifact(
             "aggregate_state": "invalid_aggregate_state",
             "migration_descriptor": "invalid_migration_descriptor",
             "aggregate_state_package": "invalid_aggregate_state_package",
+            "execution_checkpoint": "invalid_execution_checkpoint",
         }[kind]
         raise ArtifactError(code) from exc
     unsupported = _format_code(document, kind)
@@ -399,6 +420,7 @@ def load_json_artifact(
             "aggregate_state": "invalid_aggregate_state",
             "migration_descriptor": "invalid_migration_descriptor",
             "aggregate_state_package": "invalid_aggregate_state_package",
+            "execution_checkpoint": "invalid_execution_checkpoint",
         }[kind]
         raise ArtifactError(code)
     return document, raw

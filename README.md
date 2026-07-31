@@ -4,9 +4,9 @@ Python implementation of [Determa State](https://github.com/fruwehq/determa-stat
 a language-agnostic statechart engine with a shared normative conformance suite.
 
 This release implements Determa State `format: 1` at the synchronized specification
-commit `c1635d74e6a216301a8986d37be8ce7e7111dfd7`. Correctness is determined by the
-110-case core suite and persistence profiles at conformance commit
-`600523ca08c3b8a6ee790439a32dc4ce47f71b95`.
+commit `318ef1f16ae024770090bd338c8b70056df2855b`. Correctness is determined by the
+110-case core suite, persistence profiles, and 85-vector execution-checkpoint profile
+at conformance commit `86cb08a98267371b96b8f4908409aee022e4b4fe`.
 
 The package metadata is `0.1.0` for the next synchronized release of the specification,
 conformance suite, Python engine, and Rust engine.
@@ -25,6 +25,12 @@ python -m pip install -e .
 
 The distribution is `determa-state`; the import is `determa.state`. It also installs
 `determa-state` and `determa-state-python` commands.
+
+PostgreSQL support is optional and imports Psycopg only when that adapter is used:
+
+```sh
+python -m pip install -e '.[postgresql]'
+```
 
 ## Define A Bundle
 
@@ -141,11 +147,83 @@ migrations return a deterministic `MigrationFailure` and do not mutate the suppl
 artifact or resolver.
 
 Definition and descriptor resolvers are protocols, so applications can back them with
-an immutable registry or a transaction-local cache. Database schemas, broker
-acknowledgement, retries, and quarantine remain host responsibilities; the conformance
-persistence profile verifies the required transaction ordering.
+an immutable registry or a transaction-local cache.
 
-## Implemented Core
+## Run A Checkpoint Host
+
+`ExecutionHost` is an optional synchronous durable-host layer. It stores one strict
+portable checkpoint per root and implements durable acceptance, committed receipts,
+pending delivery, outbox lifecycle, keyed migration, bounded replay retention, CAS,
+and terminal tombstones. Direct store injection does not require a registry:
+
+```python
+store = ds.SQLiteExecutionStore("state.db")
+store.setup_schema()  # always explicit
+resolver = ds.MemoryArtifactResolver(definitions={bundle.fingerprint: bundle})
+host = ds.ExecutionHost(store, resolver)
+
+created = host.create(
+    bundle,
+    machine_id="counter",
+    root_instance_id="counter-42",
+    creation_id="create-counter-42",
+    bindings={},
+)
+checkpoint = host.read_checkpoint("counter-42").document
+```
+
+`MemoryExecutionStore` is ephemeral. `FileExecutionStore` provides locked atomic
+replacement and restart persistence only. SQLite advertises durable single-writer
+storage only with its verified transaction, journal, and synchronization settings.
+The optional PostgreSQL adapter provides concurrent CAS and host-owned shared
+application transactions. Every store transaction is bound to one exact root.
+
+SQLite and PostgreSQL accept explicit `replay_retention="permanent"` and
+`outbox_retention="strict" | "compact"` configuration. These settings add only the
+retention capabilities they actually enforce. Database setup records that policy
+immutably; reopening with a different policy is rejected, and database guards reject
+native root-checkpoint deletion or policy mutation. `ExecutionHost` validates required
+capabilities and composed profiles against the injected store. Strong retention
+capabilities are withheld before schema setup and whenever policy or guard validation
+fails:
+
+```python
+store = ds.SQLiteExecutionStore(
+    "bank.db",
+    replay_retention="permanent",
+    outbox_retention="strict",
+)
+store.setup_schema()
+host = ds.ExecutionHost(
+    store,
+    resolver,
+    required_capabilities={
+        ds.DURABLE_SINGLE_WRITER,
+        ds.ROOT_IDENTITY_RETENTION,
+        ds.PERMANENT_RECEIPT_RETENTION,
+    },
+    profile="exactly_once_committed_processing",
+)
+```
+
+For PostgreSQL application composition, `run_shared_transaction` opens and owns one
+native transaction. Its callback receives the Psycopg connection plus a root-bound
+staging surface for exactly one host operation. That operation returns only
+`StagedExecutionResult`; the portable committed or pending response is returned by
+`run_shared_transaction` after the native transaction commits. Callback failure rolls
+back both application writes and checkpoint work.
+
+File and database schema setup is never implicit. SQLite and PostgreSQL validate an
+explicit schema version and the exact required tables, columns, types, nullability,
+primary keys, indexes, immutable policy rows, and deletion-protection triggers before
+checkpoint use.
+
+`ExecutionStoreRegistry` starts empty. `register_bundled_execution_stores` registers
+`memory`, `file`, `sqlite`, and `postgresql` through the same public operation used by
+third-party factories. URI resolution extracts only the scheme; each factory owns its
+configuration. Root checkpoint deletion is unsupported.
+
+## Implemented Surface
 
 - strict format-1 loading, default materialization, bundle fingerprinting, and exact
   source-level scalar handling;
@@ -161,10 +239,15 @@ persistence profile verifies the required transaction ordering.
 - canonical aggregate serialization/restoration, portable typed values, package
   attachments, exact definition resolution, trusted lazy migration, deterministic
   audits, resource limits, and atomic migrate-and-dispatch results.
+- strict portable execution-checkpoint parsing, canonical digests, semantic
+  validation, synchronous transaction/CAS/replay orchestration, receipts, pending
+  delivery, outbox lifecycle, replay retention, and root tombstones;
+- public direct execution-store injection and explicit registration for memory, file,
+  SQLite, optional PostgreSQL, and third-party adapters.
 
-Format 1 deliberately does not define native queues, timers, deferral, dead letters,
-database schemas, package imports, standardized enabled-event inspection, or a
-standardized execution CLI.
+Format 1 deliberately does not define timers, a broker implementation, package
+imports, standardized enabled-event inspection, or a standardized execution CLI.
+Adapter storage schemas are implementation-owned and require explicit setup.
 
 The implementation-local CLI only validates a bundle:
 
