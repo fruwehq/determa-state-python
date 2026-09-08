@@ -8,14 +8,19 @@ commit `318ef1f16ae024770090bd338c8b70056df2855b`. Correctness is determined by 
 110-case core suite, persistence profiles, and 85-vector execution-checkpoint profile
 at conformance commit `86cb08a98267371b96b8f4908409aee022e4b4fe`.
 
-The package metadata is `0.1.0` for the next synchronized release of the specification,
-conformance suite, Python engine, and Rust engine.
+Version `0.1.0` is the published synchronized release of the specification, conformance
+suite, Python engine, and Rust engine.
 
 ## Install
 
-The published `0.0.7` distribution predates portable persistence and definition
-migration. Until the synchronized `0.1.0` Determa State release is published, install
-this release candidate from a checkout:
+The published `0.1.0` distribution includes portable persistence and definition
+migration. Install it from PyPI:
+
+```sh
+python -m pip install determa-state==0.1.0
+```
+
+To work from the current development checkout instead:
 
 ```sh
 git clone https://github.com/fruwehq/determa-state-python.git

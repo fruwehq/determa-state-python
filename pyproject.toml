@@ -40,6 +40,8 @@ postgresql = [
   "psycopg[binary]>=3.1,<4",
 ]
 dev = [
+  "build>=1",
+  "hatchling",
   "pytest>=8",
   "ruff",
   "mypy",
