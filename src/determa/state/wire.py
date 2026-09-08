@@ -386,7 +386,7 @@ def _format_code(document: Any, kind: str) -> str | None:
     format_member, expected_format, version_member, expected_version, format_code, version_code = (
         definitions[kind]
     )
-    if format_member in document and document[format_member] != expected_format:
+    if format_member not in document or document[format_member] != expected_format:
         return format_code
     if version_member in document and document[version_member] != expected_version:
         return version_code

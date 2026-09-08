@@ -24,6 +24,7 @@ from determa.state import (
 )
 from determa.state.wire import (
     canonical_bytes,
+    load_json_artifact,
     migration_descriptor_digest,
     strict_json,
 )
@@ -107,6 +108,14 @@ def _limits(path: Path, vector: dict[str, Any]) -> MigrationLimits | None:
 def _run_vector(path: Path, vector: dict[str, Any]) -> None:
     operation = vector["operation"]
     expected = vector["expect"]
+    descriptor_source = (
+        (path / vector["migration_descriptor"]).read_bytes()
+        if operation == "decode_selected_migration_descriptor"
+        else None
+    )
+    descriptor_snapshot = (
+        bytes(descriptor_source) if descriptor_source is not None else None
+    )
     source_key = (
         "aggregate_state_package"
         if operation.startswith("restore_package")
@@ -116,6 +125,12 @@ def _run_vector(path: Path, vector: dict[str, Any]) -> None:
     source_snapshot = bytes(source) if source is not None else None
     resolver = _resolver(path, vector)
     try:
+        if operation == "decode_selected_migration_descriptor":
+            assert descriptor_source is not None
+            load_json_artifact(descriptor_source, "migration_descriptor")
+            assert expected == {"result": "success"}, vector["name"]
+            assert descriptor_source == descriptor_snapshot
+            return
         if operation == "serialize_created_aggregate":
             bundle = load_bundle((path / vector["source_bundle"]).read_text(encoding="utf-8"))
             result = create(bundle, **vector["creation"])
@@ -233,6 +248,8 @@ def _run_vector(path: Path, vector: dict[str, Any]) -> None:
     except ArtifactError as error:
         assert expected["result"] == "failure", (vector["name"], error.code)
         assert error.code == expected["code"], (vector["name"], error.code)
+        if descriptor_source is not None:
+            assert descriptor_source == descriptor_snapshot
         if expected.get("caller_still_owns_aggregate"):
             assert source == source_snapshot
         if vector.get("repeat_count", 1) > 1:

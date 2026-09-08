@@ -18,6 +18,7 @@ from determa.state import (
 from determa.state.wire import (
     aggregate_state_digest,
     canonical_bytes,
+    load_json_artifact,
     migration_descriptor_digest,
     strict_json,
 )
@@ -78,6 +79,46 @@ def _resolver_for(bundle):
 def _redigest(document):
     document["aggregate_state_digest"] = aggregate_state_digest(document)
     return canonical_bytes(document)
+
+
+LEGACY_SNAPSHOT = b'''{
+  "machine": {
+    "id": "legacy_job",
+    "version": "0.0.6"
+  },
+  "configuration": ["idle"],
+  "extended_state_variables": {
+    "attempts": 1
+  }
+}\n'''
+
+
+def test_selected_legacy_migration_descriptor_without_discriminator_is_unsupported() -> None:
+    source = bytes(LEGACY_SNAPSHOT)
+    resolver = MemoryArtifactResolver()
+
+    with pytest.raises(ArtifactError) as raised:
+        resolver.put_migration_descriptor("sha256:" + "0" * 64, source)
+
+    assert raised.value.code == "unsupported_migration_descriptor_format"
+    assert source == LEGACY_SNAPSHOT
+
+
+@pytest.mark.parametrize(
+    ("kind", "code"),
+    [
+        ("aggregate_state", "unsupported_aggregate_state_format"),
+        ("aggregate_state_package", "unsupported_aggregate_state_package_format"),
+        ("execution_checkpoint", "unsupported_execution_checkpoint_format"),
+    ],
+)
+def test_selected_legacy_artifact_decoder_uses_its_exact_format_code(
+    kind: str, code: str
+) -> None:
+    with pytest.raises(ArtifactError) as raised:
+        load_json_artifact(LEGACY_SNAPSHOT, kind)
+
+    assert raised.value.code == code
 
 
 def test_aggregate_round_trip_is_canonical_and_does_not_mutate_state() -> None:
