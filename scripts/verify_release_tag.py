@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import ast
+import re
 import sys
 from pathlib import Path
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 VERSION_SOURCE = PROJECT_ROOT / "src" / "determa" / "state" / "__about__.py"
+STABLE_VERSION_PATTERN = re.compile(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)")
+STABLE_TAG_PATTERN = re.compile(r"v(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)")
 
 
 def package_version(path: Path = VERSION_SOURCE) -> str:
@@ -24,11 +27,14 @@ def package_version(path: Path = VERSION_SOURCE) -> str:
         and isinstance(statement.value, ast.Constant)
         and isinstance(statement.value.value, str)
     ]
-    if len(values) != 1 or not values[0]:
+    if len(values) != 1:
         raise ValueError(
-            f"{path} must contain exactly one non-empty literal __version__ assignment"
+            f"{path} must contain exactly one literal __version__ assignment"
         )
-    return values[0]
+    version = values[0]
+    if STABLE_VERSION_PATTERN.fullmatch(version) is None:
+        raise ValueError(f"package version must be an exact stable X.Y.Z version, got {version!r}")
+    return version
 
 
 def expected_tag(path: Path = VERSION_SOURCE) -> str:
@@ -41,6 +47,13 @@ def main(argv: list[str]) -> int:
         return 2
 
     tag = argv[1]
+    if STABLE_TAG_PATTERN.fullmatch(tag) is None:
+        print(
+            f"invalid release tag: expected exact stable vX.Y.Z, received {tag!r}",
+            file=sys.stderr,
+        )
+        return 1
+
     try:
         expected = expected_tag()
     except (OSError, SyntaxError, ValueError) as error:

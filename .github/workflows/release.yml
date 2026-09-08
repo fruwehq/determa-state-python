@@ -22,7 +22,7 @@ jobs:
         run: python scripts/verify_release_tag.py "$RELEASE_TAG"
       - name: Build sdist + wheel
         run: |
-          python -m pip install --upgrade build
+          python -m pip install --upgrade build 'jsonschema>=4'
           python -m build
       - name: Check metadata
         run: |
@@ -46,4 +46,4 @@ jobs:
         with:
           name: dist
           path: dist/
-      - uses: pypa/gh-action-pypi-publish@a892a5a61159132606e93a2fa6f4358831b04d26 # v1.14.2
+      - uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2

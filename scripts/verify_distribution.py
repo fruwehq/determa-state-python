@@ -4,13 +4,19 @@
 from __future__ import annotations
 
 import email
+import json
 import sys
 import tarfile
 import zipfile
 from email.message import Message
 from pathlib import Path
 
-from verify_release_tag import package_version
+import jsonschema
+
+if __package__:
+    from .verify_release_tag import package_version
+else:
+    from verify_release_tag import package_version
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SCHEMA_SOURCE_DIRECTORY = PROJECT_ROOT / "src" / "determa" / "state" / "data"
@@ -37,6 +43,45 @@ def _verify_metadata(metadata: Message, artifact: Path) -> None:
         )
 
 
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-JSON numeric constant {value!r}")
+
+
+def _strict_json_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key {key!r}")
+        result[key] = value
+    return result
+
+
+def _verify_schema(contents: bytes, relative_path: str, artifact: Path) -> None:
+    try:
+        document = json.loads(
+            contents.decode("utf-8"),
+            parse_constant=_reject_json_constant,
+            object_pairs_hook=_strict_json_object,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+        raise ValueError(
+            f"{artifact.name} contains invalid JSON in {relative_path}: {error}"
+        ) from error
+    if not isinstance(document, dict):
+        raise ValueError(f"{artifact.name} schema {relative_path} must be a JSON object")
+    try:
+        jsonschema.Draft202012Validator.check_schema(document)
+    except jsonschema.SchemaError as error:
+        raise ValueError(
+            f"{artifact.name} contains an invalid Draft 2020-12 schema in {relative_path}: "
+            f"{error.message}"
+        ) from error
+
+    canonical = (PROJECT_ROOT / "src" / relative_path).read_bytes()
+    if contents != canonical:
+        raise ValueError(f"{artifact.name} schema {relative_path} differs from canonical source")
+
+
 def _verify_wheel(path: Path) -> None:
     with zipfile.ZipFile(path) as archive:
         names = set(archive.namelist())
@@ -44,9 +89,19 @@ def _verify_wheel(path: Path) -> None:
         if len(metadata_paths) != 1:
             raise ValueError(f"{path.name} must contain exactly one dist-info METADATA file")
         _verify_metadata(_metadata(archive.read(metadata_paths[0]), path), path)
-        missing = [schema for schema in SCHEMA_RELATIVE_PATHS if schema not in names]
-        if missing:
-            raise ValueError(f"{path.name} omits packaged schemas: {', '.join(missing)}")
+        packaged_schemas = {
+            name
+            for name in names
+            if name.startswith("determa/state/data/") and name.endswith(".schema.json")
+        }
+        expected_schemas = set(SCHEMA_RELATIVE_PATHS)
+        if packaged_schemas != expected_schemas:
+            raise ValueError(
+                f"{path.name} packaged schemas do not match canonical sources: "
+                f"expected {sorted(expected_schemas)!r}, found {sorted(packaged_schemas)!r}"
+            )
+        for schema in sorted(packaged_schemas):
+            _verify_schema(archive.read(schema), schema, path)
 
 
 def _verify_sdist(path: Path) -> None:
@@ -60,13 +115,26 @@ def _verify_sdist(path: Path) -> None:
         if source is None:
             raise ValueError(f"{path.name} cannot read {metadata_paths[0]}")
         _verify_metadata(_metadata(source.read(), path), path)
-        missing = [
-            schema
-            for schema in SCHEMA_RELATIVE_PATHS
-            if not any(name.endswith(f"/src/{schema}") for name in names)
-        ]
-        if missing:
-            raise ValueError(f"{path.name} omits packaged schemas: {', '.join(missing)}")
+        packaged_schemas: dict[str, str] = {}
+        marker = "/src/determa/state/data/"
+        for name in names:
+            if marker not in name or not name.endswith(".schema.json"):
+                continue
+            relative_path = f"determa/state/data/{name.split(marker, 1)[1]}"
+            if relative_path in packaged_schemas:
+                raise ValueError(f"{path.name} contains duplicate schema {relative_path}")
+            packaged_schemas[relative_path] = name
+        expected_schemas = set(SCHEMA_RELATIVE_PATHS)
+        if set(packaged_schemas) != expected_schemas:
+            raise ValueError(
+                f"{path.name} packaged schemas do not match canonical sources: "
+                f"expected {sorted(expected_schemas)!r}, found {sorted(packaged_schemas)!r}"
+            )
+        for schema, member_name in sorted(packaged_schemas.items()):
+            schema_source = archive.extractfile(archive.getmember(member_name))
+            if schema_source is None:
+                raise ValueError(f"{path.name} cannot read {member_name}")
+            _verify_schema(schema_source.read(), schema, path)
 
 
 def main(argv: list[str]) -> int:
