@@ -10,11 +10,35 @@ import zipfile
 from pathlib import Path
 
 import pytest
+import yaml
 
 from scripts.verify_distribution import SCHEMA_RELATIVE_PATHS, _verify_schema
 from scripts.verify_release_tag import expected_tag, package_version
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_required_workflow_context_remains_stable() -> None:
+    workflow = yaml.safe_load(
+        (PROJECT_ROOT / ".github" / "workflows" / "test.yml").read_text(encoding="utf-8")
+    )
+    jobs = workflow["jobs"]
+
+    baseline = jobs["test"]
+    assert "name" not in baseline
+    assert baseline["runs-on"] == "${{ matrix.os }}"
+    assert baseline["strategy"]["matrix"] == {"os": ["ubuntu-24.04"]}
+    assert baseline["steps"][1]["with"]["python-version"] == "3.13"
+
+    compatibility = jobs["python-311-compatibility"]
+    assert compatibility["name"] == "Python 3.11 compatibility"
+    assert compatibility["runs-on"] == "ubuntu-24.04"
+    assert compatibility["steps"][1]["with"]["python-version"] == "3.11"
+
+    expected_gate_commands = ["ruff check .", "mypy src/determa", "pytest -q"]
+    for job in (baseline, compatibility):
+        commands = [step.get("run") for step in job["steps"]]
+        assert all(command in commands for command in expected_gate_commands)
 
 
 def test_release_tag_matches_single_package_version() -> None:
