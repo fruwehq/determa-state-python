@@ -8,6 +8,7 @@ import json
 import sys
 import tarfile
 import zipfile
+from collections import Counter
 from email.message import Message
 from pathlib import Path
 
@@ -84,7 +85,11 @@ def _verify_schema(contents: bytes, relative_path: str, artifact: Path) -> None:
 
 def _verify_wheel(path: Path) -> None:
     with zipfile.ZipFile(path) as archive:
-        names = set(archive.namelist())
+        member_names = [member.filename for member in archive.infolist()]
+        duplicates = sorted(name for name, count in Counter(member_names).items() if count > 1)
+        if duplicates:
+            raise ValueError(f"{path.name} contains duplicate archive members: {duplicates!r}")
+        names = set(member_names)
         metadata_paths = [name for name in names if name.endswith(".dist-info/METADATA")]
         if len(metadata_paths) != 1:
             raise ValueError(f"{path.name} must contain exactly one dist-info METADATA file")
@@ -106,7 +111,13 @@ def _verify_wheel(path: Path) -> None:
 
 def _verify_sdist(path: Path) -> None:
     with tarfile.open(path, "r:gz") as archive:
-        names = set(archive.getnames())
+        members = archive.getmembers()
+        duplicates = sorted(
+            name for name, count in Counter(member.name for member in members).items() if count > 1
+        )
+        if duplicates:
+            raise ValueError(f"{path.name} contains duplicate archive members: {duplicates!r}")
+        names = {member.name for member in members}
         metadata_paths = [name for name in names if name.endswith("/PKG-INFO")]
         if len(metadata_paths) != 1:
             raise ValueError(f"{path.name} must contain exactly one PKG-INFO file")

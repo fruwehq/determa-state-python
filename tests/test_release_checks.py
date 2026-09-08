@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import io
+import shutil
 import subprocess
 import sys
 import tarfile
+import warnings
 import zipfile
 from pathlib import Path
 
@@ -91,38 +93,97 @@ def test_zero_stable_version_is_valid(tmp_path: Path) -> None:
     assert package_version(version_source) == "0.0.0"
 
 
-def _metadata() -> bytes:
-    return (
-        b"Metadata-Version: 2.4\n"
-        b"Name: determa-state\n"
-        b"Version: 0.1.0\n"
-        b"Requires-Python: >=3.11\n\n"
+@pytest.fixture(scope="session")
+def built_distributions(tmp_path_factory: pytest.TempPathFactory) -> tuple[Path, Path]:
+    output = tmp_path_factory.mktemp("distribution-build")
+    subprocess.run(
+        [sys.executable, "-m", "build", "--no-isolation", "--outdir", str(output)],
+        cwd=PROJECT_ROOT,
+        check=True,
+    )
+    wheels = list(output.glob("*.whl"))
+    sdists = list(output.glob("*.tar.gz"))
+    assert len(wheels) == 1
+    assert len(sdists) == 1
+    return wheels[0], sdists[0]
+
+
+def _copy_distributions(
+    built_distributions: tuple[Path, Path], destination: Path
+) -> tuple[Path, Path]:
+    wheel, sdist = built_distributions
+    return shutil.copy2(wheel, destination / wheel.name), shutil.copy2(
+        sdist, destination / sdist.name
     )
 
 
-def _write_wheel(path: Path, *, corrupt_schema: str | None = None) -> None:
-    with zipfile.ZipFile(path, "w") as archive:
-        archive.writestr("determa_state-0.1.0.dist-info/METADATA", _metadata())
-        for schema in SCHEMA_RELATIVE_PATHS:
-            contents = (PROJECT_ROOT / "src" / schema).read_bytes()
-            if schema == corrupt_schema:
-                contents = contents.replace(b'"title"', b'"corrupted"', 1)
-            archive.writestr(schema, contents)
+def _corrupt_schema(contents: bytes) -> bytes:
+    corrupted = contents.replace(b'"title"', b'"corrupted"', 1)
+    assert corrupted != contents
+    return corrupted
 
 
-def _write_sdist(path: Path, *, corrupt_schema: str | None = None) -> None:
-    root = "determa_state-0.1.0"
-    with tarfile.open(path, "w:gz") as archive:
-        members = {f"{root}/PKG-INFO": _metadata()}
-        for schema in SCHEMA_RELATIVE_PATHS:
-            contents = (PROJECT_ROOT / "src" / schema).read_bytes()
-            if schema == corrupt_schema:
-                contents = contents.replace(b'"title"', b'"corrupted"', 1)
-            members[f"{root}/src/{schema}"] = contents
-        for name, contents in members.items():
-            member = tarfile.TarInfo(name)
-            member.size = len(contents)
-            archive.addfile(member, io.BytesIO(contents))
+def _rewrite_wheel(path: Path, schema: str) -> None:
+    rewritten = path.with_suffix(".rewritten.whl")
+    with zipfile.ZipFile(path) as source, zipfile.ZipFile(rewritten, "w") as destination:
+        for member in source.infolist():
+            contents = source.read(member)
+            destination.writestr(
+                member,
+                _corrupt_schema(contents) if member.filename == schema else contents,
+            )
+    rewritten.replace(path)
+
+
+def _rewrite_sdist(path: Path, schema: str) -> None:
+    rewritten = path.with_name(f"{path.name}.rewritten")
+    marker = f"/src/{schema}"
+    with tarfile.open(path, "r:gz") as source, tarfile.open(rewritten, "w:gz") as destination:
+        for member in source.getmembers():
+            extracted = source.extractfile(member) if member.isfile() else None
+            contents = extracted.read() if extracted is not None else None
+            if member.name.endswith(marker) and contents is not None:
+                contents = _corrupt_schema(contents)
+                member.size = len(contents)
+            destination.addfile(member, io.BytesIO(contents) if contents is not None else None)
+    rewritten.replace(path)
+
+
+def _duplicate_wheel_member(path: Path, *, metadata: bool) -> None:
+    with zipfile.ZipFile(path, "a") as archive:
+        def selected(member: zipfile.ZipInfo) -> bool:
+            if metadata:
+                return member.filename.endswith(".dist-info/METADATA")
+            return member.filename == SCHEMA_RELATIVE_PATHS[0]
+
+        name = next(
+            member.filename
+            for member in archive.infolist()
+            if selected(member)
+        )
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", UserWarning)
+            archive.writestr(name, b"concealed duplicate corruption")
+
+
+def _duplicate_sdist_member(path: Path, *, metadata: bool) -> None:
+    rewritten = path.with_name(f"{path.name}.rewritten")
+    with tarfile.open(path, "r:gz") as source, tarfile.open(rewritten, "w:gz") as destination:
+        members = source.getmembers()
+        for member in members:
+            extracted = source.extractfile(member) if member.isfile() else None
+            contents = extracted.read() if extracted is not None else None
+            destination.addfile(member, io.BytesIO(contents) if contents is not None else None)
+        def selected(member: tarfile.TarInfo) -> bool:
+            if metadata:
+                return member.name.endswith("/PKG-INFO")
+            return member.name.endswith(f"/src/{SCHEMA_RELATIVE_PATHS[0]}")
+
+        name = next(member.name for member in members if selected(member))
+        duplicate = tarfile.TarInfo(name)
+        duplicate.size = len(b"concealed duplicate corruption")
+        destination.addfile(duplicate, io.BytesIO(b"concealed duplicate corruption"))
+    rewritten.replace(path)
 
 
 def _run_distribution_verifier(directory: Path) -> subprocess.CompletedProcess[str]:
@@ -135,9 +196,10 @@ def _run_distribution_verifier(directory: Path) -> subprocess.CompletedProcess[s
     )
 
 
-def test_distribution_verifier_accepts_canonical_schemas(tmp_path: Path) -> None:
-    _write_wheel(tmp_path / "determa_state-0.1.0-py3-none-any.whl")
-    _write_sdist(tmp_path / "determa_state-0.1.0.tar.gz")
+def test_distribution_verifier_accepts_canonical_schemas(
+    tmp_path: Path, built_distributions: tuple[Path, Path]
+) -> None:
+    _copy_distributions(built_distributions, tmp_path)
 
     result = _run_distribution_verifier(tmp_path)
 
@@ -162,19 +224,36 @@ def test_distribution_verifier_meta_validates_draft_2020_12_schema() -> None:
 
 @pytest.mark.parametrize("artifact", ["wheel", "sdist"])
 def test_distribution_verifier_rejects_corrupted_schema(
-    tmp_path: Path, artifact: str
+    tmp_path: Path, built_distributions: tuple[Path, Path], artifact: str
 ) -> None:
     corrupted_schema = SCHEMA_RELATIVE_PATHS[0]
-    _write_wheel(
-        tmp_path / "determa_state-0.1.0-py3-none-any.whl",
-        corrupt_schema=corrupted_schema if artifact == "wheel" else None,
-    )
-    _write_sdist(
-        tmp_path / "determa_state-0.1.0.tar.gz",
-        corrupt_schema=corrupted_schema if artifact == "sdist" else None,
-    )
+    wheel, sdist = _copy_distributions(built_distributions, tmp_path)
+    if artifact == "wheel":
+        _rewrite_wheel(wheel, corrupted_schema)
+    else:
+        _rewrite_sdist(sdist, corrupted_schema)
 
     result = _run_distribution_verifier(tmp_path)
 
     assert result.returncode == 1
     assert "differs from canonical source" in result.stderr
+
+
+@pytest.mark.parametrize("artifact", ["wheel", "sdist"])
+@pytest.mark.parametrize("member_kind", ["schema", "metadata"])
+def test_distribution_verifier_rejects_duplicate_members(
+    tmp_path: Path,
+    built_distributions: tuple[Path, Path],
+    artifact: str,
+    member_kind: str,
+) -> None:
+    wheel, sdist = _copy_distributions(built_distributions, tmp_path)
+    if artifact == "wheel":
+        _duplicate_wheel_member(wheel, metadata=member_kind == "metadata")
+    else:
+        _duplicate_sdist_member(sdist, metadata=member_kind == "metadata")
+
+    result = _run_distribution_verifier(tmp_path)
+
+    assert result.returncode == 1
+    assert "duplicate archive members" in result.stderr
