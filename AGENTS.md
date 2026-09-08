@@ -15,8 +15,9 @@ The synchronized 0.1.0 release uses these immutable inputs:
 - conformance: `86cb08a98267371b96b8f4908409aee022e4b4fe` (110 core cases,
   persistence profiles, and the 85-vector execution-checkpoint profile).
 
-The package metadata is `0.1.0` for the next synchronized release; the specification,
-conformance suite, Python engine, and Rust engine version together.
+Version `0.1.0` is the published synchronized release. The specification, conformance
+suite, Python engine, and Rust engine version together for each future synchronized
+release.
 
 ## Boundaries
 
