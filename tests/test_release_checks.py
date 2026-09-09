@@ -42,8 +42,8 @@ def test_required_workflow_context_remains_stable() -> None:
 
 
 def test_release_tag_matches_single_package_version() -> None:
-    assert package_version() == "0.1.0"
-    assert expected_tag() == "v0.1.0"
+    assert package_version() == "0.2.0"
+    assert expected_tag() == "v0.2.0"
 
 
 def test_release_tag_rejects_mismatch() -> None:
