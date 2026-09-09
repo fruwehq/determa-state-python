@@ -132,8 +132,9 @@ the exact supplied state object.
 semantic validation path. Native values must satisfy the same portable Unicode and
 numeric domain as source documents.
 
-`PORTABLE_CODE_SETS` is an immutable mapping from stable registry category identifiers
-to the portable strings implemented by this package.
+Category-specific `StrEnum` definitions are used by production emitters.
+`PORTABLE_CODE_SETS` is the immutable category-to-string mapping derived from those
+definitions.
 
 ## Persist And Migrate
 

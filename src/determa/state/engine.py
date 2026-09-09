@@ -9,6 +9,21 @@ from dataclasses import dataclass
 from typing import Any, Literal, cast
 
 from . import cel
+from .codes import (
+    CreationRejectionCode as CreationCode,
+)
+from .codes import (
+    DispatchRejectionCode as DispatchCode,
+)
+from .codes import (
+    DispositionCode as Disposition,
+)
+from .codes import (
+    EngineFaultCode as FaultCode,
+)
+from .codes import (
+    MachineLoadFailureCode as LoadCode,
+)
 from .definition import Bundle, BundleSource, _escape_pointer, hash_identity, load_bundle
 from .errors import CelError, StepFault, ValidationError
 from .model import BundleModel, MachineModel, StateNode
@@ -279,19 +294,19 @@ def create(
         or not validate_unicode([machine_id, root_instance_id, creation_id])
     ):
         result = _empty_result(status="rejected", state=None, disposition=None)
-        result["rejection"] = {"code": "invalid_creation_request"}
+        result["rejection"] = {"code": CreationCode.INVALID_CREATION_REQUEST.value}
         return result
     models = BundleModel(validated)
     if machine_id not in models.machines:
         result = _empty_result(status="rejected", state=None, disposition=None)
-        result["rejection"] = {"code": "invalid_machine_target"}
+        result["rejection"] = {"code": CreationCode.INVALID_MACHINE_TARGET.value}
         return result
     machine = models.machine(machine_id)
     try:
         root_bindings = _creation_bindings(machine, bindings or {})
     except ValueError:
         result = _empty_result(status="rejected", state=None, disposition=None)
-        result["rejection"] = {"code": "invalid_binding"}
+        result["rejection"] = {"code": CreationCode.INVALID_BINDING.value}
         return result
     root_id = _root_runtime_id(validated, machine.raw, root_instance_id)
     state: dict[str, Any] = {
@@ -366,15 +381,17 @@ def dispatch(
             if isinstance(prior_state, dict)
             else "faulted",
             state=prior_state,
-            disposition="rejected",
+            disposition=Disposition.REJECTED.value,
         )
-        result["rejection"] = {"code": "invalid_prior_state"}
+        result["rejection"] = {"code": DispatchCode.INVALID_PRIOR_STATE.value}
         return result
     if prior_state["validated_bundle_fingerprint"] != validated.fingerprint:
         result = _empty_result(
-            status=prior_state["status"], state=prior_state, disposition="rejected"
+            status=prior_state["status"],
+            state=prior_state,
+            disposition=Disposition.REJECTED.value,
         )
-        result["rejection"] = {"code": "incompatible_bundle"}
+        result["rejection"] = {"code": DispatchCode.INCOMPATIBLE_BUNDLE.value}
         result["fault"] = copy.deepcopy(prior_state.get("fault"))
         return result
     if delivery is None:
@@ -382,7 +399,7 @@ def dispatch(
         result["fault"] = copy.deepcopy(prior_state.get("fault"))
         return result
     if not isinstance(delivery, dict) or set(delivery) not in ({"input"}, {"internal"}):
-        return _rejected(prior_state, "invalid_event")
+        return _rejected(prior_state, DispatchCode.INVALID_EVENT)
     mode = next(iter(delivery))
     envelope = delivery[mode]
     models = BundleModel(validated)
@@ -431,13 +448,17 @@ def dispatch(
             state["fault"] = copy.deepcopy(runtime["fault"])
         else:
             execution.emit_failure(runtime, str(envelope["event_id"]))
-        result = _empty_result(status=state["status"], state=state, disposition="faulted")
+        result = _empty_result(
+            status=state["status"], state=state, disposition=Disposition.FAULTED.value
+        )
         result["fault"] = copy.deepcopy(runtime["fault"])
         result["emissions"] = execution.emissions
         return result
     if not handled:
         result = _empty_result(
-            status=prior_state["status"], state=prior_state, disposition="unhandled"
+            status=prior_state["status"],
+            state=prior_state,
+            disposition=Disposition.UNHANDLED.value,
         )
         result["fault"] = copy.deepcopy(prior_state.get("fault"))
         return result
@@ -445,16 +466,22 @@ def dispatch(
     root = state["runtimes"][state["root_runtime_id"]]
     state["status"] = root["status"]
     state["fault"] = copy.deepcopy(root.get("fault"))
-    result = _empty_result(status=state["status"], state=state, disposition="handled")
+    result = _empty_result(
+        status=state["status"], state=state, disposition=Disposition.HANDLED.value
+    )
     result["emissions"] = execution.emissions
     result["fault"] = copy.deepcopy(root.get("fault")) if state["status"] == "faulted" else None
     return result
 
 
-def _rejected(prior_state: dict[str, Any], code: str) -> Result:
-    result = _empty_result(status=prior_state["status"], state=prior_state, disposition="rejected")
+def _rejected(prior_state: dict[str, Any], code: DispatchCode) -> Result:
+    result = _empty_result(
+        status=prior_state["status"],
+        state=prior_state,
+        disposition=Disposition.REJECTED.value,
+    )
     result["fault"] = copy.deepcopy(prior_state.get("fault"))
-    result["rejection"] = {"code": code}
+    result["rejection"] = {"code": code.value}
     return result
 
 
@@ -500,12 +527,12 @@ def _validate_prior_state_values(state: dict[str, Any]) -> None:
     def visit(value: Any, path: tuple[str | int, ...], ancestors: set[int]) -> None:
         if _is_prior_counter_path(path):
             if not _logical_counter(value):
-                raise ValidationError("numeric_value_out_of_range")
+                raise ValidationError(LoadCode.NUMERIC_VALUE_OUT_OF_RANGE)
             return
         if isinstance(value, list):
             identity = id(value)
             if identity in ancestors:
-                raise ValidationError("non_json_value")
+                raise ValidationError(LoadCode.NON_JSON_VALUE)
             ancestors.add(identity)
             for index, item in enumerate(value):
                 visit(item, (*path, index), ancestors)
@@ -514,11 +541,11 @@ def _validate_prior_state_values(state: dict[str, Any]) -> None:
         if isinstance(value, dict):
             identity = id(value)
             if identity in ancestors:
-                raise ValidationError("non_json_value")
+                raise ValidationError(LoadCode.NON_JSON_VALUE)
             ancestors.add(identity)
             for key, item in value.items():
                 if not isinstance(key, str):
-                    raise ValidationError("non_string_map_key")
+                    raise ValidationError(LoadCode.NON_STRING_MAP_KEY)
                 visit(item, (*path, key), ancestors)
             ancestors.remove(identity)
             return
@@ -1068,16 +1095,16 @@ def _valid_fault(
     next_logical_step_sequence: int,
 ) -> bool:
     pointer_codes = {
-        "guard_fault",
-        "action_fault",
-        "invalid_instance_target",
-        "inactive_component_target",
-        "binding_not_empty",
+        FaultCode.GUARD_FAULT.value,
+        FaultCode.ACTION_FAULT.value,
+        FaultCode.INVALID_INSTANCE_TARGET.value,
+        FaultCode.INACTIVE_COMPONENT_TARGET.value,
+        FaultCode.BINDING_NOT_EMPTY.value,
     }
     system_locators = {
-        "contained_runtime_fault": "system:unhandled_contained_failure",
-        "cascade_fault": "system:cascade_cleanup",
-        "invariant_fault": "system:invariant",
+        FaultCode.CONTAINED_RUNTIME_FAULT.value: "system:unhandled_contained_failure",
+        FaultCode.CASCADE_FAULT.value: "system:cascade_cleanup",
+        FaultCode.INVARIANT_FAULT.value: "system:invariant",
     }
     code = fault.get("code") if isinstance(fault, dict) else None
     locator = fault.get("source_locator") if isinstance(fault, dict) else None
@@ -1171,15 +1198,15 @@ def _validate_envelope(
     state: dict[str, Any],
     envelope: Any,
     mode: Literal["input", "internal"],
-) -> str | None:
+) -> DispatchCode | None:
     del models
     if state["status"] == "faulted":
-        return "invalid_instance_target"
+        return DispatchCode.INVALID_INSTANCE_TARGET
     if not isinstance(envelope, dict):
-        return "invalid_event"
+        return DispatchCode.INVALID_EVENT
     allowed_members = {"event", "event_id", "target", "payload", "correlation_id"}
     if set(envelope) - allowed_members:
-        return "invalid_event"
+        return DispatchCode.INVALID_EVENT
     event = envelope.get("event")
     event_id = envelope.get("event_id")
     if (
@@ -1189,7 +1216,7 @@ def _validate_envelope(
         or not event_id
         or not validate_unicode([event, event_id])
     ):
-        return "invalid_event"
+        return DispatchCode.INVALID_EVENT
     target = envelope.get("target")
     target_code, runtime = _locate_target(state, target)
     if target_code is not None:
@@ -1198,17 +1225,17 @@ def _validate_envelope(
     try:
         validate_portable_values(target)
     except ValidationError:
-        return "invalid_instance_target"
+        return DispatchCode.INVALID_INSTANCE_TARGET
     if not validate_unicode(target):
-        return "invalid_instance_target"
+        return DispatchCode.INVALID_INSTANCE_TARGET
     if runtime["status"] != "running":
         return (
-            "inactive_component_target"
+            DispatchCode.INACTIVE_COMPONENT_TARGET
             if runtime["role"] == "component"
-            else "invalid_instance_target"
+            else DispatchCode.INVALID_INSTANCE_TARGET
         )
     if mode == "input" and runtime["role"] == "component":
-        return "invalid_instance_target"
+        return DispatchCode.INVALID_INSTANCE_TARGET
     machine = next(
         item for item in bundle.raw["machines"] if item["machine_id"] == runtime["machine_id"]
     )
@@ -1219,21 +1246,21 @@ def _validate_envelope(
             (mode == "input" and runtime["role"] in {"root", "spawned"})
             or (mode == "internal" and runtime["role"] == "component")
         ):
-            return "invalid_event"
+            return DispatchCode.INVALID_EVENT
         if "correlation_id" in envelope:
-            return "invalid_correlation"
+            return DispatchCode.INVALID_CORRELATION
         payload = envelope.get("payload")
         if not isinstance(payload, dict) or set(payload) != {"changed"}:
-            return "invalid_payload"
+            return DispatchCode.INVALID_PAYLOAD
         changed = payload["changed"]
         if not isinstance(changed, dict) or not changed:
-            return "invalid_payload"
+            return DispatchCode.INVALID_PAYLOAD
         try:
             validate_portable_values(changed)
         except ValidationError:
-            return "invalid_payload"
+            return DispatchCode.INVALID_PAYLOAD
         if not validate_unicode(changed):
-            return "invalid_payload"
+            return DispatchCode.INVALID_PAYLOAD
         runtime_root = _pointer_get(bundle.raw, runtime["root_pointer"])
         variables = runtime_root.get("variables") or {}
         external = {
@@ -1242,32 +1269,32 @@ def _validate_envelope(
             if declaration.get("external") is True
         }
         if set(changed) - set(external):
-            return "invalid_payload"
+            return DispatchCode.INVALID_PAYLOAD
         try:
             for name, value in changed.items():
                 _normalize_value(value, str(external[name]["type"]))
         except ValueError:
-            return "invalid_payload"
+            return DispatchCode.INVALID_PAYLOAD
         return None
     declaration = declarations.get(event)
     if declaration is None:
         if mode == "internal" and event in _reserved_events():
             return _validate_reserved_payload(event, envelope)
-        return "invalid_event"
+        return DispatchCode.INVALID_EVENT
     expected_direction = "input" if mode == "input" else "internal"
     if declaration["direction"] != expected_direction:
-        return "invalid_event"
+        return DispatchCode.INVALID_EVENT
     correlation = envelope.get("correlation_id")
     if correlation is not None and (
         not isinstance(correlation, str) or not correlation or not validate_unicode(correlation)
     ):
-        return "invalid_correlation"
+        return DispatchCode.INVALID_CORRELATION
     if declaration.get("correlates_to") and correlation is None:
-        return "invalid_correlation"
+        return DispatchCode.INVALID_CORRELATION
     if "payload" not in envelope:
-        return "invalid_payload"
+        return DispatchCode.INVALID_PAYLOAD
     if _normalize_payload(declaration, envelope.get("payload")) is None:
-        return "invalid_payload"
+        return DispatchCode.INVALID_PAYLOAD
     return None
 
 
@@ -1280,16 +1307,18 @@ def _reserved_events() -> set[str]:
     }
 
 
-def _validate_reserved_payload(event: str, envelope: dict[str, Any]) -> str | None:
+def _validate_reserved_payload(
+    event: str, envelope: dict[str, Any]
+) -> DispatchCode | None:
     payload = envelope.get("payload")
     if not isinstance(payload, dict):
-        return "invalid_payload"
+        return DispatchCode.INVALID_PAYLOAD
     try:
         validate_portable_values(payload)
     except ValidationError:
-        return "invalid_payload"
+        return DispatchCode.INVALID_PAYLOAD
     if not validate_unicode(payload):
-        return "invalid_payload"
+        return DispatchCode.INVALID_PAYLOAD
     if event == "determa.component_completed":
         valid = set(payload) == {"component_id", "component_runtime_id"} and all(
             isinstance(payload[name], str) and bool(payload[name])
@@ -1349,7 +1378,7 @@ def _validate_reserved_payload(event: str, envelope: dict[str, Any]) -> str | No
             )
         else:
             valid = False
-    return None if valid else "invalid_payload"
+    return None if valid else DispatchCode.INVALID_PAYLOAD
 
 
 def _valid_public_fault(value: Any) -> bool:
@@ -1372,9 +1401,11 @@ def _valid_public_fault(value: Any) -> bool:
     )
 
 
-def _locate_target(state: dict[str, Any], target: Any) -> tuple[str | None, dict[str, Any] | None]:
+def _locate_target(
+    state: dict[str, Any], target: Any
+) -> tuple[DispatchCode | None, dict[str, Any] | None]:
     if not isinstance(target, dict) or len(target) != 1:
-        return "invalid_instance_target", None
+        return DispatchCode.INVALID_INSTANCE_TARGET, None
     runtimes = state["runtimes"]
     if "root" in target:
         value = target["root"]
@@ -1384,33 +1415,35 @@ def _locate_target(state: dict[str, Any], target: Any) -> tuple[str | None, dict
             or value.get("root_instance_id") != state["root_instance_id"]
             or value.get("root_runtime_id") != state["root_runtime_id"]
         ):
-            return "invalid_instance_target", None
+            return DispatchCode.INVALID_INSTANCE_TARGET, None
         runtime = runtimes[state["root_runtime_id"]]
         return _target_eligibility(state, runtime), runtime
     if "spawned_instance" in target:
         reference = target["spawned_instance"]
         if not _is_instance_reference(reference):
-            return "invalid_instance_target", None
+            return DispatchCode.INVALID_INSTANCE_TARGET, None
         runtime = runtimes.get(reference["instance_id"])
         if runtime is None or runtime.get("instance_reference") != reference:
-            return "invalid_instance_target", None
+            return DispatchCode.INVALID_INSTANCE_TARGET, None
         return _target_eligibility(state, runtime), runtime
     if "component" in target:
         value = target["component"]
         if not isinstance(value, dict):
-            return "inactive_component_target", None
+            return DispatchCode.INACTIVE_COMPONENT_TARGET, None
         runtime = runtimes.get(value.get("component_runtime_id"))
         if runtime is None or runtime.get("target") != target:
-            return "inactive_component_target", None
+            return DispatchCode.INACTIVE_COMPONENT_TARGET, None
         return _target_eligibility(state, runtime), runtime
-    return "invalid_instance_target", None
+    return DispatchCode.INVALID_INSTANCE_TARGET, None
 
 
-def _target_eligibility(state: dict[str, Any], runtime: dict[str, Any]) -> str | None:
+def _target_eligibility(
+    state: dict[str, Any], runtime: dict[str, Any]
+) -> DispatchCode | None:
     code = (
-        "inactive_component_target"
+        DispatchCode.INACTIVE_COMPONENT_TARGET
         if runtime["role"] == "component"
-        else "invalid_instance_target"
+        else DispatchCode.INVALID_INSTANCE_TARGET
     )
     if runtime["status"] != "running":
         return code
@@ -1486,7 +1519,7 @@ class _Execution:
             **copy.deepcopy(metadata),
         }
         if not replace and runtime_id in self.state["runtimes"]:
-            raise StepFault("invariant_fault", "system:invariant")
+            raise StepFault(FaultCode.INVARIANT_FAULT, "system:invariant")
         self.state["runtimes"][runtime_id] = runtime
         return runtime
 
@@ -1507,7 +1540,12 @@ class _Execution:
     def runtime_for_target(self, target: dict[str, Any]) -> dict[str, Any]:
         code, runtime = _locate_target(self.state, target)
         if code is not None or runtime is None:
-            raise StepFault(code or "invalid_instance_target", "system:invariant")
+            fault_code = (
+                FaultCode(code.value)
+                if code is not None
+                else FaultCode.INVALID_INSTANCE_TARGET
+            )
+            raise StepFault(fault_code, "system:invariant")
         return runtime
 
     def event_declaration(self, runtime: dict[str, Any], event_name: str) -> dict[str, Any] | None:
@@ -1624,7 +1662,7 @@ class _Execution:
             if selected is None and "init" in declaration:
                 selected = declaration["init"]
             if selected is None and declaration["type"] != "instance_reference":
-                raise StepFault("invariant_fault", "system:invariant")
+                raise StepFault(FaultCode.INVARIANT_FAULT, "system:invariant")
             values[name] = copy.deepcopy(selected)
         return values
 
@@ -1645,7 +1683,7 @@ class _Execution:
             if name in declarations and current.path in runtime["scopes"]:
                 return current.path, declarations[name]
             current = current.parent
-        raise StepFault("invariant_fault", "system:invariant")
+        raise StepFault(FaultCode.INVARIANT_FAULT, "system:invariant")
 
     def activation(
         self,
@@ -1674,7 +1712,8 @@ class _Execution:
         try:
             return cel.evaluate(expression, activation)
         except CelError as exc:
-            raise StepFault("guard_fault" if guard else "action_fault", pointer) from exc
+            code = FaultCode.GUARD_FAULT if guard else FaultCode.ACTION_FAULT
+            raise StepFault(code, pointer) from exc
 
     def allocate_components(
         self, runtime: dict[str, Any], machine: MachineModel, state: StateNode
@@ -1760,7 +1799,7 @@ class _Execution:
                     result[kind][name] = _normalize_value(value, str(declaration["type"]))
                 except ValueError as exc:
                     raise StepFault(
-                        "action_fault", f"{pointer}/with/{kind}/{_escape_pointer(name)}"
+                        FaultCode.ACTION_FAULT, f"{pointer}/with/{kind}/{_escape_pointer(name)}"
                     ) from exc
             for name, declaration in declarations.items():
                 if declaration.get(kind) and name not in result[kind]:
@@ -1806,7 +1845,10 @@ class _Execution:
                 "determa.component_failed",
                 "determa.spawned_instance_failed",
             }:
-                raise StepFault("contained_runtime_fault", "system:unhandled_contained_failure")
+                raise StepFault(
+                    FaultCode.CONTAINED_RUNTIME_FAULT,
+                    "system:unhandled_contained_failure",
+                )
             return False
         source, transition, pointer = selected
         try:
@@ -1859,7 +1901,7 @@ class _Execution:
         seen: set[str] = set()
         while target.is_choice:
             if target.path in seen:
-                raise StepFault("invariant_fault", "system:invariant")
+                raise StepFault(FaultCode.INVARIANT_FAULT, "system:invariant")
             seen.add(target.path)
             branch_selected = None
             for index, branch in enumerate(target.raw["choice"]):
@@ -1878,7 +1920,7 @@ class _Execution:
                     branch_selected = (branch, branch_pointer)
                     break
             if branch_selected is None:
-                raise StepFault("invariant_fault", "system:invariant")
+                raise StepFault(FaultCode.INVARIANT_FAULT, "system:invariant")
             branch, branch_pointer = branch_selected
             self.run_actions(
                 runtime,
@@ -1921,7 +1963,7 @@ class _Execution:
                     )
                 except ValueError as exc:
                     raise StepFault(
-                        "action_fault",
+                        FaultCode.ACTION_FAULT,
                         f"{action_pointer}/assign/{_escape_pointer(name)}",
                     ) from exc
             elif "send" in action:
@@ -1997,7 +2039,7 @@ class _Execution:
             evaluated_targets.append((target_spec, value))
         if send["event"] == "env":
             if not isinstance(payload_values["changed"], dict):
-                raise StepFault("action_fault", f"{pointer}/payload/changed")
+                raise StepFault(FaultCode.ACTION_FAULT, f"{pointer}/payload/changed")
             normalized_payload = {"changed": copy.deepcopy(payload_values["changed"])}
         else:
             assert declaration is not None
@@ -2009,7 +2051,7 @@ class _Execution:
                     if supplied
                     else f"{pointer}/payload"
                 )
-                raise StepFault("action_fault", locator)
+                raise StepFault(FaultCode.ACTION_FAULT, locator)
             normalized_payload = payload_result
         resolved = [
             self.resolve_send_target(runtime, target_spec, value, pointer, index, "targets" in send)
@@ -2071,24 +2113,24 @@ class _Execution:
         if target_spec.get("owner") is True:
             owner_id = runtime.get("owner_runtime_id")
             if owner_id is None or owner_id not in self.state["runtimes"]:
-                raise StepFault("invalid_instance_target", f"{pointer}{suffix}")
+                raise StepFault(FaultCode.INVALID_INSTANCE_TARGET, f"{pointer}{suffix}")
             return self.target_for(self.state["runtimes"][owner_id])
         if "component" in target_spec:
             child_id = runtime["components"].get(target_spec["component"])
             child = self.state["runtimes"].get(child_id)
             if child is None or _target_eligibility(self.state, child) is not None:
-                raise StepFault("inactive_component_target", f"{pointer}{suffix}")
+                raise StepFault(FaultCode.INACTIVE_COMPONENT_TARGET, f"{pointer}{suffix}")
             return cast(dict[str, Any], copy.deepcopy(child["target"]))
         if "instance" in target_spec:
             if not _is_instance_reference(evaluated):
-                raise StepFault("invalid_instance_target", f"{pointer}{suffix}/instance")
+                raise StepFault(FaultCode.INVALID_INSTANCE_TARGET, f"{pointer}{suffix}/instance")
             child = self.state["runtimes"].get(evaluated["instance_id"])
             if child is None or _target_eligibility(self.state, child) is not None:
-                raise StepFault("invalid_instance_target", f"{pointer}{suffix}/instance")
+                raise StepFault(FaultCode.INVALID_INSTANCE_TARGET, f"{pointer}{suffix}/instance")
             return {"spawned_instance": copy.deepcopy(evaluated)}
         if target_spec.get("external") is True:
             return "external"
-        raise StepFault("invalid_instance_target", f"{pointer}{suffix}")
+        raise StepFault(FaultCode.INVALID_INSTANCE_TARGET, f"{pointer}{suffix}")
 
     def target_for(self, runtime: dict[str, Any]) -> dict[str, Any]:
         if runtime["role"] == "root":
@@ -2115,7 +2157,7 @@ class _Execution:
         selected = refresh.get("only", list(changed))
         for index, name in enumerate(selected):
             if name not in changed:
-                raise StepFault("action_fault", f"{pointer}/refresh/only/{index}")
+                raise StepFault(FaultCode.ACTION_FAULT, f"{pointer}/refresh/only/{index}")
         for name in selected:
             scope_path, declaration = self.variable_slot(runtime, state, name)
             runtime["scopes"][scope_path][name] = _normalize_value(
@@ -2161,7 +2203,7 @@ class _Execution:
             name = spawn["bind_to"]
             scope_path, declaration = self.variable_slot(runtime, state, name)
             if runtime["scopes"][scope_path][name] is not None:
-                raise StepFault("binding_not_empty", f"{pointer}/bind_to")
+                raise StepFault(FaultCode.BINDING_NOT_EMPTY, f"{pointer}/bind_to")
             runtime["scopes"][scope_path][name] = copy.deepcopy(reference)
             holder_state = machine.states[scope_path]
             holder = {
@@ -2398,7 +2440,7 @@ class _Execution:
         try:
             self.cleanup_runtime(runtime, dispose=True, frozen=frozen)
         except StepFault as exc:
-            raise StepFault("cascade_fault", "system:cascade_cleanup") from exc
+            raise StepFault(FaultCode.CASCADE_FAULT, "system:cascade_cleanup") from exc
 
     def cleanup_runtime(
         self,

@@ -9,6 +9,12 @@ from dataclasses import dataclass
 from functools import cache
 from typing import Any
 
+from .codes import (
+    CheckpointArtifactFailureCode as CheckpointCode,
+)
+from .codes import (
+    PersistenceFailureCode as PersistenceCode,
+)
 from .errors import ArtifactError
 from .wire import (
     ArtifactSource,
@@ -57,7 +63,7 @@ def serialize_execution_checkpoint(document: Mapping[str, Any]) -> bytes:
 
 
 def _invalid() -> ArtifactError:
-    return ArtifactError("invalid_execution_checkpoint")
+    return ArtifactError(CheckpointCode.INVALID_EXECUTION_CHECKPOINT)
 
 
 @cache
@@ -520,14 +526,14 @@ def restore_execution_checkpoint(
             )
         except ArtifactError as exc:
             if exc.code in {
-                "source_definition_unavailable",
-                "definition_untrusted",
-                "definition_fingerprint_mismatch",
+                PersistenceCode.SOURCE_DEFINITION_UNAVAILABLE,
+                PersistenceCode.DEFINITION_UNTRUSTED,
+                PersistenceCode.DEFINITION_FINGERPRINT_MISMATCH,
             }:
                 raise
             raise _invalid() from exc
     if execution_checkpoint_digest(document) != document["execution_checkpoint_digest"]:
-        raise ArtifactError("execution_checkpoint_digest_mismatch")
+        raise ArtifactError(CheckpointCode.EXECUTION_CHECKPOINT_DIGEST_MISMATCH)
     validate_execution_checkpoint_semantics(document)
     return RestoredExecutionCheckpoint(
         document=copy.deepcopy(document),

@@ -282,27 +282,21 @@ class _ObservedTransaction(ExecutionStoreTransaction):
         )
 
 
-class _ObservedMemoryStore(ExecutionStore):
+class _ObservedMemoryStore(MemoryExecutionStore):
     def __init__(self, initial: dict[str, bytes], calls: list[str]) -> None:
-        self._store = MemoryExecutionStore(initial)
+        super().__init__(initial)
         self._calls = calls
 
     @property
-    def capabilities(self) -> frozenset[str]:
-        return self._store.capabilities
+    def root_instance_ids(self) -> frozenset[str]:
+        return frozenset(self._records)
 
     @contextmanager
     def transaction(
         self, root_instance_id: str
     ) -> Iterator[ExecutionStoreTransaction]:
-        with self._store.transaction(root_instance_id) as transaction:
+        with super().transaction(root_instance_id) as transaction:
             yield _ObservedTransaction(transaction, self._calls)
-
-    def setup_schema(self) -> None:
-        self._store.setup_schema()
-
-    def health(self) -> dict[str, Any]:
-        return dict(self._store.health())
 
 
 def _adapter_operation(vector: dict[str, Any]) -> dict[str, Any]:
@@ -478,32 +472,83 @@ def _outbox_records(checkpoint: dict[str, Any]) -> list[dict[str, str]]:
     ]
 
 
-def _assert_scope_state(
+def _expected_scope_maps(
     case: ExecutionCheckpointCase,
-    hosts: dict[str, ExecutionHost],
     expected: dict[str, Any],
-) -> None:
-    assert set(hosts) == {
-        scope["logical_scope_id"] for scope in expected["scopes"]
-    }
+) -> dict[str, dict[str, Any]]:
+    result = {}
     for scope in expected["scopes"]:
-        host = hosts[scope["logical_scope_id"]]
-        actual_records = []
+        checkpoints = {}
+        outbox_records = {}
         for root_instance_id, binding in scope["checkpoints"].items():
-            restored = host.read_checkpoint(root_instance_id)
-            assert restored is not None
             expected_checkpoint = _json(case.path / binding["file"])
-            assert restored.document == expected_checkpoint
+            canonical = serialize_execution_checkpoint(expected_checkpoint)
             assert (
-                f"sha256:{hashlib.sha256(restored.canonical_bytes).hexdigest()}"
+                f"sha256:{hashlib.sha256(canonical).hexdigest()}"
                 == binding["serialization_digest"]
             )
             assert (
-                restored.document["execution_checkpoint_digest"]
+                expected_checkpoint["execution_checkpoint_digest"]
                 == binding["execution_checkpoint_digest"]
             )
-            actual_records.extend(_outbox_records(restored.document))
-        assert actual_records == scope["outbox_records"]
+            checkpoints[root_instance_id] = canonical
+            outbox_records[root_instance_id] = _outbox_records(expected_checkpoint)
+        assert [
+            record
+            for root_records in outbox_records.values()
+            for record in root_records
+        ] == scope["outbox_records"]
+        result[scope["logical_scope_id"]] = {
+            "checkpoints": checkpoints,
+            "outbox_records": outbox_records,
+        }
+    return result
+
+
+def _actual_scope_maps(
+    hosts: dict[str, ExecutionHost],
+    stores: dict[str, _ObservedMemoryStore],
+) -> dict[str, dict[str, Any]]:
+    result = {}
+    for scope_id, store in stores.items():
+        checkpoints = {}
+        outbox_records = {}
+        for root_instance_id in sorted(store.root_instance_ids):
+            restored = hosts[scope_id].read_checkpoint(root_instance_id)
+            assert restored is not None
+            checkpoints[root_instance_id] = restored.canonical_bytes
+            outbox_records[root_instance_id] = _outbox_records(restored.document)
+        result[scope_id] = {
+            "checkpoints": checkpoints,
+            "outbox_records": outbox_records,
+        }
+    return result
+
+
+def _assert_complete_scope_maps(
+    actual: dict[str, dict[str, Any]],
+    expected: dict[str, dict[str, Any]],
+) -> None:
+    assert actual == expected
+
+
+def _scope_hosts(
+    case: ExecutionCheckpointCase,
+    state: dict[str, Any],
+    store_calls: list[str],
+) -> tuple[dict[str, ExecutionHost], dict[str, _ObservedMemoryStore]]:
+    hosts = {}
+    stores = {}
+    for scope in state["scopes"]:
+        initial = {
+            root_instance_id: (case.path / binding["file"]).read_bytes()
+            for root_instance_id, binding in scope["checkpoints"].items()
+        }
+        scope_id = scope["logical_scope_id"]
+        store = _ObservedMemoryStore(initial, store_calls)
+        stores[scope_id] = store
+        hosts[scope_id] = ExecutionHost(store, _resolver(case))
+    return hosts, stores
 
 
 def _run_scope_vector(item: ExecutionCheckpointVector) -> None:
@@ -513,14 +558,7 @@ def _run_scope_vector(item: ExecutionCheckpointVector) -> None:
     before = _scope_state(case, vector["scope_state_before"])
     after = _scope_state(case, vector["scope_state_after"])
     store_calls: list[str] = []
-    hosts = {}
-    for scope in before["scopes"]:
-        initial = {
-            root_instance_id: (case.path / binding["file"]).read_bytes()
-            for root_instance_id, binding in scope["checkpoints"].items()
-        }
-        store = _ObservedMemoryStore(initial, store_calls)
-        hosts[scope["logical_scope_id"]] = ExecutionHost(store, _resolver(case))
+    hosts, stores = _scope_hosts(case, before, store_calls)
 
     resolver_calls = ["resolve_execution_store_scope"]
     selection = vector["scope_selection"]
@@ -560,7 +598,10 @@ def _run_scope_vector(item: ExecutionCheckpointVector) -> None:
         "store": store_calls,
         "core": [],
     }
-    _assert_scope_state(case, hosts, after)
+    _assert_complete_scope_maps(
+        _actual_scope_maps(hosts, stores),
+        _expected_scope_maps(case, after),
+    )
 
 
 def run_execution_checkpoint_vector(item: ExecutionCheckpointVector) -> None:

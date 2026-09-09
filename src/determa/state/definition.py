@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from . import yaml12
+from .codes import MachineLoadFailureCode as LoadCode
 from .errors import ValidationError
 
 BundleSource = str | Mapping[str, Any]
@@ -33,7 +34,7 @@ def _normalize_typed_literal(declaration: dict[str, Any], member: str) -> None:
         value = float(value)
     if isinstance(value, float):
         if not math.isfinite(value):
-            raise ValidationError("numeric_value_out_of_range")
+            raise ValidationError(LoadCode.NUMERIC_VALUE_OUT_OF_RANGE)
         value = 0.0 if value == 0.0 else value
     declaration[member] = value
 
@@ -129,7 +130,7 @@ def _typed_value(value: Any) -> list[Any]:
     if isinstance(value, dict):
         entries = [[key, _typed_value(value[key])] for key in sorted(value, key=_utf8_key)]
         return ["map", entries]
-    raise ValidationError("non_json_value")
+    raise ValidationError(LoadCode.NON_JSON_VALUE)
 
 
 def canonical_json(value: Any) -> str:
@@ -173,13 +174,13 @@ def load_bundle(source: BundleSource) -> Bundle:
         document = copy.deepcopy(dict(source))
         yaml12.validate_portable_values(document)
         if not yaml12.validate_unicode(document):
-            raise ValidationError("invalid_unicode")
+            raise ValidationError(LoadCode.INVALID_UNICODE)
     else:
-        raise ValidationError("non_json_value")
+        raise ValidationError(LoadCode.NON_JSON_VALUE)
     if not isinstance(document, dict):
         raise ValidationError("structural_validation")
     if document.get("format") != 1 or isinstance(document.get("format"), bool):
-        raise ValidationError("unsupported_format")
+        raise ValidationError(LoadCode.UNSUPPORTED_FORMAT)
     from .validator import validate
 
     validate(document)

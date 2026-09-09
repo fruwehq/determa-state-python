@@ -3,136 +3,151 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from enum import StrEnum
 from types import MappingProxyType
+
+
+class CheckpointArtifactFailureCode(StrEnum):
+    EXECUTION_CHECKPOINT_DIGEST_MISMATCH = "execution_checkpoint_digest_mismatch"
+    INVALID_EXECUTION_CHECKPOINT = "invalid_execution_checkpoint"
+    UNSUPPORTED_EXECUTION_CHECKPOINT_FORMAT = "unsupported_execution_checkpoint_format"
+    UNSUPPORTED_EXECUTION_CHECKPOINT_SCHEMA_VERSION = (
+        "unsupported_execution_checkpoint_schema_version"
+    )
+
+
+class CheckpointHostFailureCode(StrEnum):
+    CHECKPOINT_REVISION_CONFLICT = "checkpoint_revision_conflict"
+    CREATION_ID_CONFLICT = "creation_id_conflict"
+    CREATION_REJECTED = "creation_rejected"
+    EFFECT_ID_CONFLICT = "effect_id_conflict"
+    EVENT_ID_CONFLICT = "event_id_conflict"
+    INJECTED_PRE_COMMIT_FAILURE = "injected_pre_commit_failure"
+    INVALID_EXECUTION_CHECKPOINT = "invalid_execution_checkpoint"
+    OPERATION_ID_CONFLICT = "operation_id_conflict"
+    PHYSICAL_DELETION_UNSUPPORTED = "physical_deletion_unsupported"
+    RESPONSE_LOST_AFTER_COMMIT = "response_lost_after_commit"
+
+
+class CheckpointPreAcceptanceFailureCode(StrEnum):
+    DELIVERY_DIGEST_MISMATCH = "delivery_digest_mismatch"
+    EVENT_ID_CONFLICT = "event_id_conflict"
+    INVALID_DELIVERY_MODE = "invalid_delivery_mode"
+    INVALID_DELIVERY_ORIGIN = "invalid_delivery_origin"
+    MALFORMED_DELIVERY = "malformed_delivery"
+    TOMBSTONED_ROOT = "tombstoned_root"
+    WRONG_ROOT = "wrong_root"
+
+
+class CreationRejectionCode(StrEnum):
+    INVALID_BINDING = "invalid_binding"
+    INVALID_CREATION_REQUEST = "invalid_creation_request"
+    INVALID_MACHINE_TARGET = "invalid_machine_target"
+
+
+class DispatchRejectionCode(StrEnum):
+    INACTIVE_COMPONENT_TARGET = "inactive_component_target"
+    INCOMPATIBLE_BUNDLE = "incompatible_bundle"
+    INVALID_CORRELATION = "invalid_correlation"
+    INVALID_EVENT = "invalid_event"
+    INVALID_INSTANCE_TARGET = "invalid_instance_target"
+    INVALID_PAYLOAD = "invalid_payload"
+    INVALID_PRIOR_STATE = "invalid_prior_state"
+
+
+class DispositionCode(StrEnum):
+    FAULTED = "faulted"
+    HANDLED = "handled"
+    REJECTED = "rejected"
+    UNHANDLED = "unhandled"
+
+
+class EngineFaultCode(StrEnum):
+    ACTION_FAULT = "action_fault"
+    BINDING_NOT_EMPTY = "binding_not_empty"
+    CASCADE_FAULT = "cascade_fault"
+    CONTAINED_RUNTIME_FAULT = "contained_runtime_fault"
+    GUARD_FAULT = "guard_fault"
+    INACTIVE_COMPONENT_TARGET = "inactive_component_target"
+    INVALID_INSTANCE_TARGET = "invalid_instance_target"
+    INVARIANT_FAULT = "invariant_fault"
+
+
+class ExecutionStoreAdapterFailureCode(StrEnum):
+    ADAPTER_CAPABILITY_MISMATCH = "adapter_capability_mismatch"
+    DUPLICATE_ADAPTER_REGISTRATION = "duplicate_adapter_registration"
+    INVALID_ADAPTER_CONFIGURATION = "invalid_adapter_configuration"
+    UNKNOWN_ADAPTER = "unknown_adapter"
+
+
+class MachineLoadFailureCode(StrEnum):
+    CEL_PROFILE_ERROR = "cel_profile_error"
+    DESTROYED_REFERENCE_BINDING = "destroyed_reference_binding"
+    DESTROYED_VARIABLE_WRITE = "destroyed_variable_write"
+    DUPLICATE_KEY = "duplicate_key"
+    INVALID_BINDING = "invalid_binding"
+    INVALID_BOOLEAN_SYNTAX = "invalid_boolean_syntax"
+    INVALID_NULL_SYNTAX = "invalid_null_syntax"
+    INVALID_NUMERIC_SYNTAX = "invalid_numeric_syntax"
+    INVALID_UNICODE = "invalid_unicode"
+    NON_JSON_VALUE = "non_json_value"
+    NON_STRING_MAP_KEY = "non_string_map_key"
+    NUMERIC_VALUE_OUT_OF_RANGE = "numeric_value_out_of_range"
+    ROOT_LOCAL_TRANSITION = "root_local_transition"
+    ROOT_REENTRY = "root_reentry"
+    SEMANTIC_VALIDATION = "semantic_validation"
+    UNSUPPORTED_FORMAT = "unsupported_format"
+    UNSUPPORTED_YAML_FEATURE = "unsupported_yaml_feature"
+
+
+class PersistenceFailureCode(StrEnum):
+    AGGREGATE_STATE_DIGEST_MISMATCH = "aggregate_state_digest_mismatch"
+    DEFINITION_FINGERPRINT_MISMATCH = "definition_fingerprint_mismatch"
+    DEFINITION_UNTRUSTED = "definition_untrusted"
+    INVALID_AGGREGATE_STATE = "invalid_aggregate_state"
+    INVALID_AGGREGATE_STATE_PACKAGE = "invalid_aggregate_state_package"
+    INVALID_MIGRATION_DESCRIPTOR = "invalid_migration_descriptor"
+    INVALID_MIGRATION_REQUEST = "invalid_migration_request"
+    MIGRATION_DESCRIPTOR_UNTRUSTED = "migration_descriptor_untrusted"
+    MIGRATION_RESOURCE_LIMIT_EXCEEDED = "migration_resource_limit_exceeded"
+    MIGRATION_ROUTE_MISMATCH = "migration_route_mismatch"
+    MIGRATION_ROUTE_MISSING = "migration_route_missing"
+    MIGRATION_TOTALITY_FAILURE = "migration_totality_failure"
+    MIGRATION_TRANSFORM_FAULT = "migration_transform_fault"
+    SOURCE_DEFINITION_UNAVAILABLE = "source_definition_unavailable"
+    TARGET_DEFINITION_UNAVAILABLE = "target_definition_unavailable"
+    TERMINAL_MIGRATION_REJECTED = "terminal_migration_rejected"
+    TERMINAL_MIGRATION_REQUIRES_MAINTENANCE = "terminal_migration_requires_maintenance"
+    UNSUPPORTED_AGGREGATE_STATE_FORMAT = "unsupported_aggregate_state_format"
+    UNSUPPORTED_AGGREGATE_STATE_PACKAGE_FORMAT = "unsupported_aggregate_state_package_format"
+    UNSUPPORTED_AGGREGATE_STATE_PACKAGE_SCHEMA_VERSION = (
+        "unsupported_aggregate_state_package_schema_version"
+    )
+    UNSUPPORTED_AGGREGATE_STATE_SCHEMA_VERSION = "unsupported_aggregate_state_schema_version"
+    UNSUPPORTED_MIGRATION_DESCRIPTOR_FORMAT = "unsupported_migration_descriptor_format"
+    UNSUPPORTED_MIGRATION_DESCRIPTOR_SCHEMA_VERSION = (
+        "unsupported_migration_descriptor_schema_version"
+    )
+
+
+_CATEGORY_TYPES: Mapping[str, type[StrEnum]] = MappingProxyType(
+    {
+        "checkpoint_artifact_failure": CheckpointArtifactFailureCode,
+        "checkpoint_host_failure": CheckpointHostFailureCode,
+        "checkpoint_pre_acceptance_failure": CheckpointPreAcceptanceFailureCode,
+        "creation_rejection": CreationRejectionCode,
+        "dispatch_rejection": DispatchRejectionCode,
+        "disposition": DispositionCode,
+        "engine_fault": EngineFaultCode,
+        "execution_store_adapter_failure": ExecutionStoreAdapterFailureCode,
+        "machine_load_failure": MachineLoadFailureCode,
+        "persistence_failure": PersistenceFailureCode,
+    }
+)
 
 PORTABLE_CODE_SETS: Mapping[str, frozenset[str]] = MappingProxyType(
     {
-        "checkpoint_artifact_failure": frozenset(
-            {
-                "execution_checkpoint_digest_mismatch",
-                "invalid_execution_checkpoint",
-                "unsupported_execution_checkpoint_format",
-                "unsupported_execution_checkpoint_schema_version",
-            }
-        ),
-        "checkpoint_host_failure": frozenset(
-            {
-                "checkpoint_revision_conflict",
-                "creation_id_conflict",
-                "creation_rejected",
-                "effect_id_conflict",
-                "event_id_conflict",
-                "injected_pre_commit_failure",
-                "invalid_execution_checkpoint",
-                "operation_id_conflict",
-                "physical_deletion_unsupported",
-                "response_lost_after_commit",
-            }
-        ),
-        "checkpoint_pre_acceptance_failure": frozenset(
-            {
-                "delivery_digest_mismatch",
-                "event_id_conflict",
-                "invalid_delivery_mode",
-                "invalid_delivery_origin",
-                "malformed_delivery",
-                "tombstoned_root",
-                "wrong_root",
-            }
-        ),
-        "creation_rejection": frozenset(
-            {
-                "invalid_binding",
-                "invalid_creation_request",
-                "invalid_machine_target",
-            }
-        ),
-        "dispatch_rejection": frozenset(
-            {
-                "inactive_component_target",
-                "incompatible_bundle",
-                "invalid_correlation",
-                "invalid_event",
-                "invalid_instance_target",
-                "invalid_payload",
-                "invalid_prior_state",
-            }
-        ),
-        "disposition": frozenset(
-            {
-                "faulted",
-                "handled",
-                "rejected",
-                "unhandled",
-            }
-        ),
-        "engine_fault": frozenset(
-            {
-                "action_fault",
-                "binding_not_empty",
-                "cascade_fault",
-                "contained_runtime_fault",
-                "guard_fault",
-                "inactive_component_target",
-                "invalid_instance_target",
-                "invariant_fault",
-            }
-        ),
-        "execution_store_adapter_failure": frozenset(
-            {
-                "adapter_capability_mismatch",
-                "duplicate_adapter_registration",
-                "invalid_adapter_configuration",
-                "unknown_adapter",
-            }
-        ),
-        "machine_load_failure": frozenset(
-            {
-                "cel_profile_error",
-                "destroyed_reference_binding",
-                "destroyed_variable_write",
-                "duplicate_key",
-                "invalid_binding",
-                "invalid_boolean_syntax",
-                "invalid_null_syntax",
-                "invalid_numeric_syntax",
-                "invalid_unicode",
-                "non_json_value",
-                "non_string_map_key",
-                "numeric_value_out_of_range",
-                "root_local_transition",
-                "root_reentry",
-                "semantic_validation",
-                "unsupported_format",
-                "unsupported_yaml_feature",
-            }
-        ),
-        "persistence_failure": frozenset(
-            {
-                "aggregate_state_digest_mismatch",
-                "definition_fingerprint_mismatch",
-                "definition_untrusted",
-                "invalid_aggregate_state",
-                "invalid_aggregate_state_package",
-                "invalid_migration_descriptor",
-                "invalid_migration_request",
-                "migration_descriptor_untrusted",
-                "migration_resource_limit_exceeded",
-                "migration_route_mismatch",
-                "migration_route_missing",
-                "migration_totality_failure",
-                "migration_transform_fault",
-                "source_definition_unavailable",
-                "target_definition_unavailable",
-                "terminal_migration_rejected",
-                "terminal_migration_requires_maintenance",
-                "unsupported_aggregate_state_format",
-                "unsupported_aggregate_state_package_format",
-                "unsupported_aggregate_state_package_schema_version",
-                "unsupported_aggregate_state_schema_version",
-                "unsupported_migration_descriptor_format",
-                "unsupported_migration_descriptor_schema_version",
-            }
-        ),
+        category: frozenset(code.value for code in code_type)
+        for category, code_type in _CATEGORY_TYPES.items()
     }
 )

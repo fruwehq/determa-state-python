@@ -8,6 +8,7 @@ from typing import Any
 
 import yaml
 
+from .codes import MachineLoadFailureCode as LoadCode
 from .errors import ValidationError
 
 _JSON_NUMBER = re.compile(r"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?\Z")
@@ -97,16 +98,16 @@ def _validate_portable_values(value: Any, ancestors: set[int]) -> None:
         return
     if isinstance(value, int):
         if not _INT_MIN <= value <= _INT_MAX:
-            raise ValidationError("numeric_value_out_of_range")
+            raise ValidationError(LoadCode.NUMERIC_VALUE_OUT_OF_RANGE)
         return
     if isinstance(value, float):
         if not math.isfinite(value):
-            raise ValidationError("numeric_value_out_of_range")
+            raise ValidationError(LoadCode.NUMERIC_VALUE_OUT_OF_RANGE)
         return
     if isinstance(value, list):
         identity = id(value)
         if identity in ancestors:
-            raise ValidationError("non_json_value")
+            raise ValidationError(LoadCode.NON_JSON_VALUE)
         ancestors.add(identity)
         for item in value:
             _validate_portable_values(item, ancestors)
@@ -115,15 +116,15 @@ def _validate_portable_values(value: Any, ancestors: set[int]) -> None:
     if isinstance(value, dict):
         identity = id(value)
         if identity in ancestors:
-            raise ValidationError("non_json_value")
+            raise ValidationError(LoadCode.NON_JSON_VALUE)
         ancestors.add(identity)
         for key, item in value.items():
             if not isinstance(key, str):
-                raise ValidationError("non_string_map_key")
+                raise ValidationError(LoadCode.NON_STRING_MAP_KEY)
             _validate_portable_values(item, ancestors)
         ancestors.remove(identity)
         return
-    raise ValidationError("non_json_value")
+    raise ValidationError(LoadCode.NON_JSON_VALUE)
 
 
 def _resolve_plain(value: str) -> Any:
@@ -132,28 +133,28 @@ def _resolve_plain(value: str) -> Any:
     if value == "false":
         return False
     if value in _INVALID_BOOLEAN:
-        raise ValidationError("invalid_boolean_syntax")
+        raise ValidationError(LoadCode.INVALID_BOOLEAN_SYNTAX)
     if value == "null":
         return None
     if value in _INVALID_NULL:
-        raise ValidationError("invalid_null_syntax")
+        raise ValidationError(LoadCode.INVALID_NULL_SYNTAX)
     if value in _STRING_BOOLEAN_LIKE:
         return value
     if _JSON_NUMBER.fullmatch(value):
         if _INTEGER.fullmatch(value):
             integer = int(value, 10)
             if not _INT_MIN <= integer <= _INT_MAX:
-                raise ValidationError("numeric_value_out_of_range")
+                raise ValidationError(LoadCode.NUMERIC_VALUE_OUT_OF_RANGE)
             return integer
         try:
             double = float(value)
         except ValueError as exc:
-            raise ValidationError("invalid_numeric_syntax") from exc
+            raise ValidationError(LoadCode.INVALID_NUMERIC_SYNTAX) from exc
         if not math.isfinite(double):
-            raise ValidationError("numeric_value_out_of_range")
+            raise ValidationError(LoadCode.NUMERIC_VALUE_OUT_OF_RANGE)
         return 0.0 if double == 0.0 else double
     if _NONPORTABLE_YAML_NUMBER.fullmatch(value):
-        raise ValidationError("invalid_numeric_syntax")
+        raise ValidationError(LoadCode.INVALID_NUMERIC_SYNTAX)
     return value
 
 
@@ -164,7 +165,7 @@ class _PortableLoader(yaml.BaseLoader):
 def _construct_scalar(loader: _PortableLoader, node: yaml.ScalarNode) -> Any:
     value = loader.construct_scalar(node)
     if _has_invalid_unicode(value):
-        raise ValidationError("invalid_unicode")
+        raise ValidationError(LoadCode.INVALID_UNICODE)
     if node.style is None:
         return _resolve_plain(value)
     return value
@@ -177,9 +178,9 @@ def _construct_mapping(
     for key_node, value_node in node.value:
         key = loader.construct_object(key_node, deep=deep)
         if not isinstance(key, str):
-            raise ValidationError("non_string_map_key")
+            raise ValidationError(LoadCode.NON_STRING_MAP_KEY)
         if key in result:
-            raise ValidationError("duplicate_key")
+            raise ValidationError(LoadCode.DUPLICATE_KEY)
         result[key] = loader.construct_object(value_node, deep=deep)
     return result
 
@@ -202,27 +203,30 @@ def _reject_yaml_features(text: str) -> None:
             if isinstance(
                 token, (yaml.tokens.AliasToken, yaml.tokens.AnchorToken, yaml.tokens.TagToken)
             ):
-                raise ValidationError("unsupported_yaml_feature")
+                raise ValidationError(LoadCode.UNSUPPORTED_YAML_FEATURE)
     except ValidationError:
         raise
     except (yaml.YAMLError, UnicodeError) as exc:
-        raise ValidationError("non_json_value", message=str(exc)) from exc
+        raise ValidationError(LoadCode.NON_JSON_VALUE, message=str(exc)) from exc
 
 
 def load(text: str) -> Any:
     """Parse exactly one portable format-1 source document."""
     if _has_invalid_unicode(text):
-        raise ValidationError("invalid_unicode")
+        raise ValidationError(LoadCode.INVALID_UNICODE)
     _reject_yaml_features(text)
     try:
         documents = list(yaml.load_all(text, Loader=_PortableLoader))
     except ValidationError:
         raise
     except (yaml.YAMLError, UnicodeError) as exc:
-        raise ValidationError("non_json_value", message=str(exc)) from exc
+        raise ValidationError(LoadCode.NON_JSON_VALUE, message=str(exc)) from exc
     if len(documents) != 1:
-        raise ValidationError("non_json_value", message="source must contain exactly one document")
+        raise ValidationError(
+            LoadCode.NON_JSON_VALUE,
+            message="source must contain exactly one document",
+        )
     document = documents[0]
     if not validate_unicode(document):
-        raise ValidationError("invalid_unicode")
+        raise ValidationError(LoadCode.INVALID_UNICODE)
     return document

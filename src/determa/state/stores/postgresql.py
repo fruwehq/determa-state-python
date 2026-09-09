@@ -9,6 +9,7 @@ from importlib import import_module
 from typing import Any
 from urllib.parse import urlsplit
 
+from ..codes import ExecutionStoreAdapterFailureCode as AdapterCode
 from .base import (
     COMPACT_EFFECT_IDENTITY_RETENTION,
     DURABLE_CONCURRENT,
@@ -133,7 +134,7 @@ class PostgreSQLExecutionStore(ExecutionStore):
             or replay_retention not in _REPLAY_RETENTION_MODES
             or outbox_retention not in _OUTBOX_RETENTION_MODES
         ):
-            raise ExecutionStoreError("invalid_adapter_configuration")
+            raise ExecutionStoreError(AdapterCode.INVALID_ADAPTER_CONFIGURATION)
         self.conninfo = conninfo
         self.table_name = table_name
         self.metadata_table = metadata_table
@@ -430,13 +431,13 @@ def postgresql_execution_store_factory(
     """Create the ordinary bundled PostgreSQL adapter without importing Psycopg."""
     parsed = urlsplit(uri)
     if parsed.scheme != "postgresql" or parsed.fragment:
-        raise ExecutionStoreError("invalid_adapter_configuration")
+        raise ExecutionStoreError(AdapterCode.INVALID_ADAPTER_CONFIGURATION)
     if set(configuration) - {
         "table_name",
         "replay_retention",
         "outbox_retention",
     }:
-        raise ExecutionStoreError("invalid_adapter_configuration")
+        raise ExecutionStoreError(AdapterCode.INVALID_ADAPTER_CONFIGURATION)
     table_name = configuration.get(
         "table_name", "determa_execution_checkpoints"
     )
@@ -446,7 +447,7 @@ def postgresql_execution_store_factory(
         isinstance(value, str)
         for value in (table_name, replay_retention, outbox_retention)
     ):
-        raise ExecutionStoreError("invalid_adapter_configuration")
+        raise ExecutionStoreError(AdapterCode.INVALID_ADAPTER_CONFIGURATION)
     return PostgreSQLExecutionStore(
         uri,
         table_name=table_name,

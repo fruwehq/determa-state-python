@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from . import cel
+from .codes import MachineLoadFailureCode as LoadCode
 from .definition import Bundle, _escape_pointer, normalize_bundle
 from .errors import CelError, ErrorRecord, ValidationError
 from .model import BundleModel, MachineModel, StateNode
@@ -195,25 +196,25 @@ def _check_expression(
             owner_fields=owner_fields if allow_owner else None,
         )
     except cel.CelProfileError as exc:
-        raise ValidationError("cel_profile_error", message=str(exc)) from exc
+        raise ValidationError(LoadCode.CEL_PROFILE_ERROR, message=str(exc)) from exc
     except CelError as exc:
-        raise ValidationError("semantic_validation", message=str(exc)) from exc
+        raise ValidationError(LoadCode.SEMANTIC_VALIDATION, message=str(exc)) from exc
 
 
 def _validate_semantics(bundle: Bundle, model: BundleModel) -> None:
     if not isinstance(bundle.raw.get("format"), int) or isinstance(bundle.raw.get("format"), bool):
-        raise ValidationError("unsupported_format")
+        raise ValidationError(LoadCode.UNSUPPORTED_FORMAT)
     events = bundle.raw.get("events") or {}
     for _name, declaration in events.items():
         correlation = declaration.get("correlates_to")
         if correlation is not None:
             target = events.get(correlation)
             if declaration["direction"] != "input" or not target or target["direction"] != "output":
-                raise ValidationError("semantic_validation")
+                raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
     graph: dict[str, set[str]] = {machine_id: set() for machine_id in model.machines}
     for machine in model.machines.values():
         if not isinstance(machine.raw["version"], int) or isinstance(machine.raw["version"], bool):
-            raise ValidationError("semantic_validation")
+            raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
         _validate_machine(bundle, model, machine, graph)
     _reject_initialization_cycles(graph)
 
@@ -227,7 +228,7 @@ def _validate_machine(
     declarations = _event_declarations(bundle, machine)
     for name, declaration in (machine.raw.get("events") or {}).items():
         if name in _RESERVED_EVENTS or declaration["direction"] != "internal":
-            raise ValidationError("semantic_validation")
+            raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
     component_ids: set[str] = set()
     for state in machine.states.values():
         _validate_variable_literals(state)
@@ -241,17 +242,17 @@ def _validate_variable_literals(state: StateNode) -> None:
     for declaration in (state.raw.get("variables") or {}).values():
         expected = str(declaration["type"])
         if "init" in declaration and not _literal_matches(declaration["init"], expected):
-            raise ValidationError("semantic_validation")
+            raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
         if expected == "int" and isinstance(declaration.get("init"), float):
-            raise ValidationError("semantic_validation")
+            raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
 
 
 def _validate_payload_literals(declaration: dict[str, Any]) -> None:
     for field in (declaration.get("payload") or {}).values():
         if "default" in field and not _literal_matches(field["default"], str(field["type"])):
-            raise ValidationError("semantic_validation")
+            raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
         if field["type"] == "int" and isinstance(field.get("default"), float):
-            raise ValidationError("semantic_validation")
+            raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
 
 
 def _validate_state_structure(
@@ -301,7 +302,7 @@ def _validate_state_structure(
     if isinstance(initial, dict):
         target = machine.resolve(initial["transition_to"], state)
         if not state.is_ancestor_of(target, strict=True):
-            raise ValidationError("semantic_validation")
+            raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
         _validate_transition(
             initial,
             bundle=bundle,
@@ -319,13 +320,13 @@ def _validate_state_structure(
     for event_name, transition_or_list in (state.raw.get("on_events") or {}).items():
         declaration = events.get(event_name)
         if declaration is None and event_name not in _RESERVED_EVENTS:
-            raise ValidationError("semantic_validation")
+            raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
         transitions = (
             transition_or_list if isinstance(transition_or_list, list) else [transition_or_list]
         )
         for index, transition in enumerate(transitions):
             if index < len(transitions) - 1 and "guard" not in transition:
-                raise ValidationError("semantic_validation")
+                raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
             suffix = f"/{index}" if isinstance(transition_or_list, list) else ""
             _validate_transition(
                 transition,
@@ -345,7 +346,7 @@ def _validate_state_structure(
         branches = state.raw["choice"]
         defaults = [index for index, branch in enumerate(branches) if "guard" not in branch]
         if defaults != [len(branches) - 1]:
-            raise ValidationError("semantic_validation")
+            raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
         for index, branch in enumerate(branches):
             _validate_transition(
                 branch,
@@ -364,7 +365,7 @@ def _validate_state_structure(
     for index, placement in enumerate(state.raw.get("components") or []):
         component_id = str(placement["component_id"])
         if component_id in component_ids:
-            raise ValidationError("semantic_validation")
+            raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
         component_ids.add(component_id)
         pointer = f"{state.pointer}/components/{index}"
         if "machine_id" in placement:
@@ -470,18 +471,18 @@ def _validate_target_shape(
     transition: dict[str, Any],
 ) -> None:
     if target is machine.root:
-        raise ValidationError("root_reentry")
+        raise ValidationError(LoadCode.ROOT_REENTRY)
     local = transition.get("local") is True
     if local:
         if source is machine.root:
-            raise ValidationError("root_local_transition")
+            raise ValidationError(LoadCode.ROOT_LOCAL_TRANSITION)
         if source.type != "composite" or not source.is_ancestor_of(target, strict=True):
-            raise ValidationError("semantic_validation")
+            raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
     if isinstance(target_spec, dict):
         if target.type != "composite" or target.raw.get("history", "none") == "none":
-            raise ValidationError("semantic_validation")
+            raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
         if target.is_ancestor_of(source, strict=True):
-            raise ValidationError("semantic_validation")
+            raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
 
 
 def _transition_boundary(
@@ -517,14 +518,14 @@ def _validate_destroyed_destinations(
             name = next(iter(action["assign"]))
             declaration_state = declarations[name][0]
             if boundary.is_ancestor_of(declaration_state, strict=True):
-                raise ValidationError("destroyed_variable_write")
+                raise ValidationError(LoadCode.DESTROYED_VARIABLE_WRITE)
         if "refresh" in action and target.type == "final" and target.parent is machine.root:
-            raise ValidationError("destroyed_variable_write")
+            raise ValidationError(LoadCode.DESTROYED_VARIABLE_WRITE)
         if "spawn" in action and "bind_to" in action["spawn"]:
             name = action["spawn"]["bind_to"]
             declaration_state = declarations[name][0]
             if boundary.is_ancestor_of(declaration_state, strict=True):
-                raise ValidationError("destroyed_reference_binding")
+                raise ValidationError(LoadCode.DESTROYED_REFERENCE_BINDING)
 
 
 def _validate_actions(
@@ -547,7 +548,7 @@ def _validate_actions(
         if "assign" in action:
             name, expression = next(iter(action["assign"].items()))
             if name not in scope_declarations or scope_declarations[name][1].get("external"):
-                raise ValidationError("semantic_validation")
+                raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
             _check_expression(
                 expression,
                 scope=scope,
@@ -584,13 +585,13 @@ def _validate_actions(
             bind_to = spawn.get("bind_to")
             if bind_to is not None:
                 if bind_to not in scope_declarations:
-                    raise ValidationError("semantic_validation")
+                    raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
                 declaration = scope_declarations[bind_to][1]
                 if declaration["type"] != "instance_reference":
-                    raise ValidationError("semantic_validation")
+                    raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
                 constraint = declaration.get("machine_id")
                 if constraint is not None and constraint != target.machine_id:
-                    raise ValidationError("semantic_validation")
+                    raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
         elif "cancel" in action:
             _check_expression(
                 action["cancel"]["instance"],
@@ -603,7 +604,7 @@ def _validate_actions(
             )
         elif "refresh" in action:
             if event_name != "env":
-                raise ValidationError("semantic_validation")
+                raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
 
 
 def _validate_send(
@@ -624,12 +625,12 @@ def _validate_send(
     external = any(target.get("external") is True for target in targets)
     if event_name == "env":
         if len(targets) != 1 or "component" not in targets[0]:
-            raise ValidationError("semantic_validation")
+            raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
         changed = (send.get("payload") or {}).get("changed")
         if not isinstance(changed, str) or not changed.strip().startswith("{"):
-            raise ValidationError("semantic_validation")
+            raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
         if changed.strip() == "{}" or "correlation_id" in send:
-            raise ValidationError("semantic_validation")
+            raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
         component_id = targets[0]["component"]
         placement = next(
             (
@@ -640,7 +641,7 @@ def _validate_send(
             None,
         )
         if placement is None:
-            raise ValidationError("semantic_validation")
+            raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
         pointer = (
             f"{state.pointer}/components/{(state.raw.get('components') or []).index(placement)}"
         )
@@ -662,28 +663,28 @@ def _validate_send(
                 event_fields=event_fields,
             )
         except cel.CelProfileError as exc:
-            raise ValidationError("cel_profile_error", message=str(exc)) from exc
+            raise ValidationError(LoadCode.CEL_PROFILE_ERROR, message=str(exc)) from exc
         except CelError as exc:
-            raise ValidationError("semantic_validation", message=str(exc)) from exc
+            raise ValidationError(LoadCode.SEMANTIC_VALIDATION, message=str(exc)) from exc
         return
     if declaration is None or event_name in _RESERVED_EVENTS:
-        raise ValidationError("semantic_validation")
+        raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
     expected_direction = "output" if external else "internal"
     if declaration["direction"] != expected_direction:
-        raise ValidationError("semantic_validation")
+        raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
     if external and "correlation_id" not in send:
-        raise ValidationError("semantic_validation")
+        raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
     payload_types = _payload_types(declaration, event_name)
     supplied = send.get("payload") or {}
     if set(supplied) - set(payload_types):
-        raise ValidationError("semantic_validation")
+        raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
     required = {
         name
         for name, field in (declaration.get("payload") or {}).items()
         if field.get("required") is True and "default" not in field
     }
     if required - set(supplied):
-        raise ValidationError("semantic_validation")
+        raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
     for name, expression in supplied.items():
         _check_expression(
             expression,
@@ -733,14 +734,14 @@ def _validate_bindings(
         }
         supplied = bindings.get(kind) or {}
         if set(supplied) - set(expected):
-            raise ValidationError("invalid_binding")
+            raise ValidationError(LoadCode.INVALID_BINDING)
         missing = {
             name
             for name, declaration in expected.items()
             if name not in supplied and "init" not in declaration
         }
         if missing:
-            raise ValidationError("invalid_binding")
+            raise ValidationError(LoadCode.INVALID_BINDING)
         for name, expression in supplied.items():
             _check_expression(
                 expression,
@@ -786,7 +787,7 @@ def _validate_reachability(machine: MachineModel) -> None:
         changed = len(reachable) != before
     unreachable = [state for state in machine.states.values() if state.path not in reachable]
     if unreachable:
-        raise ValidationError("semantic_validation", path=unreachable[0].pointer)
+        raise ValidationError(LoadCode.SEMANTIC_VALIDATION, path=unreachable[0].pointer)
 
 
 def _reject_initialization_cycles(graph: dict[str, set[str]]) -> None:
@@ -795,7 +796,7 @@ def _reject_initialization_cycles(graph: dict[str, set[str]]) -> None:
 
     def visit(machine_id: str) -> None:
         if machine_id in visiting:
-            raise ValidationError("semantic_validation")
+            raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
         if machine_id in visited:
             return
         visiting.add(machine_id)
