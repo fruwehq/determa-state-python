@@ -26,7 +26,7 @@ SCHEMAS = (
     "aggregate-state-package.schema.json",
     "execution-checkpoint.schema.json",
 )
-SPEC_COMMIT = "cc4b0d734aa1c5953de75fb53b63e390a3b72761"
+SPEC_COMMIT = "7782671b56165a59caa61a65c29fefc63105ebf8"
 
 
 def _fetch(name: str) -> str:
