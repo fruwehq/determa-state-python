@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping
 from typing import Any
 from urllib.parse import urlsplit
 
+from ..codes import ExecutionStoreAdapterFailureCode as AdapterCode
 from .base import ExecutionStore, ExecutionStoreError
 
 ExecutionStoreFactory = Callable[[str, Mapping[str, Any]], ExecutionStore]
@@ -25,9 +26,9 @@ class ExecutionStoreRegistry:
 
     def register(self, identifier: str, factory: ExecutionStoreFactory) -> None:
         if _IDENTIFIER.fullmatch(identifier) is None:
-            raise ExecutionStoreError("invalid_adapter_configuration")
+            raise ExecutionStoreError(AdapterCode.INVALID_ADAPTER_CONFIGURATION)
         if identifier in self._factories:
-            raise ExecutionStoreError("duplicate_adapter_registration")
+            raise ExecutionStoreError(AdapterCode.DUPLICATE_ADAPTER_REGISTRATION)
         self._factories[identifier] = factory
 
     def resolve(
@@ -38,21 +39,21 @@ class ExecutionStoreRegistry:
         required_capabilities: set[str] | frozenset[str] = frozenset(),
     ) -> ExecutionStore:
         if not isinstance(uri, str):
-            raise ExecutionStoreError("invalid_adapter_configuration")
+            raise ExecutionStoreError(AdapterCode.INVALID_ADAPTER_CONFIGURATION)
         scheme = urlsplit(uri).scheme
         factory = self._factories.get(scheme)
         if factory is None:
-            raise ExecutionStoreError("unknown_adapter")
+            raise ExecutionStoreError(AdapterCode.UNKNOWN_ADAPTER)
         try:
             store = factory(uri, dict(configuration or {}))
         except ExecutionStoreError:
             raise
         except (TypeError, ValueError) as exc:
-            raise ExecutionStoreError("invalid_adapter_configuration") from exc
+            raise ExecutionStoreError(AdapterCode.INVALID_ADAPTER_CONFIGURATION) from exc
         if required_capabilities and not required_capabilities.issubset(
             store.capabilities
         ):
-            raise ExecutionStoreError("adapter_capability_mismatch")
+            raise ExecutionStoreError(AdapterCode.ADAPTER_CAPABILITY_MISMATCH)
         return store
 
 

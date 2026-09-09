@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from typing import Any, cast
 
 from . import cel
+from .codes import PersistenceFailureCode as PersistenceCode
 from .definition import Bundle, _escape_pointer
 from .engine import Delivery, dispatch
 from .errors import ArtifactError, CelError
@@ -54,11 +55,11 @@ class MigrationLimits:
     def from_mapping(cls, value: dict[str, Any]) -> MigrationLimits:
         expected = set(cls.__dataclass_fields__)
         if set(value) != expected:
-            raise ArtifactError("invalid_migration_request")
+            raise ArtifactError(PersistenceCode.INVALID_MIGRATION_REQUEST)
         try:
             parsed = {name: decimal(value[name]) for name in expected}
         except ArtifactError as exc:
-            raise ArtifactError("invalid_migration_request") from exc
+            raise ArtifactError(PersistenceCode.INVALID_MIGRATION_REQUEST) from exc
         return cls(**parsed)
 
 
@@ -101,7 +102,7 @@ class MigrationDispatchResult:
 
 
 def _failure(code: str) -> MigrationResult:
-    return MigrationResult(None, None, (), MigrationFailure(code))
+    return MigrationResult(None, None, (), MigrationFailure(str(code)))
 
 
 def _dispatch_failure(code: str) -> MigrationDispatchResult:
@@ -151,17 +152,17 @@ def _check_shape_limits(
     limits: MigrationLimits,
 ) -> None:
     if len(canonical_bytes(aggregate)) > limits.maximum_aggregate_bytes:
-        raise ArtifactError("migration_resource_limit_exceeded")
+        raise ArtifactError(PersistenceCode.MIGRATION_RESOURCE_LIMIT_EXCEEDED)
     if any(
         len(canonical_bytes(typed_value(bundle.raw))) > limits.maximum_definition_bytes
         for bundle in definitions
     ):
-        raise ArtifactError("migration_resource_limit_exceeded")
+        raise ArtifactError(PersistenceCode.MIGRATION_RESOURCE_LIMIT_EXCEEDED)
     if any(
         len(canonical_bytes(descriptor)) > limits.maximum_descriptor_bytes
         for descriptor in descriptors
     ):
-        raise ArtifactError("migration_resource_limit_exceeded")
+        raise ArtifactError(PersistenceCode.MIGRATION_RESOURCE_LIMIT_EXCEEDED)
     values: list[Any] = [aggregate, *[bundle.raw for bundle in definitions], *descriptors]
     metrics = [_resource_metrics(value) for value in values]
     if (
@@ -180,7 +181,7 @@ def _check_shape_limits(
             for runtime in aggregate["runtimes"]
         )
     ):
-        raise ArtifactError("migration_resource_limit_exceeded")
+        raise ArtifactError(PersistenceCode.MIGRATION_RESOURCE_LIMIT_EXCEEDED)
 
 
 def _ast_nodes(value: Any) -> int:
@@ -195,7 +196,7 @@ def _descriptor_static_requirements(
 ) -> tuple[int, int]:
     rule_count = sum(len(items) for items in descriptor["mappings"].values())
     if rule_count > limits.maximum_descriptor_rules:
-        raise ArtifactError("migration_resource_limit_exceeded")
+        raise ArtifactError(PersistenceCode.MIGRATION_RESOURCE_LIMIT_EXCEEDED)
     expressions = {
         rule["expression"]
         for rule in descriptor["mappings"]["variables"]
@@ -210,13 +211,13 @@ def _descriptor_static_requirements(
         or expression_bytes > decimal(requirements["maximum_cel_expression_length"])
         or ast_nodes > decimal(requirements["maximum_cel_ast_nodes"])
     ):
-        raise ArtifactError("migration_resource_limit_exceeded")
+        raise ArtifactError(PersistenceCode.MIGRATION_RESOURCE_LIMIT_EXCEEDED)
     return expression_bytes, ast_nodes
 
 
 def _pointer_parts(pointer: str) -> list[str]:
     if not pointer.startswith("/"):
-        raise ArtifactError("invalid_migration_descriptor")
+        raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)
     return [
         item.replace("~1", "/").replace("~0", "~")
         for item in pointer[1:].split("/")
@@ -230,22 +231,22 @@ def _pointer_get(document: Any, pointer: str) -> Any:
             try:
                 current = current[int(part)]
             except (IndexError, ValueError) as exc:
-                raise ArtifactError("invalid_migration_descriptor") from exc
+                raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR) from exc
         elif isinstance(current, dict) and part in current:
             current = current[part]
         else:
-            raise ArtifactError("invalid_migration_descriptor")
+            raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)
     return current
 
 
 def _machine_identity_for_pointer(bundle: Bundle, root_pointer: str) -> dict[str, Any]:
     parts = _pointer_parts(root_pointer)
     if len(parts) < 3 or parts[0] != "machines":
-        raise ArtifactError("migration_totality_failure")
+        raise ArtifactError(PersistenceCode.MIGRATION_TOTALITY_FAILURE)
     try:
         machine = bundle.raw["machines"][int(parts[1])]
     except (IndexError, ValueError) as exc:
-        raise ArtifactError("migration_totality_failure") from exc
+        raise ArtifactError(PersistenceCode.MIGRATION_TOTALITY_FAILURE) from exc
     return {
         "namespace": bundle.namespace,
         "machine_id": machine["machine_id"],
@@ -285,14 +286,14 @@ def _state_nodes(machine: MachineModel) -> dict[str, StateNode]:
 def _variable_declaration(bundle: Bundle, pointer: str) -> dict[str, Any]:
     declaration = _pointer_get(bundle.raw, pointer)
     if not isinstance(declaration, dict) or "type" not in declaration:
-        raise ArtifactError("invalid_migration_descriptor")
+        raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)
     return declaration
 
 
 def _state_pointer_for_variable(pointer: str) -> str:
     marker = "/variables/"
     if marker not in pointer:
-        raise ArtifactError("invalid_migration_descriptor")
+        raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)
     return pointer.split(marker, 1)[0]
 
 
@@ -313,7 +314,7 @@ def _active_ancestor_pointers(machine: MachineModel, leaves: list[str]) -> list[
     for pointer in leaves:
         node = nodes.get(pointer)
         if node is None:
-            raise ArtifactError("migration_totality_failure")
+            raise ArtifactError(PersistenceCode.MIGRATION_TOTALITY_FAILURE)
         result.update(item.pointer for item in node.ancestors(include_self=True))
     return sorted(result, key=lambda item: item.encode("utf-8"))
 
@@ -327,7 +328,7 @@ def _unique_mapping(
         source = rule[source_member]
         target = rule[target_member]
         if source in result or target in targets:
-            raise ArtifactError("invalid_migration_descriptor")
+            raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)
         result[source] = target
         targets.add(target)
     return result
@@ -347,7 +348,7 @@ def _validate_descriptor_semantics(
         or descriptor["target_aggregate_shape_fingerprint"]
         != aggregate_shape_fingerprint(target_bundle)
     ):
-        raise ArtifactError("invalid_migration_descriptor")
+        raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)
     mappings = descriptor["mappings"]
     if descriptor["mode"] == "compatible":
         if (
@@ -355,7 +356,7 @@ def _validate_descriptor_semantics(
             != descriptor["target_aggregate_shape_fingerprint"]
             or any(mappings.values())
         ):
-            raise ArtifactError("invalid_migration_descriptor")
+            raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)
     _unique_mapping(
         mappings["machines"], "source_definition_pointer", "target_definition_pointer"
     )
@@ -380,7 +381,7 @@ def _validate_descriptor_semantics(
         source = rule["source_leaf_state_definition_pointer"]
         targets = rule["target_leaf_state_definition_pointers"]
         if source in active_sources or any(target in active_targets for target in targets):
-            raise ArtifactError("invalid_migration_descriptor")
+            raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)
         active_sources.add(source)
         active_targets.update(targets)
     consumed: set[str] = set()
@@ -398,7 +399,7 @@ def _validate_descriptor_semantics(
         if any(source in consumed for source in sources) or (
             target is not None and target in produced
         ):
-            raise ArtifactError("invalid_migration_descriptor")
+            raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)
         consumed.update(sources)
         if target is not None:
             produced.add(target)
@@ -416,7 +417,7 @@ def _validate_descriptor_semantics(
             if target_declaration["type"] == "instance_reference" or any(
                 declaration.kind == "instance_reference" for declaration in scope.values()
             ):
-                raise ArtifactError("invalid_migration_descriptor")
+                raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)
             try:
                 cel.check_expression(
                     rule["expression"],
@@ -426,7 +427,7 @@ def _validate_descriptor_semantics(
                     owner_fields=None,
                 )
             except CelError as exc:
-                raise ArtifactError("invalid_migration_descriptor") from exc
+                raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR) from exc
     _descriptor_static_requirements(descriptor, limits)
 
 
@@ -435,13 +436,13 @@ def _resolve_descriptor(
 ) -> tuple[dict[str, Any], bytes]:
     source = resolver.resolve_migration_descriptor(digest)
     if source is None:
-        raise ArtifactError("migration_route_mismatch")
+        raise ArtifactError(PersistenceCode.MIGRATION_ROUTE_MISMATCH)
     if not resolver.migration_descriptor_is_trusted(digest):
-        raise ArtifactError("migration_descriptor_untrusted")
+        raise ArtifactError(PersistenceCode.MIGRATION_DESCRIPTOR_UNTRUSTED)
     document, _raw = load_json_artifact(source, "migration_descriptor")
     encoded = canonical_bytes(document)
     if migration_descriptor_digest(document) != digest:
-        raise ArtifactError("invalid_migration_descriptor")
+        raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)
     return document, encoded
 
 
@@ -473,7 +474,7 @@ def _counter_transform(
         operation = rule["operation"]
         target = rule["target_definition_pointer"]
         if target in targets:
-            raise ArtifactError("invalid_migration_descriptor")
+            raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)
         targets.add(target)
         if operation == "map":
             pointer = rule["source_definition_pointer"]
@@ -491,7 +492,7 @@ def _counter_transform(
             consumed.update(pointers)
         result.append({"definition_pointer": target, "next_sequence": str(value)})
     if consumed != set(source):
-        raise ArtifactError("migration_totality_failure")
+        raise ArtifactError(PersistenceCode.MIGRATION_TOTALITY_FAILURE)
     result.sort(key=lambda item: item["definition_pointer"].encode("utf-8"))
     return result
 
@@ -512,13 +513,13 @@ def _mapped_active(
         ]
         if len(matching) != 1:
             raise ArtifactError(
-                "invalid_migration_descriptor"
+                PersistenceCode.INVALID_MIGRATION_DESCRIPTOR
                 if len(matching) > 1
-                else "migration_totality_failure"
+                else PersistenceCode.MIGRATION_TOTALITY_FAILURE
             )
         targets.extend(matching[0]["target_leaf_state_definition_pointers"])
     if len(set(targets)) != len(targets):
-        raise ArtifactError("migration_totality_failure")
+        raise ArtifactError(PersistenceCode.MIGRATION_TOTALITY_FAILURE)
     targets.sort(key=lambda item: item.encode("utf-8"))
     source_activations = {
         item["state_definition_pointer"]: item["activation_sequence"]
@@ -540,7 +541,7 @@ def _mapped_active(
             if mapped == target and source in source_activations
         ]
         if len(sources) != 1:
-            raise ArtifactError("migration_totality_failure")
+            raise ArtifactError(PersistenceCode.MIGRATION_TOTALITY_FAILURE)
         activations.append(
             {
                 "state_definition_pointer": target,
@@ -575,7 +576,7 @@ def _transform_variables(
     for occurrence in runtime["variables"]:
         pointer = occurrence["variable_declaration_pointer"]
         if pointer in source_values:
-            raise ArtifactError("migration_totality_failure")
+            raise ArtifactError(PersistenceCode.MIGRATION_TOTALITY_FAILURE)
         source_values[pointer] = occurrence
     target_required = _target_variable_pointers(target_machine, target_activations)
     produced: dict[str, dict[str, Any]] = {}
@@ -601,11 +602,11 @@ def _transform_variables(
         if target not in target_required:
             continue
         if target in produced:
-            raise ArtifactError("invalid_migration_descriptor")
+            raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)
         if operation in {"copy", "transform"} and any(
             value is None for value in applicable_sources
         ):
-            raise ArtifactError("migration_totality_failure")
+            raise ArtifactError(PersistenceCode.MIGRATION_TOTALITY_FAILURE)
         if operation == "copy":
             value = copy.deepcopy(cast(dict[str, Any], applicable_sources[0])["value"])
         else:
@@ -622,7 +623,7 @@ def _transform_variables(
             try:
                 evaluated = cel.evaluate(expression, activation)
             except CelError as exc:
-                raise ArtifactError("migration_transform_fault") from exc
+                raise ArtifactError(PersistenceCode.MIGRATION_TRANSFORM_FAULT) from exc
             value = typed_value(evaluated)
             transformed_bytes += len(canonical_bytes(value))
         if operation == "copy":
@@ -633,7 +634,7 @@ def _transform_variables(
             "value": value,
         }
     if consumed != set(source_values) or set(produced) != set(target_required):
-        raise ArtifactError("migration_totality_failure")
+        raise ArtifactError(PersistenceCode.MIGRATION_TOTALITY_FAILURE)
     result = sorted(
         produced.values(),
         key=lambda item: (
@@ -678,7 +679,7 @@ def _transform_history(
         }
         if recorded is not None:
             if any(pointer not in mapping for pointer in recorded):
-                raise ArtifactError("migration_totality_failure")
+                raise ArtifactError(PersistenceCode.MIGRATION_TOTALITY_FAILURE)
             recorded = sorted(
                 (mapping[pointer] for pointer in recorded),
                 key=lambda item: item.encode("utf-8"),
@@ -688,7 +689,7 @@ def _transform_history(
             "recorded_state_definition_pointers": recorded,
         }
     if consumed != set(source) or set(produced) != set(_history_pointers(target_machine)):
-        raise ArtifactError("migration_totality_failure")
+        raise ArtifactError(PersistenceCode.MIGRATION_TOTALITY_FAILURE)
     return sorted(
         produced.values(),
         key=lambda item: item["history_declaration_pointer"].encode("utf-8"),
@@ -708,7 +709,7 @@ def _component_counter_transform(
     for item in items:
         source = item["definition_pointer"]
         if source not in mapping:
-            raise ArtifactError("migration_totality_failure")
+            raise ArtifactError(PersistenceCode.MIGRATION_TOTALITY_FAILURE)
         result.append(
             {
                 "definition_pointer": mapping[source],
@@ -722,21 +723,21 @@ def _component_counter_transform(
 def _target_root_for_component(bundle: Bundle, pointer: str) -> str:
     placement = _pointer_get(bundle.raw, pointer)
     if not isinstance(placement, dict):
-        raise ArtifactError("migration_totality_failure")
+        raise ArtifactError(PersistenceCode.MIGRATION_TOTALITY_FAILURE)
     if "root" in placement:
         return f"{pointer}/root"
     machine_id = placement.get("machine_id")
     for index, machine in enumerate(bundle.raw["machines"]):
         if machine["machine_id"] == machine_id:
             return f"/machines/{index}/root"
-    raise ArtifactError("migration_totality_failure")
+    raise ArtifactError(PersistenceCode.MIGRATION_TOTALITY_FAILURE)
 
 
 def _target_root_for_machine(bundle: Bundle, machine_id: str) -> str:
     for index, machine in enumerate(bundle.raw["machines"]):
         if machine["machine_id"] == machine_id:
             return f"/machines/{index}/root"
-    raise ArtifactError("migration_totality_failure")
+    raise ArtifactError(PersistenceCode.MIGRATION_TOTALITY_FAILURE)
 
 
 def _transform_candidate(
@@ -772,12 +773,12 @@ def _transform_candidate(
         if relation["kind"] == "root":
             target_root = machine_mapping.get(source_root)
             if target_root is None:
-                raise ArtifactError("migration_totality_failure")
+                raise ArtifactError(PersistenceCode.MIGRATION_TOTALITY_FAILURE)
         elif relation["kind"] == "component":
             source_component = relation["current_component_definition_pointer"]
             rule = component_mapping.get(source_component)
             if rule is None:
-                raise ArtifactError("migration_totality_failure")
+                raise ArtifactError(PersistenceCode.MIGRATION_TOTALITY_FAILURE)
             target_component = rule["target_component_definition_pointer"]
             relation["current_component_definition_pointer"] = target_component
             relation["component_id"] = rule["target_component_id"]
@@ -789,14 +790,14 @@ def _transform_candidate(
             source_machine = runtime["current_definition"]["machine"]["machine_id"]
             rule = owned_mapping.get((source_spawn, source_machine))
             if rule is None:
-                raise ArtifactError("migration_totality_failure")
+                raise ArtifactError(PersistenceCode.MIGRATION_TOTALITY_FAILURE)
             relation["current_spawn_action_pointer"] = rule["target_spawn_action_pointer"]
             target_root = _target_root_for_machine(target_bundle, rule["target_machine_id"])
             holder = relation["lifetime_holder"]
             if holder is not None:
                 source_holder = holder["variable_declaration_pointer"]
                 if source_holder not in holder_mapping:
-                    raise ArtifactError("migration_totality_failure")
+                    raise ArtifactError(PersistenceCode.MIGRATION_TOTALITY_FAILURE)
                 holder["variable_declaration_pointer"] = holder_mapping[source_holder]
         source_machine_model = _machine_model_for_root(source_bundle, source_root)
         target_machine_model = _machine_model_for_root(target_bundle, target_root)
@@ -839,7 +840,7 @@ def _transform_candidate(
             decimal(requirements["maximum_cel_evaluation_steps"]),
         )
     ):
-        raise ArtifactError("migration_resource_limit_exceeded")
+        raise ArtifactError(PersistenceCode.MIGRATION_RESOURCE_LIMIT_EXCEEDED)
     root = next(
         runtime
         for runtime in candidate["runtimes"]
@@ -872,9 +873,9 @@ def _apply_descriptor(
     )
     if root["status"] in {"completed", "faulted"}:
         if not maintenance_mode:
-            raise ArtifactError("terminal_migration_requires_maintenance")
+            raise ArtifactError(PersistenceCode.TERMINAL_MIGRATION_REQUIRES_MAINTENANCE)
         if descriptor["terminal_policy"][root["status"]] != "preserve":
-            raise ArtifactError("terminal_migration_rejected")
+            raise ArtifactError(PersistenceCode.TERMINAL_MIGRATION_REJECTED)
     _validate_descriptor_semantics(descriptor, source_bundle, target_bundle, limits)
     candidate = (
         _compatible_candidate(source, target_bundle)
@@ -908,22 +909,22 @@ def migrate_aggregate(
             or not all(isinstance(item, str) and item for item in migration_route)
             or not isinstance(maintenance_mode, bool)
         ):
-            raise ArtifactError("invalid_migration_request")
+            raise ArtifactError(PersistenceCode.INVALID_MIGRATION_REQUEST)
         route = list(migration_route)
         if len(route) > limits.maximum_chain_length:
-            raise ArtifactError("migration_resource_limit_exceeded")
+            raise ArtifactError(PersistenceCode.MIGRATION_RESOURCE_LIMIT_EXCEEDED)
         restored = restore_aggregate(source_copy, artifact_resolver)
         if not route:
             if (
                 restored.aggregate_envelope["validated_bundle_fingerprint"]
                 != target_validated_bundle_fingerprint
             ):
-                raise ArtifactError("migration_route_missing")
+                raise ArtifactError(PersistenceCode.MIGRATION_ROUTE_MISSING)
             return MigrationResult(
                 copy.deepcopy(restored.aggregate_envelope), source_copy, (), None
             )
         if len(set(route)) != len(route):
-            raise ArtifactError("migration_route_mismatch")
+            raise ArtifactError(PersistenceCode.MIGRATION_ROUTE_MISMATCH)
         descriptors_with_bytes = [
             _resolve_descriptor(artifact_resolver, digest) for digest in route
         ]
@@ -939,13 +940,13 @@ def migrate_aggregate(
                 for left, right in zip(descriptors, descriptors[1:], strict=False)
             )
         ):
-            raise ArtifactError("migration_route_mismatch")
+            raise ArtifactError(PersistenceCode.MIGRATION_ROUTE_MISMATCH)
         fingerprints = [descriptors[0]["source_validated_bundle_fingerprint"]] + [
             descriptor["target_validated_bundle_fingerprint"]
             for descriptor in descriptors
         ]
         if len(set(fingerprints)) != len(fingerprints):
-            raise ArtifactError("migration_route_mismatch")
+            raise ArtifactError(PersistenceCode.MIGRATION_ROUTE_MISMATCH)
         definitions = [
             _bundle_from_resolver(
                 artifact_resolver,
@@ -999,7 +1000,7 @@ def migrate_aggregate(
         return _failure(exc.code)
     except (CelError, KeyError, TypeError, ValueError) as exc:
         del exc
-        return _failure("invalid_migration_descriptor")
+        return _failure(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)
 
 
 def migrate_and_dispatch(
@@ -1029,7 +1030,7 @@ def migrate_and_dispatch(
         core = dispatch(restored.bundle, restored.state, delivery)
         state = core["state"]
         if state is None:
-            raise ArtifactError("invalid_aggregate_state")
+            raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
         from .wire import aggregate_envelope
 
         envelope = aggregate_envelope(restored.bundle, state)

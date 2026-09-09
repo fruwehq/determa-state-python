@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any, BinaryIO
 from urllib.parse import unquote, urlsplit
 
+from ..codes import ExecutionStoreAdapterFailureCode as AdapterCode
 from .base import (
     RESTART_PERSISTENT,
     ExecutionStore,
@@ -172,13 +173,13 @@ def file_execution_store_factory(
     """Create the ordinary bundled file adapter."""
     parsed = urlsplit(uri)
     if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
-        raise ExecutionStoreError("invalid_adapter_configuration")
+        raise ExecutionStoreError(AdapterCode.INVALID_ADAPTER_CONFIGURATION)
     if parsed.query or parsed.fragment or set(configuration) - {"directory"}:
-        raise ExecutionStoreError("invalid_adapter_configuration")
+        raise ExecutionStoreError(AdapterCode.INVALID_ADAPTER_CONFIGURATION)
     configured = configuration.get("directory")
     if configured is not None and not isinstance(configured, str):
-        raise ExecutionStoreError("invalid_adapter_configuration")
+        raise ExecutionStoreError(AdapterCode.INVALID_ADAPTER_CONFIGURATION)
     directory = configured if configured is not None else unquote(parsed.path)
     if not directory or not Path(directory).is_absolute():
-        raise ExecutionStoreError("invalid_adapter_configuration")
+        raise ExecutionStoreError(AdapterCode.INVALID_ADAPTER_CONFIGURATION)
     return FileExecutionStore(directory)

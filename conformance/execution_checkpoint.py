@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -18,6 +21,7 @@ from determa.state import (
     ExecutionStore,
     ExecutionStoreError,
     ExecutionStoreRegistry,
+    ExecutionStoreTransaction,
     MemoryArtifactResolver,
     MemoryExecutionStore,
     load_bundle,
@@ -25,6 +29,7 @@ from determa.state import (
     restore_execution_checkpoint,
     serialize_execution_checkpoint,
 )
+from determa.state.wire import hash_value
 
 from .harness import conformance_root
 
@@ -246,6 +251,54 @@ class _StaticStore(ExecutionStore):
         return {"healthy": True}
 
 
+class _ObservedTransaction(ExecutionStoreTransaction):
+    def __init__(
+        self, transaction: ExecutionStoreTransaction, calls: list[str]
+    ) -> None:
+        self._transaction = transaction
+        self._calls = calls
+
+    @property
+    def root_instance_id(self) -> str:
+        return self._transaction.root_instance_id
+
+    def load(self) -> bytes | None:
+        self._calls.append("load_checkpoint")
+        return self._transaction.load()
+
+    def insert(self, checkpoint: bytes) -> bool:
+        self._calls.append("insert_checkpoint")
+        return self._transaction.insert(checkpoint)
+
+    def replace(
+        self,
+        expected_revision: str,
+        expected_checkpoint_digest: str,
+        checkpoint: bytes,
+    ) -> bool:
+        self._calls.append("compare_and_swap_checkpoint")
+        return self._transaction.replace(
+            expected_revision, expected_checkpoint_digest, checkpoint
+        )
+
+
+class _ObservedMemoryStore(MemoryExecutionStore):
+    def __init__(self, initial: dict[str, bytes], calls: list[str]) -> None:
+        super().__init__(initial)
+        self._calls = calls
+
+    @property
+    def root_instance_ids(self) -> frozenset[str]:
+        return frozenset(self._records)
+
+    @contextmanager
+    def transaction(
+        self, root_instance_id: str
+    ) -> Iterator[ExecutionStoreTransaction]:
+        with super().transaction(root_instance_id) as transaction:
+            yield _ObservedTransaction(transaction, self._calls)
+
+
 def _adapter_operation(vector: dict[str, Any]) -> dict[str, Any]:
     operation = vector["operation"]
     if operation == "inject_execution_store":
@@ -387,10 +440,177 @@ def _expected_response(
     raise AssertionError(f"no exact response projection for {operation}")
 
 
+def _scope_state(
+    case: ExecutionCheckpointCase, reference: dict[str, str]
+) -> dict[str, Any]:
+    return copy.deepcopy(
+        _pointer(_json(case.path / reference["file"]), reference["pointer"])
+    )
+
+
+def _outbox_records(checkpoint: dict[str, Any]) -> list[dict[str, str]]:
+    records = [
+        ("pending", record) for record in checkpoint["pending_outbox_intents"]
+    ]
+    records.extend(
+        ("terminal", record) for record in checkpoint["terminal_outbox_records"]
+    )
+    records.extend(
+        ("tombstone", record) for record in checkpoint["outbox_effect_tombstones"]
+    )
+    return [
+        {
+            "effect_id": (
+                record["effect_id"]
+                if kind == "tombstone"
+                else record["intent"]["effect_id"]
+            ),
+            "record_kind": kind,
+            "source_digest": hash_value(record),
+        }
+        for kind, record in records
+    ]
+
+
+def _expected_scope_maps(
+    case: ExecutionCheckpointCase,
+    expected: dict[str, Any],
+) -> dict[str, dict[str, Any]]:
+    result = {}
+    for scope in expected["scopes"]:
+        checkpoints = {}
+        outbox_records = {}
+        for root_instance_id, binding in scope["checkpoints"].items():
+            expected_checkpoint = _json(case.path / binding["file"])
+            canonical = serialize_execution_checkpoint(expected_checkpoint)
+            assert (
+                f"sha256:{hashlib.sha256(canonical).hexdigest()}"
+                == binding["serialization_digest"]
+            )
+            assert (
+                expected_checkpoint["execution_checkpoint_digest"]
+                == binding["execution_checkpoint_digest"]
+            )
+            checkpoints[root_instance_id] = canonical
+            outbox_records[root_instance_id] = _outbox_records(expected_checkpoint)
+        assert [
+            record
+            for root_records in outbox_records.values()
+            for record in root_records
+        ] == scope["outbox_records"]
+        result[scope["logical_scope_id"]] = {
+            "checkpoints": checkpoints,
+            "outbox_records": outbox_records,
+        }
+    return result
+
+
+def _actual_scope_maps(
+    hosts: dict[str, ExecutionHost],
+    stores: dict[str, _ObservedMemoryStore],
+) -> dict[str, dict[str, Any]]:
+    result = {}
+    for scope_id, store in stores.items():
+        checkpoints = {}
+        outbox_records = {}
+        for root_instance_id in sorted(store.root_instance_ids):
+            restored = hosts[scope_id].read_checkpoint(root_instance_id)
+            assert restored is not None
+            checkpoints[root_instance_id] = restored.canonical_bytes
+            outbox_records[root_instance_id] = _outbox_records(restored.document)
+        result[scope_id] = {
+            "checkpoints": checkpoints,
+            "outbox_records": outbox_records,
+        }
+    return result
+
+
+def _assert_complete_scope_maps(
+    actual: dict[str, dict[str, Any]],
+    expected: dict[str, dict[str, Any]],
+) -> None:
+    assert actual == expected
+
+
+def _scope_hosts(
+    case: ExecutionCheckpointCase,
+    state: dict[str, Any],
+    store_calls: list[str],
+) -> tuple[dict[str, ExecutionHost], dict[str, _ObservedMemoryStore]]:
+    hosts = {}
+    stores = {}
+    for scope in state["scopes"]:
+        initial = {
+            root_instance_id: (case.path / binding["file"]).read_bytes()
+            for root_instance_id, binding in scope["checkpoints"].items()
+        }
+        scope_id = scope["logical_scope_id"]
+        store = _ObservedMemoryStore(initial, store_calls)
+        stores[scope_id] = store
+        hosts[scope_id] = ExecutionHost(store, _resolver(case))
+    return hosts, stores
+
+
+def _run_scope_vector(item: ExecutionCheckpointVector) -> None:
+    case = item.case
+    vector = item.vector
+    expected = vector["expect"]
+    before = _scope_state(case, vector["scope_state_before"])
+    after = _scope_state(case, vector["scope_state_after"])
+    store_calls: list[str] = []
+    hosts, stores = _scope_hosts(case, before, store_calls)
+
+    resolver_calls = ["resolve_execution_store_scope"]
+    selection = vector["scope_selection"]
+    requested = selection["requested_scope_id"]
+    candidates = selection["candidates"]
+    selected = (
+        requested
+        if requested is not None
+        and len(candidates) == 1
+        and candidates[0]["logical_scope_id"] == requested
+        and candidates[0]["authorized"]
+        else None
+    )
+    host_calls = []
+    if selected is not None:
+        host_calls.append("update_pending_outbox")
+        selected_scope = next(
+            scope for scope in before["scopes"] if scope["logical_scope_id"] == selected
+        )
+        root_instance_id, binding = next(iter(selected_scope["checkpoints"].items()))
+        checkpoint = _json(case.path / binding["file"])
+        hosts[selected].update_pending_outbox(
+            root_instance_id,
+            vector["effect_id"],
+            vector["desired_pending_state"],
+            expected_revision=checkpoint["revision"],
+            expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+        )
+
+    assert expected["selection_result"] == (
+        "selected" if selected is not None else "rejected"
+    )
+    assert expected["selected_scope_id"] == selected
+    assert expected["calls"] == {
+        "resolver": resolver_calls,
+        "execution_host": host_calls,
+        "store": store_calls,
+        "core": [],
+    }
+    _assert_complete_scope_maps(
+        _actual_scope_maps(hosts, stores),
+        _expected_scope_maps(case, after),
+    )
+
+
 def run_execution_checkpoint_vector(item: ExecutionCheckpointVector) -> None:
     case = item.case
     vector = item.vector
     expected = vector["expect"]
+    if "scope_state_before" in vector:
+        _run_scope_vector(item)
+        return
     before_name = vector.get("checkpoint_before")
     after_name = expected["checkpoint_after"]
     if vector["operation"] in {

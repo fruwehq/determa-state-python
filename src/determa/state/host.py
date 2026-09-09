@@ -15,6 +15,18 @@ from .checkpoint import (
     serialize_execution_checkpoint,
     validate_execution_checkpoint_member,
 )
+from .codes import (
+    CheckpointHostFailureCode as HostCode,
+)
+from .codes import (
+    CheckpointPreAcceptanceFailureCode as PreAcceptanceCode,
+)
+from .codes import (
+    ExecutionStoreAdapterFailureCode as AdapterCode,
+)
+from .codes import (
+    PersistenceFailureCode as PersistenceCode,
+)
 from .definition import Bundle, BundleSource, load_bundle
 from .engine import create as core_create
 from .engine import dispatch as core_dispatch
@@ -48,8 +60,8 @@ class ExecutionHostError(DetermaError):
     """A closed host-layer failure."""
 
     def __init__(self, code: str, message: str = "") -> None:
-        self.code = code
-        self.message = message or code
+        self.code = str(code)
+        self.message = message or self.code
         super().__init__(self.message)
 
 
@@ -67,17 +79,17 @@ def _checkpoint_number(value: Any) -> int:
             )
         )
     ):
-        raise ExecutionHostError("invalid_execution_checkpoint")
+        raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
     try:
         return int(value)
     except ValueError as exc:
-        raise ExecutionHostError("invalid_execution_checkpoint") from exc
+        raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT) from exc
 
 
 def _increment_checkpoint_number(value: Any) -> str:
     result = str(_checkpoint_number(value) + 1)
     if len(result) > _MAX_DECIMAL_DIGITS:
-        raise ExecutionHostError("invalid_execution_checkpoint")
+        raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
     return result
 
 
@@ -147,7 +159,7 @@ def portable_envelope(
     if correlation_id is not None:
         result["correlation_id"] = correlation_id
     if not validate_execution_checkpoint_member("envelope", result):
-        raise ExecutionHostError("malformed_delivery")
+        raise ExecutionHostError(PreAcceptanceCode.MALFORMED_DELIVERY)
     return result
 
 
@@ -248,7 +260,7 @@ def validate_host_profile(
             and "native_shared_application_transaction" in host_features
         )
     if not valid:
-        raise ExecutionHostError("adapter_capability_mismatch")
+        raise ExecutionHostError(AdapterCode.ADAPTER_CAPABILITY_MISMATCH)
 
 
 @dataclass(frozen=True)
@@ -269,7 +281,7 @@ def _project_fault(
         candidate = runtime["fault"]
         if candidate is not None and candidate["runtime_id"] == fault["runtime_id"]:
             return cast(dict[str, Any], copy.deepcopy(candidate))
-    raise ExecutionHostError("invalid_execution_checkpoint")
+    raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
 
 
 def _project_emission(emission: Mapping[str, Any]) -> dict[str, Any]:
@@ -466,7 +478,7 @@ class ExecutionHost:
         fault_injector: FaultInjector | None = None,
     ) -> None:
         if not required_capabilities.issubset(store.capabilities):
-            raise ExecutionHostError("adapter_capability_mismatch")
+            raise ExecutionHostError(AdapterCode.ADAPTER_CAPABILITY_MISMATCH)
         if required_capabilities or profile is not None:
             store.validate_schema()
         if profile is not None:
@@ -525,12 +537,12 @@ class ExecutionHost:
             PERMANENT_RECEIPT_RETENTION in self.store.capabilities
             and restored.document["replay_retention"]["mode"] != "permanent"
         ):
-            raise ExecutionHostError("adapter_capability_mismatch")
+            raise ExecutionHostError(AdapterCode.ADAPTER_CAPABILITY_MISMATCH)
         if (
             PERMANENT_OUTBOX_TERMINAL_RETENTION in self.store.capabilities
             and restored.document["outbox_effect_tombstones"]
         ):
-            raise ExecutionHostError("adapter_capability_mismatch")
+            raise ExecutionHostError(AdapterCode.ADAPTER_CAPABILITY_MISMATCH)
         return restored
 
     def _transaction(
@@ -555,7 +567,7 @@ class ExecutionHost:
     ) -> dict[str, Any]:
         """Commit application writes and exactly one staged host operation together."""
         if SHARED_APPLICATION_TRANSACTION not in self.store.capabilities:
-            raise ExecutionHostError("adapter_capability_mismatch")
+            raise ExecutionHostError(AdapterCode.ADAPTER_CAPABILITY_MISMATCH)
         with self.store.shared_transaction(root_instance_id) as (
             native_transaction,
             store_transaction,
@@ -584,7 +596,7 @@ class ExecutionHost:
             or checkpoint["execution_checkpoint_digest"]
             != expected_checkpoint_digest
         ):
-            raise ExecutionHostError("checkpoint_revision_conflict")
+            raise ExecutionHostError(HostCode.CHECKPOINT_REVISION_CONFLICT)
 
     def _stage_insert(
         self, transaction: ExecutionStoreTransaction, candidate: dict[str, Any]
@@ -592,7 +604,7 @@ class ExecutionHost:
         restore_execution_checkpoint(candidate, self.artifact_resolver)
         self._fault("before_commit")
         if not transaction.insert(serialize_execution_checkpoint(candidate)):
-            raise ExecutionHostError("checkpoint_revision_conflict")
+            raise ExecutionHostError(HostCode.CHECKPOINT_REVISION_CONFLICT)
 
     def _stage_replace(
         self,
@@ -607,7 +619,7 @@ class ExecutionHost:
             previous["execution_checkpoint_digest"],
             serialize_execution_checkpoint(candidate),
         ):
-            raise ExecutionHostError("checkpoint_revision_conflict")
+            raise ExecutionHostError(HostCode.CHECKPOINT_REVISION_CONFLICT)
 
     def read_checkpoint(
         self,
@@ -651,7 +663,7 @@ class ExecutionHost:
                     and receipt["request_digest"] == request_digest
                 ):
                     return {"result": "committed", "receipt": copy.deepcopy(receipt)}
-                raise ExecutionHostError("creation_id_conflict")
+                raise ExecutionHostError(HostCode.CREATION_ID_CONFLICT)
             result = core_create(
                 validated,
                 machine_id,
@@ -662,7 +674,7 @@ class ExecutionHost:
             projected = _project_core_result(validated, result)
             aggregate = projected["aggregate_state"]
             if aggregate is None:
-                raise ExecutionHostError("creation_rejected")
+                raise ExecutionHostError(HostCode.CREATION_REJECTED)
             candidate = _new_checkpoint(aggregate, request_digest, projected)
             self._stage_insert(transaction, candidate)
             receipt = copy.deepcopy(candidate["operation_receipts"][0])
@@ -706,8 +718,10 @@ class ExecutionHost:
             supplied_digest,
         )
 
-    def _not_accepted(self, code: str) -> dict[str, Any]:
-        return {"result": "not_accepted", "failure": {"code": code}}
+    def _not_accepted(
+        self, code: PreAcceptanceCode
+    ) -> dict[str, Any]:
+        return {"result": "not_accepted", "failure": {"code": code.value}}
 
     def _delivery_replay(
         self,
@@ -718,7 +732,7 @@ class ExecutionHost:
         for pending in checkpoint["pending_deliveries"]:
             if pending["envelope"]["event_id"] == event_id:
                 if pending["envelope_digest"] != digest:
-                    return self._not_accepted("event_id_conflict")
+                    return self._not_accepted(PreAcceptanceCode.EVENT_ID_CONFLICT)
                 return {
                     "result": "pending",
                     "event_id": event_id,
@@ -728,7 +742,7 @@ class ExecutionHost:
         for receipt in checkpoint["operation_receipts"]:
             if receipt["operation_kind"] == "delivery" and receipt["event_id"] == event_id:
                 if receipt["request_digest"] != digest:
-                    return self._not_accepted("event_id_conflict")
+                    return self._not_accepted(PreAcceptanceCode.EVENT_ID_CONFLICT)
                 return {"result": "committed", "receipt": copy.deepcopy(receipt)}
         return None
 
@@ -740,9 +754,9 @@ class ExecutionHost:
         parsed = self._delivery_candidate(candidate)
         root_instance_id, mode, origin, envelope, supplied_digest = parsed
         if root_instance_id is None or mode is None or envelope is None:
-            return None, self._not_accepted("malformed_delivery")
+            return None, self._not_accepted(PreAcceptanceCode.MALFORMED_DELIVERY)
         if root_instance_id != checkpoint["root_instance_id"]:
-            return None, self._not_accepted("wrong_root")
+            return None, self._not_accepted(PreAcceptanceCode.WRONG_ROOT)
 
         digest = delivery_request_digest(root_instance_id, mode, envelope)
         replay = self._delivery_replay(
@@ -751,7 +765,7 @@ class ExecutionHost:
         if replay is not None:
             return None, replay
         if checkpoint["root_record"]["status"] == "tombstone":
-            return None, self._not_accepted("tombstoned_root")
+            return None, self._not_accepted(PreAcceptanceCode.TOMBSTONED_ROOT)
 
         valid_mode = mode in {"input", "internal"}
         valid_origin = validate_execution_checkpoint_member("deliveryOrigin", origin)
@@ -763,16 +777,18 @@ class ExecutionHost:
             and origin.get("kind") == "internal_emission"
         )
         if not valid_mode:
-            return None, self._not_accepted("invalid_delivery_mode")
+            return None, self._not_accepted(PreAcceptanceCode.INVALID_DELIVERY_MODE)
         if not valid_origin or not valid_pair:
-            return None, self._not_accepted("invalid_delivery_origin")
+            return None, self._not_accepted(PreAcceptanceCode.INVALID_DELIVERY_ORIGIN)
         if supplied_digest is not None and supplied_digest != digest:
-            return None, self._not_accepted("delivery_digest_mismatch")
+            return None, self._not_accepted(
+                PreAcceptanceCode.DELIVERY_DIGEST_MISMATCH
+            )
         if (
             _target_root_instance_id(envelope["target"])
             != checkpoint["root_instance_id"]
         ):
-            return None, self._not_accepted("wrong_root")
+            return None, self._not_accepted(PreAcceptanceCode.WRONG_ROOT)
         return {
             "root_instance_id": root_instance_id,
             "delivery_mode": mode,
@@ -792,7 +808,7 @@ class ExecutionHost:
         with self._transaction(root_instance_id) as transaction:
             source = transaction.load()
             if source is None:
-                return self._not_accepted("wrong_root")
+                return self._not_accepted(PreAcceptanceCode.WRONG_ROOT)
             checkpoint = self._restore(source, root_instance_id).document
             prepared, result = self._prepare_acceptance(checkpoint, candidate)
             if result is not None:
@@ -864,7 +880,7 @@ class ExecutionHost:
         )
         aggregate = copy.deepcopy(projected["aggregate_state"])
         if aggregate is None or restored.aggregate is None:
-            raise ExecutionHostError("invalid_execution_checkpoint")
+            raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
         candidate["root_record"]["aggregate_state"] = aggregate
         receipt = {
             "operation_kind": "delivery",
@@ -902,7 +918,7 @@ class ExecutionHost:
         with self._transaction(root_instance_id) as transaction:
             source = transaction.load()
             if source is None:
-                raise ExecutionHostError("wrong_root")
+                raise ExecutionHostError(PreAcceptanceCode.WRONG_ROOT)
             restored = self._restore(source, root_instance_id)
             checkpoint = restored.document
             parsed = self._delivery_candidate(candidate)
@@ -913,10 +929,10 @@ class ExecutionHost:
                 or origin is None
                 or envelope is None
             ):
-                raise ExecutionHostError("malformed_delivery")
+                raise ExecutionHostError(PreAcceptanceCode.MALFORMED_DELIVERY)
             digest = delivery_request_digest(root_instance_id, mode, envelope)
             if supplied_digest is not None and supplied_digest != digest:
-                raise ExecutionHostError("delivery_digest_mismatch")
+                raise ExecutionHostError(PreAcceptanceCode.DELIVERY_DIGEST_MISMATCH)
             replay = self._delivery_replay(
                 checkpoint, envelope["event_id"], digest
             )
@@ -933,12 +949,12 @@ class ExecutionHost:
                 None,
             )
             if pending is None or pending["envelope_digest"] != digest:
-                raise ExecutionHostError("event_id_conflict")
+                raise ExecutionHostError(HostCode.EVENT_ID_CONFLICT)
             self._check_expected(
                 checkpoint, expected_revision, expected_checkpoint_digest
             )
             if restored.aggregate is None:
-                raise ExecutionHostError("tombstoned_root")
+                raise ExecutionHostError(PreAcceptanceCode.TOMBSTONED_ROOT)
             result = core_dispatch(
                 restored.aggregate.bundle,
                 restored.aggregate.state,
@@ -971,7 +987,7 @@ class ExecutionHost:
         with self._transaction(root_instance_id) as transaction:
             source = transaction.load()
             if source is None:
-                raise ExecutionHostError("wrong_root")
+                raise ExecutionHostError(PreAcceptanceCode.WRONG_ROOT)
             restored = self._restore(source, root_instance_id)
             checkpoint = restored.document
             prepared, replay = self._prepare_acceptance(checkpoint, candidate)
@@ -982,7 +998,7 @@ class ExecutionHost:
                 checkpoint, expected_revision, expected_checkpoint_digest
             )
             if restored.aggregate is None:
-                raise ExecutionHostError("tombstoned_root")
+                raise ExecutionHostError(PreAcceptanceCode.TOMBSTONED_ROOT)
             result = core_dispatch(
                 restored.aggregate.bundle,
                 restored.aggregate.state,
@@ -1022,7 +1038,7 @@ class ExecutionHost:
                 "sha256", source_aggregate_state_digest
             )
         ):
-            raise ExecutionHostError("invalid_migration_request")
+            raise ExecutionHostError(PersistenceCode.INVALID_MIGRATION_REQUEST)
         request_digest = maintenance_migration_request_digest(
             root_instance_id,
             operation_id,
@@ -1034,7 +1050,7 @@ class ExecutionHost:
         with self._transaction(root_instance_id) as transaction:
             source = transaction.load()
             if source is None:
-                raise ExecutionHostError("wrong_root")
+                raise ExecutionHostError(PreAcceptanceCode.WRONG_ROOT)
             restored = self._restore(source, root_instance_id)
             checkpoint = restored.document
             for receipt in checkpoint["operation_receipts"]:
@@ -1047,14 +1063,14 @@ class ExecutionHost:
                             "result": "committed",
                             "receipt": copy.deepcopy(receipt),
                         }
-                    raise ExecutionHostError("operation_id_conflict")
+                    raise ExecutionHostError(HostCode.OPERATION_ID_CONFLICT)
             if restored.aggregate is None:
-                raise ExecutionHostError("tombstoned_root")
+                raise ExecutionHostError(PreAcceptanceCode.TOMBSTONED_ROOT)
             current_source_digest = restored.aggregate.aggregate_envelope[
                 "aggregate_state_digest"
             ]
             if source_aggregate_state_digest != current_source_digest:
-                raise ExecutionHostError("invalid_migration_request")
+                raise ExecutionHostError(PersistenceCode.INVALID_MIGRATION_REQUEST)
             self._check_expected(
                 checkpoint, expected_revision, expected_checkpoint_digest
             )
@@ -1122,11 +1138,11 @@ class ExecutionHost:
     ) -> dict[str, Any]:
         desired = copy.deepcopy(dict(desired_pending_state))
         if not validate_execution_checkpoint_member("pendingOutboxState", desired):
-            raise ExecutionHostError("invalid_execution_checkpoint")
+            raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
         with self._transaction(root_instance_id) as transaction:
             source = transaction.load()
             if source is None:
-                raise ExecutionHostError("wrong_root")
+                raise ExecutionHostError(PreAcceptanceCode.WRONG_ROOT)
             checkpoint = self._restore(source, root_instance_id).document
             item = next(
                 (
@@ -1137,7 +1153,7 @@ class ExecutionHost:
                 None,
             )
             if item is None:
-                raise ExecutionHostError("effect_id_conflict")
+                raise ExecutionHostError(HostCode.EFFECT_ID_CONFLICT)
             if item["delivery_state"] == desired:
                 return {"result": "committed", "record": copy.deepcopy(item)}
             self._check_expected(
@@ -1168,11 +1184,11 @@ class ExecutionHost:
     ) -> dict[str, Any]:
         outcome = copy.deepcopy(dict(terminal_outcome))
         if not validate_execution_checkpoint_member("terminalOutboxOutcome", outcome):
-            raise ExecutionHostError("invalid_execution_checkpoint")
+            raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
         with self._transaction(root_instance_id) as transaction:
             source = transaction.load()
             if source is None:
-                raise ExecutionHostError("wrong_root")
+                raise ExecutionHostError(PreAcceptanceCode.WRONG_ROOT)
             checkpoint = self._restore(source, root_instance_id).document
             for record in checkpoint["terminal_outbox_records"]:
                 if record["intent"]["effect_id"] == effect_id:
@@ -1181,7 +1197,7 @@ class ExecutionHost:
                             "result": "committed",
                             "record": copy.deepcopy(record),
                         }
-                    raise ExecutionHostError("effect_id_conflict")
+                    raise ExecutionHostError(HostCode.EFFECT_ID_CONFLICT)
             for record in checkpoint["outbox_effect_tombstones"]:
                 if record["effect_id"] == effect_id:
                     if record["outcome"] == outcome:
@@ -1189,7 +1205,7 @@ class ExecutionHost:
                             "result": "committed",
                             "record": copy.deepcopy(record),
                         }
-                    raise ExecutionHostError("effect_id_conflict")
+                    raise ExecutionHostError(HostCode.EFFECT_ID_CONFLICT)
             pending = next(
                 (
                     value
@@ -1199,7 +1215,7 @@ class ExecutionHost:
                 None,
             )
             if pending is None:
-                raise ExecutionHostError("effect_id_conflict")
+                raise ExecutionHostError(HostCode.EFFECT_ID_CONFLICT)
             self._check_expected(
                 checkpoint, expected_revision, expected_checkpoint_digest
             )
@@ -1236,11 +1252,11 @@ class ExecutionHost:
         expected_checkpoint_digest: str,
     ) -> dict[str, Any]:
         if PERMANENT_OUTBOX_TERMINAL_RETENTION in self.store.capabilities:
-            raise ExecutionHostError("adapter_capability_mismatch")
+            raise ExecutionHostError(AdapterCode.ADAPTER_CAPABILITY_MISMATCH)
         with self._transaction(root_instance_id) as transaction:
             source = transaction.load()
             if source is None:
-                raise ExecutionHostError("wrong_root")
+                raise ExecutionHostError(PreAcceptanceCode.WRONG_ROOT)
             checkpoint = self._restore(source, root_instance_id).document
             existing = next(
                 (
@@ -1261,7 +1277,7 @@ class ExecutionHost:
                 None,
             )
             if terminal is None:
-                raise ExecutionHostError("effect_id_conflict")
+                raise ExecutionHostError(HostCode.EFFECT_ID_CONFLICT)
             self._check_expected(
                 checkpoint, expected_revision, expected_checkpoint_digest
             )
@@ -1303,11 +1319,11 @@ class ExecutionHost:
             PERMANENT_OUTBOX_TERMINAL_RETENTION,
             COMPACT_EFFECT_IDENTITY_RETENTION,
         }.intersection(self.store.capabilities):
-            raise ExecutionHostError("adapter_capability_mismatch")
+            raise ExecutionHostError(AdapterCode.ADAPTER_CAPABILITY_MISMATCH)
         with self._transaction(root_instance_id) as transaction:
             source = transaction.load()
             if source is None:
-                raise ExecutionHostError("wrong_root")
+                raise ExecutionHostError(PreAcceptanceCode.WRONG_ROOT)
             checkpoint = self._restore(source, root_instance_id).document
             if any(
                 emission.get("kind") == "external_outbox"
@@ -1315,7 +1331,7 @@ class ExecutionHost:
                 for receipt in checkpoint["operation_receipts"]
                 for emission in receipt.get("emission_references", [])
             ):
-                raise ExecutionHostError("invalid_execution_checkpoint")
+                raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
             self._check_expected(
                 checkpoint, expected_revision, expected_checkpoint_digest
             )
@@ -1336,7 +1352,7 @@ class ExecutionHost:
             if prior_count == len(candidate["terminal_outbox_records"]) + len(
                 candidate["outbox_effect_tombstones"]
             ):
-                raise ExecutionHostError("effect_id_conflict")
+                raise ExecutionHostError(HostCode.EFFECT_ID_CONFLICT)
             candidate = seal_execution_checkpoint(candidate)
             self._stage_replace(transaction, checkpoint, candidate)
         self._after_commit()
@@ -1352,22 +1368,22 @@ class ExecutionHost:
     ) -> dict[str, Any]:
         target = copy.deepcopy(dict(target_replay_retention))
         if not validate_execution_checkpoint_member("replayRetention", target):
-            raise ExecutionHostError("invalid_execution_checkpoint")
+            raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
         if (
             PERMANENT_RECEIPT_RETENTION in self.store.capabilities
             and target["mode"] != "permanent"
         ):
-            raise ExecutionHostError("adapter_capability_mismatch")
+            raise ExecutionHostError(AdapterCode.ADAPTER_CAPABILITY_MISMATCH)
         with self._transaction(root_instance_id) as transaction:
             source = transaction.load()
             if source is None:
-                raise ExecutionHostError("wrong_root")
+                raise ExecutionHostError(PreAcceptanceCode.WRONG_ROOT)
             checkpoint = self._restore(source, root_instance_id).document
             current = checkpoint["replay_retention"]
             if current == target:
                 return {"result": "committed", "replay_retention": copy.deepcopy(current)}
             if current["mode"] == "bounded" and target["mode"] == "permanent":
-                raise ExecutionHostError("invalid_execution_checkpoint")
+                raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
             current_cutoff = current["pruned_through_receipt_sequence"]
             target_cutoff = target["pruned_through_receipt_sequence"]
             if target["mode"] == "bounded":
@@ -1376,7 +1392,7 @@ class ExecutionHost:
                     and current["policy_identifier"]
                     != target["policy_identifier"]
                 ):
-                    raise ExecutionHostError("invalid_execution_checkpoint")
+                    raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
                 if (
                     current_cutoff is not None
                     and (
@@ -1385,7 +1401,7 @@ class ExecutionHost:
                         < _checkpoint_number(current_cutoff)
                     )
                 ):
-                    raise ExecutionHostError("invalid_execution_checkpoint")
+                    raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
                 if (
                     target_cutoff is not None
                     and _checkpoint_number(target_cutoff)
@@ -1393,7 +1409,7 @@ class ExecutionHost:
                         checkpoint["next_operation_receipt_sequence"]
                     )
                 ):
-                    raise ExecutionHostError("invalid_execution_checkpoint")
+                    raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
             self._check_expected(
                 checkpoint, expected_revision, expected_checkpoint_digest
             )
@@ -1438,8 +1454,8 @@ class ExecutionHost:
             try:
                 self._stage_replace(transaction, checkpoint, candidate)
             except Exception as exc:
-                if getattr(exc, "code", None) == "invalid_execution_checkpoint":
-                    raise ExecutionHostError("invalid_execution_checkpoint") from exc
+                if getattr(exc, "code", None) == HostCode.INVALID_EXECUTION_CHECKPOINT:
+                    raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT) from exc
                 raise
             response = {
                 "result": "committed",
@@ -1457,11 +1473,11 @@ class ExecutionHost:
         expected_checkpoint_digest: str,
     ) -> dict[str, Any]:
         if not operation_id:
-            raise ExecutionHostError("invalid_execution_checkpoint")
+            raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
         with self._transaction(root_instance_id) as transaction:
             source = transaction.load()
             if source is None:
-                raise ExecutionHostError("wrong_root")
+                raise ExecutionHostError(PreAcceptanceCode.WRONG_ROOT)
             restored = self._restore(source, root_instance_id)
             checkpoint = restored.document
             root_record = checkpoint["root_record"]
@@ -1471,12 +1487,12 @@ class ExecutionHost:
                         "result": "tombstoned",
                         "tombstone": copy.deepcopy(root_record),
                     }
-                raise ExecutionHostError("operation_id_conflict")
+                raise ExecutionHostError(HostCode.OPERATION_ID_CONFLICT)
             self._check_expected(
                 checkpoint, expected_revision, expected_checkpoint_digest
             )
             if restored.aggregate is None:
-                raise ExecutionHostError("invalid_execution_checkpoint")
+                raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
             root_runtime = restored.aggregate.state["runtimes"][
                 restored.aggregate.state["root_runtime_id"]
             ]
@@ -1485,7 +1501,7 @@ class ExecutionHost:
                 or checkpoint["pending_deliveries"]
                 or checkpoint["pending_outbox_intents"]
             ):
-                raise ExecutionHostError("invalid_execution_checkpoint")
+                raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
             aggregate = root_record["aggregate_state"]
             candidate = _mutate(checkpoint)
             tombstone = {
@@ -1518,7 +1534,7 @@ class ExecutionHost:
         del root_instance_id, expected_revision, expected_checkpoint_digest
         return {
             "result": "unsupported",
-            "failure": {"code": "physical_deletion_unsupported"},
+            "failure": {"code": HostCode.PHYSICAL_DELETION_UNSUPPORTED.value},
         }
 
 

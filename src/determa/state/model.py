@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from .codes import MachineLoadFailureCode as LoadCode
 from .definition import Bundle, _escape_pointer
 from .errors import ValidationError
 
@@ -103,7 +104,7 @@ class MachineModel:
 
     def _index(self, state: StateNode) -> None:
         if state.path in self.states:
-            raise ValidationError("semantic_validation", path=state.pointer)
+            raise ValidationError(LoadCode.SEMANTIC_VALIDATION, path=state.pointer)
         self.states[state.path] = state
         for child in state.children.values():
             self._index(child)
@@ -129,7 +130,9 @@ class MachineModel:
         try:
             return self.states[path]
         except KeyError as exc:
-            raise ValidationError("semantic_validation", message=f"unknown state {path}") from exc
+            raise ValidationError(
+                LoadCode.SEMANTIC_VALIDATION, message=f"unknown state {path}"
+            ) from exc
 
     def leaves_under(self, state: StateNode) -> list[StateNode]:
         return [
@@ -157,7 +160,7 @@ class BundleModel:
         for index, raw in enumerate(bundle.raw["machines"]):
             machine_id = str(raw["machine_id"])
             if machine_id in self.machines:
-                raise ValidationError("semantic_validation", message="duplicate machine_id")
+                raise ValidationError(LoadCode.SEMANTIC_VALIDATION, message="duplicate machine_id")
             self.machines[machine_id] = MachineModel(bundle, raw, machine_index=index)
 
     def machine(self, machine_id: str) -> MachineModel:
@@ -165,7 +168,7 @@ class BundleModel:
             return self.machines[machine_id]
         except KeyError as exc:
             raise ValidationError(
-                "semantic_validation", message=f"unknown machine {machine_id}"
+                LoadCode.SEMANTIC_VALIDATION, message=f"unknown machine {machine_id}"
             ) from exc
 
     def inline_component(

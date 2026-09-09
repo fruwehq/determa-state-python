@@ -15,6 +15,15 @@ from typing import Any, Protocol, cast
 
 import rfc8785
 
+from .codes import (
+    CheckpointArtifactFailureCode as CheckpointCode,
+)
+from .codes import (
+    MachineLoadFailureCode as LoadCode,
+)
+from .codes import (
+    PersistenceFailureCode as PersistenceCode,
+)
 from .definition import Bundle, BundleSource, _escape_pointer, load_bundle
 from .errors import ArtifactError, ValidationError
 from .model import BundleModel, MachineModel, StateNode
@@ -107,14 +116,14 @@ class MemoryArtifactResolver:
     ) -> None:
         bundle = definition if isinstance(definition, Bundle) else load_bundle(definition)
         if bundle.fingerprint != fingerprint:
-            raise ArtifactError("definition_fingerprint_mismatch")
+            raise ArtifactError(PersistenceCode.DEFINITION_FINGERPRINT_MISMATCH)
         existing = self._definitions.get(fingerprint)
         if existing is not None:
             current = existing if isinstance(existing, Bundle) else load_bundle(existing)
             if canonical_bytes(typed_value(current.raw)) != canonical_bytes(
                 typed_value(bundle.raw)
             ):
-                raise ArtifactError("definition_fingerprint_mismatch")
+                raise ArtifactError(PersistenceCode.DEFINITION_FINGERPRINT_MISMATCH)
         else:
             self._definitions[fingerprint] = bundle
         if trusted:
@@ -125,12 +134,12 @@ class MemoryArtifactResolver:
     ) -> None:
         document, _ = load_json_artifact(descriptor, "migration_descriptor")
         if migration_descriptor_digest(document) != digest:
-            raise ArtifactError("invalid_migration_descriptor")
+            raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)
         existing = self._migration_descriptors.get(digest)
         if existing is not None:
             current, _ = load_json_artifact(existing, "migration_descriptor")
             if canonical_bytes(current) != canonical_bytes(document):
-                raise ArtifactError("invalid_migration_descriptor")
+                raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)
         else:
             self._migration_descriptors[digest] = copy.deepcopy(document)
         if trusted:
@@ -166,7 +175,7 @@ def _source_bytes(source: ArtifactSource) -> bytes:
     except ValidationError as exc:
         raise ArtifactError("invalid_json_value") from exc
     if not validate_unicode(source):
-        raise ArtifactError("invalid_unicode")
+        raise ArtifactError(LoadCode.INVALID_UNICODE)
     return canonical_bytes(copy.deepcopy(dict(source)))
 
 
@@ -176,7 +185,7 @@ def strict_json(source: ArtifactSource) -> tuple[Any, bytes]:
     try:
         text = raw.decode("utf-8", errors="strict")
     except UnicodeDecodeError as exc:
-        raise ArtifactError("invalid_unicode") from exc
+        raise ArtifactError(LoadCode.INVALID_UNICODE) from exc
     try:
         value = json.loads(
             text,
@@ -192,7 +201,7 @@ def strict_json(source: ArtifactSource) -> tuple[Any, bytes]:
     except ValidationError as exc:
         raise ArtifactError("invalid_json_value") from exc
     if not validate_unicode(value):
-        raise ArtifactError("invalid_unicode")
+        raise ArtifactError(LoadCode.INVALID_UNICODE)
     return value, raw
 
 
@@ -216,38 +225,38 @@ def typed_value(value: Any) -> list[Any]:
         return ["boolean", value]
     if isinstance(value, str):
         if not validate_unicode(value):
-            raise ArtifactError("invalid_aggregate_state")
+            raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
         return ["string", value]
     if isinstance(value, int):
         if not _INT_MIN <= value <= _INT_MAX:
-            raise ArtifactError("invalid_aggregate_state")
+            raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
         return ["integer", str(value)]
     if isinstance(value, float):
         if not math.isfinite(value):
-            raise ArtifactError("invalid_aggregate_state")
+            raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
         return ["float", struct.pack("!d", 0.0 if value == 0.0 else value).hex()]
     if isinstance(value, list):
         return ["list", [typed_value(item) for item in value]]
     if isinstance(value, dict):
         if not all(isinstance(key, str) for key in value):
-            raise ArtifactError("invalid_aggregate_state")
+            raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
         entries = [
             [key, typed_value(value[key])]
             for key in sorted(value, key=lambda item: item.encode("utf-8"))
         ]
         return ["map", entries]
-    raise ArtifactError("invalid_aggregate_state")
+    raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
 
 
 def decoded_typed_value(value: Any) -> Any:
     """Decode one exact typed value, rejecting noncanonical representations."""
     if not isinstance(value, list) or not value or not isinstance(value[0], str):
-        raise ArtifactError("invalid_aggregate_state")
+        raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
     tag = value[0]
     if tag == "null" and value == ["null"]:
         return None
     if len(value) != 2:
-        raise ArtifactError("invalid_aggregate_state")
+        raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
     payload = value[1]
     if tag == "boolean" and isinstance(payload, bool):
         return payload
@@ -277,14 +286,14 @@ def decoded_typed_value(value: Any) -> Any:
                 or not isinstance(entry[0], str)
                 or not validate_unicode(entry[0])
             ):
-                raise ArtifactError("invalid_aggregate_state")
+                raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
             encoded = entry[0].encode("utf-8")
             if previous is not None and encoded <= previous:
-                raise ArtifactError("invalid_aggregate_state")
+                raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
             previous = encoded
             result[entry[0]] = decoded_typed_value(entry[1])
         return result
-    raise ArtifactError("invalid_aggregate_state")
+    raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
 
 
 def _signed_decimal(value: str) -> int:
@@ -299,19 +308,19 @@ def _signed_decimal(value: str) -> int:
         or not digits.isdigit()
         or digits.startswith("0")
     ):
-        raise ArtifactError("invalid_aggregate_state")
+        raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
     try:
         return int(value)
     except ValueError as exc:
-        raise ArtifactError("invalid_aggregate_state") from exc
+        raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE) from exc
 
 
 def decimal(value: Any, *, positive: bool = False) -> int:
     if not isinstance(value, str):
-        raise ArtifactError("invalid_aggregate_state")
+        raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
     number = _signed_decimal(value)
     if number < 0 or (positive and number == 0):
-        raise ArtifactError("invalid_aggregate_state")
+        raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
     return number
 
 
@@ -355,32 +364,32 @@ def _format_code(document: Any, kind: str) -> str | None:
             "determa.aggregate_state",
             "aggregate_state_schema_version",
             1,
-            "unsupported_aggregate_state_format",
-            "unsupported_aggregate_state_schema_version",
+            PersistenceCode.UNSUPPORTED_AGGREGATE_STATE_FORMAT,
+            PersistenceCode.UNSUPPORTED_AGGREGATE_STATE_SCHEMA_VERSION,
         ),
         "migration_descriptor": (
             "migration_descriptor_format",
             "determa.aggregate_migration",
             "migration_descriptor_schema_version",
             1,
-            "unsupported_migration_descriptor_format",
-            "unsupported_migration_descriptor_schema_version",
+            PersistenceCode.UNSUPPORTED_MIGRATION_DESCRIPTOR_FORMAT,
+            PersistenceCode.UNSUPPORTED_MIGRATION_DESCRIPTOR_SCHEMA_VERSION,
         ),
         "aggregate_state_package": (
             "aggregate_state_package_format",
             "determa.aggregate_state_package",
             "aggregate_state_package_schema_version",
             1,
-            "unsupported_aggregate_state_package_format",
-            "unsupported_aggregate_state_package_schema_version",
+            PersistenceCode.UNSUPPORTED_AGGREGATE_STATE_PACKAGE_FORMAT,
+            PersistenceCode.UNSUPPORTED_AGGREGATE_STATE_PACKAGE_SCHEMA_VERSION,
         ),
         "execution_checkpoint": (
             "execution_checkpoint_format",
             "determa.execution_checkpoint",
             "execution_checkpoint_schema_version",
             1,
-            "unsupported_execution_checkpoint_format",
-            "unsupported_execution_checkpoint_schema_version",
+            CheckpointCode.UNSUPPORTED_EXECUTION_CHECKPOINT_FORMAT,
+            CheckpointCode.UNSUPPORTED_EXECUTION_CHECKPOINT_SCHEMA_VERSION,
         ),
     }
     format_member, expected_format, version_member, expected_version, format_code, version_code = (
@@ -401,10 +410,10 @@ def load_json_artifact(
         document, raw = strict_json(source)
     except ArtifactError as exc:
         code = {
-            "aggregate_state": "invalid_aggregate_state",
-            "migration_descriptor": "invalid_migration_descriptor",
-            "aggregate_state_package": "invalid_aggregate_state_package",
-            "execution_checkpoint": "invalid_execution_checkpoint",
+            "aggregate_state": PersistenceCode.INVALID_AGGREGATE_STATE,
+            "migration_descriptor": PersistenceCode.INVALID_MIGRATION_DESCRIPTOR,
+            "aggregate_state_package": PersistenceCode.INVALID_AGGREGATE_STATE_PACKAGE,
+            "execution_checkpoint": CheckpointCode.INVALID_EXECUTION_CHECKPOINT,
         }[kind]
         raise ArtifactError(code) from exc
     unsupported = _format_code(document, kind)
@@ -417,10 +426,10 @@ def load_json_artifact(
     )
     if not isinstance(document, dict) or next(validator.iter_errors(document), None) is not None:
         code = {
-            "aggregate_state": "invalid_aggregate_state",
-            "migration_descriptor": "invalid_migration_descriptor",
-            "aggregate_state_package": "invalid_aggregate_state_package",
-            "execution_checkpoint": "invalid_execution_checkpoint",
+            "aggregate_state": PersistenceCode.INVALID_AGGREGATE_STATE,
+            "migration_descriptor": PersistenceCode.INVALID_MIGRATION_DESCRIPTOR,
+            "aggregate_state_package": PersistenceCode.INVALID_AGGREGATE_STATE_PACKAGE,
+            "execution_checkpoint": CheckpointCode.INVALID_EXECUTION_CHECKPOINT,
         }[kind]
         raise ArtifactError(code)
     return document, raw
@@ -450,12 +459,12 @@ def bundle_from_attachment(attachment: Mapping[str, Any]) -> Bundle:
         raw = decoded_typed_value(attachment["normalized_bundle"])
         fingerprint = attachment["validated_bundle_fingerprint"]
     except (ArtifactError, KeyError, TypeError) as exc:
-        raise ArtifactError("invalid_aggregate_state_package") from exc
+        raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE_PACKAGE) from exc
     if not isinstance(raw, dict) or not isinstance(fingerprint, str):
-        raise ArtifactError("invalid_aggregate_state_package")
+        raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE_PACKAGE)
     bundle = load_bundle(raw)
     if bundle.fingerprint != fingerprint:
-        raise ArtifactError("invalid_aggregate_state_package")
+        raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE_PACKAGE)
     return bundle
 
 
@@ -469,16 +478,18 @@ def _bundle_from_resolver(
     definition = resolver.resolve_definition(fingerprint)
     if definition is None:
         raise ArtifactError(
-            "source_definition_unavailable" if source else "target_definition_unavailable"
+            PersistenceCode.SOURCE_DEFINITION_UNAVAILABLE
+            if source
+            else PersistenceCode.TARGET_DEFINITION_UNAVAILABLE
         )
     if require_trust and not resolver.definition_is_trusted(fingerprint):
-        raise ArtifactError("definition_untrusted")
+        raise ArtifactError(PersistenceCode.DEFINITION_UNTRUSTED)
     try:
         bundle = definition if isinstance(definition, Bundle) else load_bundle(definition)
     except ValidationError as exc:
-        raise ArtifactError("definition_fingerprint_mismatch") from exc
+        raise ArtifactError(PersistenceCode.DEFINITION_FINGERPRINT_MISMATCH) from exc
     if bundle.fingerprint != fingerprint:
-        raise ArtifactError("definition_fingerprint_mismatch")
+        raise ArtifactError(PersistenceCode.DEFINITION_FINGERPRINT_MISMATCH)
     return bundle
 
 
@@ -581,7 +592,7 @@ def _node_for_runtime(machine: MachineModel, path: str) -> StateNode:
     try:
         return machine.states[path]
     except KeyError as exc:
-        raise ArtifactError("invalid_aggregate_state") from exc
+        raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE) from exc
 
 
 def _runtime_wire(
@@ -717,7 +728,7 @@ def aggregate_envelope(bundle: Bundle | BundleSource, state: dict[str, Any]) -> 
     from .engine import _valid_prior_state
 
     if not _valid_prior_state(state, validated):
-        raise ArtifactError("invalid_aggregate_state")
+        raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
     models = BundleModel(validated)
     root = state["runtimes"][state["root_runtime_id"]]
     restored_order = state.get("_wire_runtime_order")
@@ -768,7 +779,7 @@ def _state_path_for_pointer(machine: MachineModel, pointer: str) -> str:
     for path, node in machine.states.items():
         if node.pointer == pointer:
             return path
-    raise ArtifactError("invalid_aggregate_state")
+    raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
 
 
 def _variable_for_pointer(
@@ -780,14 +791,14 @@ def _variable_for_pointer(
             for name, declaration in (node.raw.get("variables") or {}).items():
                 if pointer == f"{prefix}{_escape_pointer(name)}":
                     return path, name, declaration
-    raise ArtifactError("invalid_aggregate_state")
+    raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
 
 
 def _history_path_for_pointer(machine: MachineModel, pointer: str) -> str:
     for path, node in machine.states.items():
         if pointer == f"{node.pointer}/history":
             return "$root" if node is machine.root else path
-    raise ArtifactError("invalid_aggregate_state")
+    raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
 
 
 def _machine_for_binding(
@@ -800,7 +811,7 @@ def _machine_for_binding(
         machine_data["namespace"] != bundle.namespace
         or decimal(machine_data["machine_version"], positive=True) != base.version
     ):
-        raise ArtifactError("invalid_aggregate_state")
+        raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
     root_pointer = machine_data["root_definition_pointer"]
     if root_pointer == base.root_pointer:
         return base
@@ -822,10 +833,10 @@ def _origin_machine(
 ) -> tuple[Bundle, MachineModel]:
     definition = origin.get("definition")
     if not isinstance(definition, Mapping):
-        raise ArtifactError("invalid_aggregate_state")
+        raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
     fingerprint = definition.get("validated_bundle_fingerprint")
     if not isinstance(fingerprint, str):
-        raise ArtifactError("invalid_aggregate_state")
+        raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
     bundle = _bundle_from_resolver(resolver, fingerprint, source=True, require_trust=True)
     return bundle, _machine_for_binding(bundle, BundleModel(bundle), definition)
 
@@ -843,7 +854,7 @@ def _validate_immutable_identity(
         "component": "component",
         "spawned": "owned_spawned_instance",
     }[role]:
-        raise ArtifactError("invalid_aggregate_state")
+        raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
     origin_bundle, origin_machine = _origin_machine(resolver, origin)
     root_instance_id = aggregate["root_instance_id"]
     runtime_id = document["runtime_id"]
@@ -858,22 +869,22 @@ def _validate_immutable_identity(
                 }
             }
         ):
-            raise ArtifactError("invalid_aggregate_state")
+            raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
         return
     if role == "component":
         component = target.get("component")
         if not isinstance(component, Mapping):
-            raise ArtifactError("invalid_aggregate_state")
+            raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
         pointer = origin.get("component_definition_pointer")
         if not isinstance(pointer, str):
-            raise ArtifactError("invalid_aggregate_state")
+            raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
         try:
             from .engine import _pointer_get
 
             placement = _pointer_get(origin_bundle.raw, pointer)
             declaration_index = int(pointer.rsplit("/", 1)[1])
         except (IndexError, KeyError, TypeError, ValueError):
-            raise ArtifactError("invalid_aggregate_state") from None
+            raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE) from None
         if (
             not isinstance(placement, dict)
             or decimal(origin.get("declaration_index")) != declaration_index
@@ -886,7 +897,7 @@ def _validate_immutable_identity(
                 "activation_sequence": decimal(origin.get("activation_sequence")),
             }
         ):
-            raise ArtifactError("invalid_aggregate_state")
+            raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
         return
     spawned = target.get("spawned_instance")
     if (
@@ -899,7 +910,7 @@ def _validate_immutable_identity(
             "machine_version": origin_machine.version,
         }
     ):
-        raise ArtifactError("invalid_aggregate_state")
+        raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
 
 
 def _runtime_from_wire(
@@ -911,7 +922,7 @@ def _runtime_from_wire(
 ) -> dict[str, Any]:
     current = document["current_definition"]
     if current["validated_bundle_fingerprint"] != bundle.fingerprint:
-        raise ArtifactError("invalid_aggregate_state")
+        raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
     machine = _machine_for_binding(bundle, models, current)
     relation = document["relation"]
     role = {
@@ -923,41 +934,41 @@ def _runtime_from_wire(
     for item in document["active_state_activations"]:
         path = _state_path_for_pointer(machine, item["state_definition_pointer"])
         if path in activations:
-            raise ArtifactError("invalid_aggregate_state")
+            raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
         activations[path] = decimal(item["activation_sequence"])
     leaf_pointers = document["active_leaf_state_definition_pointers"]
     if len(leaf_pointers) > 1:
-        raise ArtifactError("invalid_aggregate_state")
+        raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
     active: list[str] = []
     if leaf_pointers:
         leaf = machine.states[_state_path_for_pointer(machine, leaf_pointers[0])]
         active = [node.path for node in reversed(leaf.ancestors(include_self=True))]
     if set(active) != set(activations):
-        raise ArtifactError("invalid_aggregate_state")
+        raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
     scopes: dict[str, dict[str, Any]] = {path: {} for path in active}
     for item in document["variables"]:
         path, name, declaration = _variable_for_pointer(
             machine, item["variable_declaration_pointer"]
         )
         if path not in scopes or name in scopes[path]:
-            raise ArtifactError("invalid_aggregate_state")
+            raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
         if decimal(item["declaring_state_activation_sequence"]) != activations[path]:
-            raise ArtifactError("invalid_aggregate_state")
+            raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
         value = decoded_typed_value(item["value"])
         from .engine import _value_matches
 
         if not _value_matches(value, str(declaration["type"])):
-            raise ArtifactError("invalid_aggregate_state")
+            raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
         scopes[path][name] = value
     for path in active:
         declarations = machine.states[path].raw.get("variables") or {}
         if set(scopes[path]) != set(declarations):
-            raise ArtifactError("invalid_aggregate_state")
+            raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
     history: dict[str, list[str] | None] = {}
     for item in document["history"]:
         path = _history_path_for_pointer(machine, item["history_declaration_pointer"])
         if path in history:
-            raise ArtifactError("invalid_aggregate_state")
+            raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
         recorded = item["recorded_state_definition_pointers"]
         history[path] = (
             None
@@ -968,13 +979,13 @@ def _runtime_from_wire(
     for item in document["next_state_activation_sequences"]:
         path = _state_path_for_pointer(machine, item["definition_pointer"])
         if path in state_counters:
-            raise ArtifactError("invalid_aggregate_state")
+            raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
         state_counters[path] = decimal(item["next_sequence"])
     component_counters: dict[str, int] = {}
     for item in document["next_component_activation_sequences"]:
         pointer = item["definition_pointer"]
         if pointer in component_counters:
-            raise ArtifactError("invalid_aggregate_state")
+            raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
         component_counters[pointer] = decimal(item["next_sequence"])
     target = copy.deepcopy(document["target_identity"])
     if "component" in target:
@@ -1064,7 +1075,7 @@ def _finish_relationships(
         if runtime["role"] == "component":
             owner = state["runtimes"].get(runtime["owner_runtime_id"])
             if owner is None:
-                raise ArtifactError("invalid_aggregate_state")
+                raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
             relation = runtime["_relation"]
             owner_machine = _runtime_model(bundle, models, owner)
             pointer = relation["current_component_definition_pointer"]
@@ -1077,25 +1088,25 @@ def _finish_relationships(
                 None,
             )
             if owning is None or owning.path not in owner["state_activation_sequence"]:
-                raise ArtifactError("invalid_aggregate_state")
+                raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
             runtime["owning_state_path"] = owning.path
             runtime["owning_state_activation_sequence"] = owner[
                 "state_activation_sequence"
             ][owning.path]
             if runtime["component_id"] in owner["components"]:
-                raise ArtifactError("invalid_aggregate_state")
+                raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
             owner["components"][runtime["component_id"]] = runtime["runtime_id"]
         elif runtime["role"] == "spawned" and runtime["holder"] is not None:
             owner = state["runtimes"].get(runtime["owner_runtime_id"])
             if owner is None:
-                raise ArtifactError("invalid_aggregate_state")
+                raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
             owner_machine = _runtime_model(bundle, models, owner)
             holder_pointer = runtime["holder"]["pointer"]
             path, _name, _declaration = _variable_for_pointer(
                 owner_machine, holder_pointer
             )
             if path not in owner["state_activation_sequence"]:
-                raise ArtifactError("invalid_aggregate_state")
+                raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
             runtime["holder"]["state_path"] = path
 
 
@@ -1105,13 +1116,13 @@ def restore_aggregate(
     """Verify and restore one portable aggregate without changing the source."""
     document, raw = load_json_artifact(source, "aggregate_state")
     if aggregate_state_digest(document) != document["aggregate_state_digest"]:
-        raise ArtifactError("aggregate_state_digest_mismatch")
+        raise ArtifactError(PersistenceCode.AGGREGATE_STATE_DIGEST_MISMATCH)
     fingerprint = document["validated_bundle_fingerprint"]
     bundle = _bundle_from_resolver(
         definition_resolver, fingerprint, source=True, require_trust=True
     )
     if document["namespace"] != bundle.namespace:
-        raise ArtifactError("invalid_aggregate_state")
+        raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
     models = BundleModel(bundle)
     state: dict[str, Any] = {
         "validated_bundle_fingerprint": fingerprint,
@@ -1135,12 +1146,12 @@ def restore_aggregate(
             bundle, models, definition_resolver, document, runtime_document
         )
         if runtime["runtime_id"] in state["runtimes"]:
-            raise ArtifactError("invalid_aggregate_state")
+            raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
         state["runtimes"][runtime["runtime_id"]] = runtime
     _finish_relationships(bundle, state, models)
     root = state["runtimes"].get(state["root_runtime_id"])
     if root is None or root["role"] != "root":
-        raise ArtifactError("invalid_aggregate_state")
+        raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
     if (
         document["root_machine_id"] != root["machine_id"]
         or decimal(document["root_machine_version"], positive=True)
@@ -1148,13 +1159,13 @@ def restore_aggregate(
         or root["_current_definition"]["machine"]["root_definition_pointer"]
         != root["root_pointer"]
     ):
-        raise ArtifactError("invalid_aggregate_state")
+        raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
     state["status"] = root["status"]
     state["fault"] = copy.deepcopy(root["fault"])
     from .engine import _valid_prior_state
 
     if not _valid_prior_state(state, bundle):
-        raise ArtifactError("invalid_aggregate_state")
+        raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
     canonical = canonical_bytes(document)
     return RestoredAggregate(
         bundle=bundle,
@@ -1176,16 +1187,16 @@ def restore_aggregate_package(
         for attachment in document["normalized_definitions"]:
             bundle = bundle_from_attachment(attachment)
             if bundle.fingerprint in definitions:
-                raise ArtifactError("invalid_aggregate_state_package")
+                raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE_PACKAGE)
             definitions[bundle.fingerprint] = bundle
         for descriptor in document["migration_descriptors"]:
             digest = descriptor["migration_descriptor_digest"]
             if digest in descriptors or migration_descriptor_digest(descriptor) != digest:
-                raise ArtifactError("invalid_aggregate_state_package")
+                raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE_PACKAGE)
             descriptors[digest] = copy.deepcopy(descriptor)
         route = tuple(document["migration_route"])
         if len(set(route)) != len(route):
-            raise ArtifactError("invalid_aggregate_state_package")
+            raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE_PACKAGE)
         for fingerprint, bundle in definitions.items():
             existing_definition = artifact_resolver.resolve_definition(fingerprint)
             if existing_definition is not None:
@@ -1199,7 +1210,7 @@ def restore_aggregate_package(
                     or canonical_bytes(typed_value(current_bundle.raw))
                     != canonical_bytes(typed_value(bundle.raw))
                 ):
-                    raise ArtifactError("definition_fingerprint_mismatch")
+                    raise ArtifactError(PersistenceCode.DEFINITION_FINGERPRINT_MISMATCH)
         for digest, descriptor in descriptors.items():
             existing_descriptor = artifact_resolver.resolve_migration_descriptor(digest)
             if existing_descriptor is not None:
@@ -1207,21 +1218,24 @@ def restore_aggregate_package(
                     existing_descriptor, "migration_descriptor"
                 )
                 if canonical_bytes(current_descriptor) != canonical_bytes(descriptor):
-                    raise ArtifactError("invalid_migration_descriptor")
+                    raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)
     except (ArtifactError, KeyError, TypeError, ValidationError) as exc:
         if isinstance(exc, ArtifactError) and (
             exc.code.startswith("unsupported_")
             or exc.code
-            in {"definition_fingerprint_mismatch", "invalid_migration_descriptor"}
+            in {
+                PersistenceCode.DEFINITION_FINGERPRINT_MISMATCH,
+                PersistenceCode.INVALID_MIGRATION_DESCRIPTOR,
+            }
         ):
             raise exc
-        raise ArtifactError("invalid_aggregate_state_package") from exc
+        raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE_PACKAGE) from exc
     put_definition = getattr(artifact_resolver, "put_definition", None)
     put_descriptor = getattr(artifact_resolver, "put_migration_descriptor", None)
     if (definitions and not callable(put_definition)) or (
         descriptors and not callable(put_descriptor)
     ):
-        raise ArtifactError("invalid_aggregate_state_package")
+        raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE_PACKAGE)
     overlay = _PackageResolver(artifact_resolver, definitions, descriptors)
     try:
         aggregate = restore_aggregate(document["aggregate_state"], overlay)
@@ -1421,4 +1435,4 @@ def _resolve_variable_pointer(
         if name in (current.raw.get("variables") or {}):
             return f"{current.pointer}/variables/{_escape_pointer(name)}"
         current = current.parent
-    raise ArtifactError("invalid_migration_descriptor")
+    raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)

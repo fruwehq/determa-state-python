@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote, urlsplit
 
+from ..codes import ExecutionStoreAdapterFailureCode as AdapterCode
 from .base import (
     COMPACT_EFFECT_IDENTITY_RETENTION,
     DURABLE_SINGLE_WRITER,
@@ -135,7 +136,7 @@ class SQLiteExecutionStore(ExecutionStore):
             or replay_retention not in _REPLAY_RETENTION_MODES
             or outbox_retention not in _OUTBOX_RETENTION_MODES
         ):
-            raise ExecutionStoreError("invalid_adapter_configuration")
+            raise ExecutionStoreError(AdapterCode.INVALID_ADAPTER_CONFIGURATION)
 
     @property
     def capabilities(self) -> frozenset[str]:
@@ -188,7 +189,7 @@ class SQLiteExecutionStore(ExecutionStore):
             or int(actual_synchronous[0]) != expected_synchronous
         ):
             connection.close()
-            raise ExecutionStoreError("invalid_adapter_configuration")
+            raise ExecutionStoreError(AdapterCode.INVALID_ADAPTER_CONFIGURATION)
         return connection
 
     def _validate_table(
@@ -452,7 +453,7 @@ def _single_query(query: Mapping[str, list[str]], key: str, default: str) -> str
     if values is None:
         return default
     if len(values) != 1:
-        raise ExecutionStoreError("invalid_adapter_configuration")
+        raise ExecutionStoreError(AdapterCode.INVALID_ADAPTER_CONFIGURATION)
     return values[0]
 
 
@@ -467,10 +468,10 @@ def sqlite_execution_store_factory(
         or parsed.fragment
         or configuration
     ):
-        raise ExecutionStoreError("invalid_adapter_configuration")
+        raise ExecutionStoreError(AdapterCode.INVALID_ADAPTER_CONFIGURATION)
     path = unquote(parsed.path)
     if not path or not Path(path).is_absolute():
-        raise ExecutionStoreError("invalid_adapter_configuration")
+        raise ExecutionStoreError(AdapterCode.INVALID_ADAPTER_CONFIGURATION)
     query = parse_qs(parsed.query, keep_blank_values=True)
     if set(query) - {
         "journal_mode",
@@ -479,7 +480,7 @@ def sqlite_execution_store_factory(
         "replay_retention",
         "outbox_retention",
     }:
-        raise ExecutionStoreError("invalid_adapter_configuration")
+        raise ExecutionStoreError(AdapterCode.INVALID_ADAPTER_CONFIGURATION)
     journal_mode = _single_query(query, "journal_mode", "WAL")
     synchronous = _single_query(query, "synchronous", "FULL")
     timeout_text = _single_query(query, "timeout", "30")
@@ -488,7 +489,7 @@ def sqlite_execution_store_factory(
     try:
         timeout = float(timeout_text)
     except ValueError as exc:
-        raise ExecutionStoreError("invalid_adapter_configuration") from exc
+        raise ExecutionStoreError(AdapterCode.INVALID_ADAPTER_CONFIGURATION) from exc
     return SQLiteExecutionStore(
         path,
         journal_mode=journal_mode,

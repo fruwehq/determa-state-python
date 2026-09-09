@@ -7,6 +7,7 @@ from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from typing import Any
 
+from ..codes import ExecutionStoreAdapterFailureCode as AdapterCode
 from .base import (
     EPHEMERAL,
     ExecutionStore,
@@ -108,5 +109,5 @@ def memory_execution_store_factory(
     if uri != "memory:" or configuration:
         from .base import ExecutionStoreError
 
-        raise ExecutionStoreError("invalid_adapter_configuration")
+        raise ExecutionStoreError(AdapterCode.INVALID_ADAPTER_CONFIGURATION)
     return MemoryExecutionStore()

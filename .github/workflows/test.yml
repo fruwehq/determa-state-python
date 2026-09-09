@@ -58,7 +58,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: fruwehq/determa-state-conformance
-          ref: 263644f951f342b0eeaa3aceef4877293d2d7c67
+          ref: 5ba78c7ef90b8556e76de6481a18b23a3d0c2378
           path: .pinned/determa-state-conformance
       - name: Check out pinned specification
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

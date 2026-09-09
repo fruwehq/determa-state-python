@@ -9,17 +9,22 @@ from pathlib import Path
 import pytest
 from jsonschema import Draft202012Validator
 
-from determa.state import load_bundle
+from determa.state import PORTABLE_CODE_SETS, load_bundle
 from determa.state.validator import schema as bundled_schema
 from determa.state.wire import artifact_schema
 
 from .execution_checkpoint import (
+    _actual_scope_maps,
+    _assert_complete_scope_maps,
+    _expected_scope_maps,
+    _scope_hosts,
+    _scope_state,
     execution_checkpoint_cases,
     execution_checkpoint_vectors,
     run_execution_checkpoint_vector,
     validate_execution_checkpoint_artifact,
 )
-from .harness import CORE_DIR, CoreCase, core_cases, run_case
+from .harness import CORE_DIR, CoreCase, conformance_root, core_cases, run_case
 from .persistence import persistence_vector_cases, run_persistence_vectors
 from .persistence_profiles import (
     persistence_profile_cases,
@@ -46,7 +51,102 @@ def _spec_root() -> Path | None:
 def test_suite_present() -> None:
     assert CORE_DIR.exists(), "pinned conformance suite is unavailable"
     assert len(core_cases()) == 111
-    assert len(execution_checkpoint_vectors()) == 85
+    assert len(execution_checkpoint_vectors()) == 91
+
+
+def test_portable_code_sets_match_authoritative_registry() -> None:
+    vector_path = (
+        conformance_root()
+        / "conformance"
+        / "closed-code-registry"
+        / "vectors.generated.json"
+    )
+    vectors = json.loads(vector_path.read_text(encoding="utf-8"))
+    expected = {
+        category["id"]: frozenset(category["codes"])
+        for category in vectors["categories"]
+        if category["id"] != "execution_store_failure"
+    }
+
+    missing_categories = sorted(set(expected) - set(PORTABLE_CODE_SETS))
+    extra_categories = sorted(set(PORTABLE_CODE_SETS) - set(expected))
+    mismatches = []
+    for category in sorted(set(expected) & set(PORTABLE_CODE_SETS)):
+        missing = sorted(expected[category] - PORTABLE_CODE_SETS[category])
+        extra = sorted(PORTABLE_CODE_SETS[category] - expected[category])
+        if missing or extra:
+            mismatches.append(f"{category}: missing={missing}, extra={extra}")
+
+    assert not (missing_categories or extra_categories or mismatches), "\n".join(
+        [
+            f"categories: missing={missing_categories}, extra={extra_categories}",
+            *mismatches,
+        ]
+    )
+
+
+def _scope_map_pair() -> tuple[dict, dict]:
+    item = next(
+        item
+        for item in execution_checkpoint_vectors()
+        if item.vector["name"] == "pending_outbox_update_in_scope_a"
+    )
+    before = _scope_state(item.case, item.vector["scope_state_before"])
+    hosts, stores = _scope_hosts(item.case, before, [])
+    selected_scope = next(
+        scope
+        for scope in before["scopes"]
+        if scope["logical_scope_id"] == "scope-a"
+    )
+    root_instance_id, binding = next(iter(selected_scope["checkpoints"].items()))
+    checkpoint = json.loads(
+        (item.case.path / binding["file"]).read_text(encoding="utf-8")
+    )
+    hosts["scope-a"].update_pending_outbox(
+        root_instance_id,
+        item.vector["effect_id"],
+        item.vector["desired_pending_state"],
+        expected_revision=checkpoint["revision"],
+        expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+    )
+    after = _scope_state(item.case, item.vector["scope_state_after"])
+    return (
+        _actual_scope_maps(hosts, stores),
+        _expected_scope_maps(item.case, after),
+    )
+
+
+def test_scope_map_rejects_omitted_unchanged_scope_records() -> None:
+    actual, expected = _scope_map_pair()
+    root_instance_id = next(iter(expected["scope-b"]["checkpoints"]))
+    expected["scope-b"]["checkpoints"].pop(root_instance_id)
+    expected["scope-b"]["outbox_records"].pop(root_instance_id)
+
+    with pytest.raises(AssertionError):
+        _assert_complete_scope_maps(actual, expected)
+
+
+def test_scope_map_rejects_unexpected_checkpoint() -> None:
+    actual, expected = _scope_map_pair()
+    actual["scope-a"]["checkpoints"]["unexpected-root"] = b"unexpected"
+
+    with pytest.raises(AssertionError):
+        _assert_complete_scope_maps(actual, expected)
+
+
+def test_scope_map_rejects_unexpected_outbox_record() -> None:
+    actual, expected = _scope_map_pair()
+    root_instance_id = next(iter(actual["scope-a"]["outbox_records"]))
+    actual["scope-a"]["outbox_records"][root_instance_id].append(
+        {
+            "effect_id": "unexpected-effect",
+            "record_kind": "pending",
+            "source_digest": "sha256:unexpected",
+        }
+    )
+
+    with pytest.raises(AssertionError):
+        _assert_complete_scope_maps(actual, expected)
 
 
 def test_bundled_schema_matches_pinned_spec() -> None:

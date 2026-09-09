@@ -7,6 +7,7 @@ from collections.abc import Mapping
 from contextlib import AbstractContextManager
 from typing import Any
 
+from ..codes import ExecutionStoreAdapterFailureCode as AdapterCode
 from ..errors import ArtifactError, DetermaError
 from ..wire import strict_json
 
@@ -39,8 +40,8 @@ class ExecutionStoreError(DetermaError):
     """A closed execution-store or adapter failure."""
 
     def __init__(self, code: str, message: str = "") -> None:
-        self.code = code
-        self.message = message or code
+        self.code = str(code)
+        self.message = message or self.code
         super().__init__(self.message)
 
 
@@ -96,7 +97,7 @@ class ExecutionStore(ABC):
     ) -> AbstractContextManager[tuple[Any, ExecutionStoreTransaction]]:
         """Open one host-owned native transaction for application composition."""
         del root_instance_id
-        raise ExecutionStoreError("adapter_capability_mismatch")
+        raise ExecutionStoreError(AdapterCode.ADAPTER_CAPABILITY_MISMATCH)
 
     @abstractmethod
     def setup_schema(self) -> None:

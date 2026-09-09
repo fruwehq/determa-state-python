@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .codes import EngineFaultCode
+
 
 class DetermaError(Exception):
     """Base class for Determa State errors."""
@@ -22,10 +24,13 @@ class ValidationError(DetermaError):
     """A source, schema, or semantic validation failure."""
 
     def __init__(self, code: str, path: str = "", message: str = "") -> None:
-        self.code = code
+        normalized_code = str(code)
+        self.code = normalized_code
         self.path = path
-        self.message = message or code
-        self.errors = [ErrorRecord(code=code, path=path, message=self.message)]
+        self.message = message or normalized_code
+        self.errors = [
+            ErrorRecord(code=normalized_code, path=path, message=self.message)
+        ]
         super().__init__(self.message)
 
 
@@ -41,16 +46,17 @@ class ArtifactError(DetermaError):
     """A portable persistence artifact is invalid or unsupported."""
 
     def __init__(self, code: str, path: str = "", message: str = "") -> None:
-        self.code = code
+        normalized_code = str(code)
+        self.code = normalized_code
         self.path = path
-        self.message = message or code
+        self.message = message or normalized_code
         super().__init__(self.message)
 
 
 class StepFault(DetermaError):
     """Internal control flow for one atomic RTC fault."""
 
-    def __init__(self, code: str, source_locator: str) -> None:
-        self.code = code
+    def __init__(self, code: EngineFaultCode, source_locator: str) -> None:
+        self.code = code.value
         self.source_locator = source_locator
         super().__init__(f"{code} at {source_locator}")
