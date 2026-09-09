@@ -5,8 +5,8 @@ a language-agnostic statechart engine with a shared normative conformance suite.
 
 This implementation supports Determa State `format: 1` at specification
 commit `cc4b0d734aa1c5953de75fb53b63e390a3b72761`. Correctness is determined by the
-111-case core suite, persistence profiles, and 85-vector execution-checkpoint profile
-at conformance commit `263644f951f342b0eeaa3aceef4877293d2d7c67`.
+111-case core suite, persistence profiles, and 91-vector execution-checkpoint profile
+at conformance commit `5ba78c7ef90b8556e76de6481a18b23a3d0c2378`.
 
 Version `0.1.0` is the published synchronized release of the specification, conformance
 suite, Python engine, and Rust engine.
@@ -131,6 +131,9 @@ the exact supplied state object.
 `load_bundle` also accepts a native Python mapping through the same structural and
 semantic validation path. Native values must satisfy the same portable Unicode and
 numeric domain as source documents.
+
+`PORTABLE_CODE_SETS` is an immutable mapping from stable registry category identifiers
+to the portable strings implemented by this package.
 
 ## Persist And Migrate
 

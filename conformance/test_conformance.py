@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from jsonschema import Draft202012Validator
 
-from determa.state import load_bundle
+from determa.state import PORTABLE_CODE_SETS, load_bundle
 from determa.state.validator import schema as bundled_schema
 from determa.state.wire import artifact_schema
 
@@ -19,7 +19,7 @@ from .execution_checkpoint import (
     run_execution_checkpoint_vector,
     validate_execution_checkpoint_artifact,
 )
-from .harness import CORE_DIR, CoreCase, core_cases, run_case
+from .harness import CORE_DIR, CoreCase, conformance_root, core_cases, run_case
 from .persistence import persistence_vector_cases, run_persistence_vectors
 from .persistence_profiles import (
     persistence_profile_cases,
@@ -46,7 +46,38 @@ def _spec_root() -> Path | None:
 def test_suite_present() -> None:
     assert CORE_DIR.exists(), "pinned conformance suite is unavailable"
     assert len(core_cases()) == 111
-    assert len(execution_checkpoint_vectors()) == 85
+    assert len(execution_checkpoint_vectors()) == 91
+
+
+def test_portable_code_sets_match_authoritative_registry() -> None:
+    vector_path = (
+        conformance_root()
+        / "conformance"
+        / "closed-code-registry"
+        / "vectors.generated.json"
+    )
+    vectors = json.loads(vector_path.read_text(encoding="utf-8"))
+    expected = {
+        category["id"]: frozenset(category["codes"])
+        for category in vectors["categories"]
+        if category["id"] != "execution_store_failure"
+    }
+
+    missing_categories = sorted(set(expected) - set(PORTABLE_CODE_SETS))
+    extra_categories = sorted(set(PORTABLE_CODE_SETS) - set(expected))
+    mismatches = []
+    for category in sorted(set(expected) & set(PORTABLE_CODE_SETS)):
+        missing = sorted(expected[category] - PORTABLE_CODE_SETS[category])
+        extra = sorted(PORTABLE_CODE_SETS[category] - expected[category])
+        if missing or extra:
+            mismatches.append(f"{category}: missing={missing}, extra={extra}")
+
+    assert not (missing_categories or extra_categories or mismatches), "\n".join(
+        [
+            f"categories: missing={missing_categories}, extra={extra_categories}",
+            *mismatches,
+        ]
+    )
 
 
 def test_bundled_schema_matches_pinned_spec() -> None:

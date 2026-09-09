@@ -14,6 +14,7 @@ from .checkpoint import (
     validate_execution_checkpoint_member,
     validate_execution_checkpoint_semantics,
 )
+from .codes import PORTABLE_CODE_SETS
 from .definition import Bundle, BundleSource, load_bundle
 from .engine import Delivery, Result, create, dispatch
 from .errors import (
@@ -118,6 +119,7 @@ __all__ = [
     "PERMANENT_OUTBOX_TERMINAL_RETENTION",
     "PERMANENT_RECEIPT_RETENTION",
     "PostgreSQLExecutionStore",
+    "PORTABLE_CODE_SETS",
     "RESTART_PERSISTENT",
     "ROOT_IDENTITY_RETENTION",
     "Result",
