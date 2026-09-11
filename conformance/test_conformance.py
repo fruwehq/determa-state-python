@@ -14,6 +14,7 @@ from determa.state import PORTABLE_CODE_SETS, MemoryExecutionStore, load_bundle
 from determa.state.validator import schema as bundled_schema
 from determa.state.wire import artifact_schema
 
+from .durable_host import durable_host_vectors, run_durable_host_vector
 from .harness import CORE_DIR, CoreCase, conformance_root, core_cases, run_case
 from .version2 import (
     _assert_checkpoint_unchanged,
@@ -63,6 +64,7 @@ def test_suite_present() -> None:
     assert CORE_DIR.exists(), "pinned conformance suite is unavailable"
     assert len(core_cases()) == 98
     assert len(version2_vectors()) == 162
+    assert len(durable_host_vectors()) == 138
 
 
 @pytest.mark.parametrize("stored", [b"mutated", None])
@@ -85,6 +87,24 @@ def test_v2_maintenance_failure_requires_exact_unchanged_checkpoint(
 
     with pytest.raises(AssertionError):
         _assert_checkpoint_unchanged(item, observation)
+
+
+def test_valid_artifact_manifest_does_not_accept_forged_digest(tmp_path: Path) -> None:
+    case, artifact = next(
+        (case, artifact)
+        for case, artifact in _version2_artifacts()
+        if artifact["kind"] == "aggregate_state_v2" and artifact["valid"]
+    )
+    document = json.loads((case / artifact["file"]).read_text(encoding="utf-8"))
+    document["aggregate_state_digest"] = "sha256:" + "0" * 64
+    forged = tmp_path / "forged-aggregate.json"
+    forged.write_text(json.dumps(document), encoding="utf-8")
+
+    with pytest.raises(AssertionError):
+        validate_version2_artifact(
+            tmp_path,
+            {"file": forged.name, "kind": "aggregate_state_v2", "valid": True},
+        )
 
 
 def test_portable_code_sets_match_authoritative_registry() -> None:
@@ -177,6 +197,11 @@ def test_core_case(case: CoreCase) -> None:
 @pytest.mark.parametrize("item", version2_vectors(), ids=lambda item: item.name)
 def test_version2_vector(item) -> None:
     run_version2_vector(item)
+
+
+@pytest.mark.parametrize("item", durable_host_vectors(), ids=lambda item: item.name)
+def test_durable_host_vector(item) -> None:
+    run_durable_host_vector(item)
 
 
 @pytest.mark.parametrize(

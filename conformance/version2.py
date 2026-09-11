@@ -22,6 +22,7 @@ from determa.state import (
     restore_aggregate_package,
     serialize_execution_checkpoint,
 )
+from determa.state.checkpoint import execution_checkpoint_digest
 from determa.state.checkpoint_v2 import (
     admit_checkpoint_v2,
     prune_checkpoint_v2,
@@ -35,7 +36,12 @@ from determa.state.queueing import (
     restore_aggregate_v2,
     step_aggregate_v2,
 )
-from determa.state.wire import canonical_bytes, load_json_artifact, migration_descriptor_digest
+from determa.state.wire import (
+    aggregate_state_digest,
+    canonical_bytes,
+    load_json_artifact,
+    migration_descriptor_digest,
+)
 
 from .harness import conformance_root
 
@@ -95,6 +101,10 @@ def _resolver(
     request = request or {}
     specification = request.get("artifact_resolver") or request.get("definition_resolver")
     if specification is None:
+        definitions = dict(_conformance_definitions())
+        for candidate in path.glob("*machine*.yaml"):
+            bundle = load_bundle(candidate.read_text(encoding="utf-8"))
+            definitions[bundle.fingerprint] = bundle
         descriptors = {}
         for candidate in path.glob("*descriptor*.json"):
             document = _json(candidate)
@@ -103,7 +113,7 @@ def _resolver(
             except ArtifactError:
                 continue
         return MemoryArtifactResolver(
-            definitions=_conformance_definitions(), migration_descriptors=descriptors
+            definitions=definitions, migration_descriptors=descriptors
         )
     definitions = {
         item["validated_bundle_fingerprint"]: (path / item["bundle_file"]).read_text(
@@ -333,6 +343,23 @@ def validate_version2_artifact(path: Path, artifact: dict[str, Any]) -> None:
     try:
         if artifact["valid"]:
             document, _ = load_json_artifact(source, artifact["kind"])
+            if artifact.get("verify_digest", True):
+                if artifact["kind"] == "aggregate_state_v2" and (
+                    aggregate_state_digest(document) != document["aggregate_state_digest"]
+                ):
+                    raise ArtifactError("aggregate_state_digest_mismatch")
+                if artifact["kind"] == "execution_checkpoint_v2" and (
+                    execution_checkpoint_digest(document)
+                    != document["execution_checkpoint_digest"]
+                ):
+                    raise ArtifactError("execution_checkpoint_digest_mismatch")
+                if artifact["kind"] == "migration_descriptor_v2" and (
+                    migration_descriptor_digest(document)
+                    != document["migration_descriptor_digest"]
+                ):
+                    raise ArtifactError("migration_descriptor_digest_mismatch")
+                if artifact["kind"] == "aggregate_state_package_v2":
+                    restore_aggregate_package(source, resolver)
             if artifact.get("canonical_of"):
                 assert canonical_bytes(document) == source
         elif artifact["kind"] == "aggregate_state_v2":
@@ -341,10 +368,14 @@ def validate_version2_artifact(path: Path, artifact: dict[str, Any]) -> None:
             restore_execution_checkpoint_v2(source, resolver)
         elif artifact["kind"] == "aggregate_state_package_v2":
             restore_aggregate_package(source, resolver)
-        elif artifact["kind"] in {
-            "migration_descriptor_v2",
-            "core_step_result_v2",
-        }:
+        elif artifact["kind"] == "migration_descriptor_v2":
+            document, _ = load_json_artifact(source, artifact["kind"])
+            if (
+                migration_descriptor_digest(document)
+                != document["migration_descriptor_digest"]
+            ):
+                raise ArtifactError("migration_descriptor_digest_mismatch")
+        elif artifact["kind"] == "core_step_result_v2":
             load_json_artifact(source, artifact["kind"])
         else:
             return

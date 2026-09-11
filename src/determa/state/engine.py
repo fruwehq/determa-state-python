@@ -1315,6 +1315,10 @@ def _validate_envelope(
     expected_direction = "input" if mode == "input" else "internal"
     if declaration["direction"] != expected_direction:
         return DispatchCode.INVALID_EVENT
+    if "payload" not in envelope:
+        return DispatchCode.INVALID_PAYLOAD
+    if _normalize_payload(declaration, envelope.get("payload")) is None:
+        return DispatchCode.INVALID_PAYLOAD
     correlation = envelope.get("correlation_id")
     if correlation is not None and (
         not isinstance(correlation, str) or not correlation or not validate_unicode(correlation)
@@ -1322,10 +1326,6 @@ def _validate_envelope(
         return DispatchCode.INVALID_CORRELATION
     if declaration.get("correlates_to") and correlation is None:
         return DispatchCode.INVALID_CORRELATION
-    if "payload" not in envelope:
-        return DispatchCode.INVALID_PAYLOAD
-    if _normalize_payload(declaration, envelope.get("payload")) is None:
-        return DispatchCode.INVALID_PAYLOAD
     return None
 
 
@@ -2132,6 +2132,8 @@ class _Execution:
                     ),
                     "sequence": sequence,
                 }
+                if self.capture_emission_provenance:
+                    emission["_determa_v2_provenance"] = {"emission_index": index}
             else:
                 assert isinstance(target, dict)
                 target_runtime_id = _target_runtime_id(target)

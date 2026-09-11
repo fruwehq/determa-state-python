@@ -92,6 +92,8 @@ def create_aggregate_v2(
     root_instance_id: str,
     creation_id: str,
     bindings: dict[str, dict[str, Any]] | None = None,
+    *,
+    _include_host_evidence: bool = False,
 ) -> dict[str, Any]:
     """Create one queue-bearing aggregate and route initialization emissions."""
     validated = bundle if isinstance(bundle, Bundle) else load_bundle(bundle)
@@ -118,6 +120,7 @@ def create_aggregate_v2(
         root_runtime,
         cast(list[Mapping[str, Any]], result["emissions"]),
         lifecycle,
+        include_host_evidence=_include_host_evidence,
     )
     encoded = seal_aggregate_v2(encoded)
     restore_aggregate_v2(encoded, resolver_for_bundle(validated))
@@ -412,6 +415,91 @@ def _dispatch_code_to_admission(code: DispatchRejectionCode) -> str:
     }[code]
 
 
+def _validate_new_deliveries(
+    restored: RestoredAggregate, deliveries: Sequence[Mapping[str, Any]]
+) -> str | None:
+    document = restored.aggregate_envelope
+    if any(delivery.get("delivery_mode") not in {"input", "internal"} for delivery in deliveries):
+        return AdmissionCode.INVALID_DELIVERY_MODE.value
+    runtime_by_id = {runtime["runtime_id"]: runtime for runtime in document["runtimes"]}
+    models = BundleModel(restored.bundle)
+    for delivery in deliveries:
+        mode = cast(Literal["input", "internal"], delivery["delivery_mode"])
+        envelope = delivery["envelope"]
+        source_value = envelope.get("source")
+        if (
+            (mode == "input" and source_value != {"host": True})
+            or (mode == "internal" and not isinstance(source_value, Mapping))
+            or (mode == "input" and envelope.get("cause_id") != envelope.get("event_id"))
+        ):
+            return AdmissionCode.INVALID_DELIVERY_SOURCE.value
+        if mode == "internal":
+            assert isinstance(source_value, Mapping)
+            source_runtime = source_value.get("runtime")
+            source_system = source_value.get("system")
+            valid_runtime_source = source_runtime is not None and any(
+                runtime["target_identity"] == source_runtime for runtime in document["runtimes"]
+            )
+            valid_system_source = source_system in {
+                "system:component_completion",
+                "system:spawned_completion",
+                "system:component_failure",
+                "system:spawned_failure",
+            }
+            if not valid_runtime_source and not valid_system_source:
+                return AdmissionCode.INVALID_DELIVERY_SOURCE.value
+        try:
+            runtime_id = _runtime_id_for_target(envelope["target"])
+        except (KeyError, TypeError):
+            return AdmissionCode.INVALID_INSTANCE_TARGET.value
+        target_runtime = runtime_by_id.get(runtime_id)
+        if target_runtime is None or target_runtime["target_identity"] != envelope["target"]:
+            return AdmissionCode.INVALID_INSTANCE_TARGET.value
+        relation = target_runtime["relation"]["kind"]
+        if target_runtime["status"] != "running":
+            return (
+                AdmissionCode.INACTIVE_COMPONENT_TARGET.value
+                if relation == "component"
+                else AdmissionCode.INVALID_INSTANCE_TARGET.value
+            )
+        if mode == "input" and relation == "component":
+            return AdmissionCode.INVALID_INSTANCE_TARGET.value
+        try:
+            native = _native_envelope(delivery)
+        except (ArtifactError, KeyError, TypeError):
+            return AdmissionCode.INVALID_PAYLOAD.value
+        rejection = _validate_envelope(
+            restored.bundle,
+            models,
+            restored.state,
+            native,
+            mode,
+        )
+        if rejection is not None:
+            return _dispatch_code_to_admission(rejection)
+        machine_id = target_runtime["current_definition"]["machine"]["machine_id"]
+        machine = restored.bundle.machine(machine_id)
+        declarations = dict(restored.bundle.raw.get("events") or {})
+        declarations.update((machine or {}).get("events") or {})
+        declaration = declarations.get(envelope["event"])
+        payload = decoded_typed_value(envelope["payload"])
+        if not isinstance(payload, Mapping) or not _valid_envelope_source(
+            document,
+            delivery,
+            declaration,
+            payload,
+        ):
+            return AdmissionCode.INVALID_DELIVERY_SOURCE.value
+        if not _mailbox_payload_is_normalized(
+            restored, target_runtime, delivery, declaration, payload
+        ):
+            return AdmissionCode.INVALID_PAYLOAD.value
+        expected_digest = _entry_digest(document["root_instance_id"], mode, envelope)
+        if delivery.get("envelope_digest") != expected_digest:
+            return AdmissionCode.DELIVERY_DIGEST_MISMATCH.value
+    return None
+
+
 def admit_aggregate_v2(
     source: ArtifactSource,
     deliveries: Sequence[Mapping[str, Any]],
@@ -486,78 +574,19 @@ def admit_aggregate_v2(
             "rejection": None,
         }
 
-    models = BundleModel(restored.bundle)
+    validation_code = _validate_new_deliveries(restored, new_deliveries)
+    if validation_code is not None:
+        return _admission_rejection(validation_code, document)
     accepted: list[dict[str, str]] = []
     candidate = copy.deepcopy(document)
     runtime_by_id = {runtime["runtime_id"]: runtime for runtime in candidate["runtimes"]}
     for delivery in new_deliveries:
         mode = delivery.get("delivery_mode")
         envelope = delivery["envelope"]
-        if mode not in {"input", "internal"}:
-            return _admission_rejection(AdmissionCode.INVALID_DELIVERY_MODE.value, document)
-        source_value = envelope.get("source")
-        if (
-            (mode == "input" and source_value != {"host": True})
-            or (mode == "internal" and not isinstance(source_value, Mapping))
-            or (mode == "input" and envelope.get("cause_id") != envelope.get("event_id"))
-        ):
-            return _admission_rejection(AdmissionCode.INVALID_DELIVERY_SOURCE.value, document)
-        if mode == "internal":
-            assert isinstance(source_value, Mapping)
-            source_runtime = source_value.get("runtime")
-            source_system = source_value.get("system")
-            valid_runtime_source = source_runtime is not None and any(
-                runtime["target_identity"] == source_runtime for runtime in document["runtimes"]
-            )
-            valid_system_source = source_system in {
-                "system:component_completion",
-                "system:spawned_completion",
-                "system:component_failure",
-                "system:spawned_failure",
-            }
-            if not valid_runtime_source and not valid_system_source:
-                return _admission_rejection(AdmissionCode.INVALID_DELIVERY_SOURCE.value, document)
         supplied_digest = delivery.get("envelope_digest")
         expected_digest = _entry_digest(document["root_instance_id"], str(mode), envelope)
-        if supplied_digest != expected_digest:
-            return _admission_rejection(AdmissionCode.DELIVERY_DIGEST_MISMATCH.value, document)
-        try:
-            native = _native_envelope(delivery)
-        except (ArtifactError, KeyError, TypeError):
-            return _admission_rejection(AdmissionCode.INVALID_PAYLOAD.value, document)
-        try:
-            runtime_id = _runtime_id_for_target(envelope["target"])
-        except (KeyError, TypeError):
-            return _admission_rejection(AdmissionCode.INVALID_INSTANCE_TARGET.value, document)
-        target_runtime = runtime_by_id.get(runtime_id)
-        if target_runtime is None or target_runtime["target_identity"] != envelope["target"]:
-            return _admission_rejection(AdmissionCode.INVALID_INSTANCE_TARGET.value, document)
-        rejection = _validate_envelope(
-            restored.bundle,
-            models,
-            restored.state,
-            native,
-            cast(Literal["input", "internal"], mode),
-        )
-        if rejection is not None:
-            return _admission_rejection(_dispatch_code_to_admission(rejection), document)
-        machine_id = target_runtime["current_definition"]["machine"]["machine_id"]
-        machine = restored.bundle.machine(machine_id)
-        declarations = dict(restored.bundle.raw.get("events") or {})
-        declarations.update((machine or {}).get("events") or {})
-        declaration = declarations.get(envelope["event"])
-        payload = decoded_typed_value(envelope["payload"])
-        if not isinstance(payload, Mapping) or not _valid_envelope_source(
-            document,
-            delivery,
-            declaration,
-            payload,
-        ):
-            return _admission_rejection(AdmissionCode.INVALID_DELIVERY_SOURCE.value, document)
-        if not _mailbox_payload_is_normalized(
-            restored, target_runtime, delivery, declaration, payload
-        ):
-            return _admission_rejection(AdmissionCode.INVALID_PAYLOAD.value, document)
+        assert supplied_digest == expected_digest
+        runtime_id = _runtime_id_for_target(envelope["target"])
         acceptance = candidate["next_acceptance_sequence"]
         queue = candidate["next_queue_sequence"]
         entry = {
@@ -638,21 +667,31 @@ def _enqueue_emissions(
     selected_runtime: Mapping[str, Any],
     native_emissions: Sequence[Mapping[str, Any]],
     lifecycle: list[dict[str, Any]],
+    *,
+    include_host_evidence: bool = False,
 ) -> list[dict[str, Any]]:
     projected: list[dict[str, Any]] = []
     runtimes = {runtime["runtime_id"]: runtime for runtime in encoded["runtimes"]}
     root_completed = _root_status(encoded) == "completed"
     for index, emission in enumerate(native_emissions):
         if emission.get("target") == "external":
-            projected.append(
-                {
-                    "effect_id": emission["effect_id"],
-                    "sequence": str(emission["sequence"]),
-                    "event": emission["event"],
-                    "payload": typed_value(emission["payload"]),
-                    "correlation_id": emission["correlation_id"],
-                }
-            )
+            projected_emission = {
+                "effect_id": emission["effect_id"],
+                "sequence": str(emission["sequence"]),
+                "event": emission["event"],
+                "payload": typed_value(emission["payload"]),
+                "correlation_id": emission["correlation_id"],
+            }
+            if include_host_evidence:
+                provenance = emission.get("_determa_v2_provenance")
+                if not isinstance(provenance, Mapping) or not isinstance(
+                    provenance.get("emission_index"), int
+                ):
+                    raise ArtifactError(PersistenceFailureCode.INVALID_AGGREGATE_STATE)
+                projected_emission["_determa_v2_emission_index"] = str(
+                    provenance["emission_index"]
+                )
+            projected.append(projected_emission)
             continue
         target = cast(Mapping[str, Any], emission["target"])
         target_wire = _wire_target(target)
@@ -813,6 +852,8 @@ def step_aggregate_v2(
     source: ArtifactSource,
     target_runtime_id: str,
     definition_resolver: DefinitionResolver,
+    *,
+    _include_host_evidence: bool = False,
 ) -> dict[str, Any]:
     """Process at most the selected runtime's ready-mailbox head."""
     restored = restore_aggregate_v2(source, definition_resolver)
@@ -891,7 +932,12 @@ def step_aggregate_v2(
             encoded = _encode_after_dispatch(restored.bundle, state, before, mailboxes)
             overflow_lifecycle: list[dict[str, Any]] = []
             emissions = _enqueue_emissions(
-                encoded, before, wire_runtime, execution.emissions, overflow_lifecycle
+                encoded,
+                before,
+                wire_runtime,
+                execution.emissions,
+                overflow_lifecycle,
+                include_host_evidence=_include_host_evidence,
             )
             encoded_fault = copy.deepcopy(runtime["fault"])
             encoded_fault["step_sequence"] = str(encoded_fault["step_sequence"])
@@ -951,6 +997,7 @@ def step_aggregate_v2(
         wire_runtime,
         cast(list[Mapping[str, Any]], result["emissions"]),
         lifecycle,
+        include_host_evidence=_include_host_evidence,
     )
     if (
         disposition == DispositionCode.HANDLED.value

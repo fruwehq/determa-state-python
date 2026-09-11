@@ -505,7 +505,7 @@ def test_configured_sqlite_satisfies_bank_and_outbox_profiles(
         _resolver(),
         profile="strict_durable_outbox",
         host_features={
-            "atomic_checkpoint_processing",
+            "atomic_accept_process",
             "outbox_worker",
             "total_outbox_lifecycle",
             "retain_unresolved_outbox",
@@ -557,10 +557,10 @@ def test_configured_sqlite_satisfies_compact_outbox_profile(
         _resolver(),
         profile="compact_durable_outbox",
         host_features={
-            "atomic_checkpoint_processing",
+            "atomic_accept_process",
             "outbox_worker",
             "total_outbox_lifecycle",
-            "retain_referenced_effect_tombstones",
+            "retain_receipt_references",
         },
     )
     with pytest.raises(ExecutionHostError) as error:

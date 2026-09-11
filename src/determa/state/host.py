@@ -147,16 +147,20 @@ def portable_envelope(
     *,
     correlation_id: str | None = None,
 ) -> dict[str, Any]:
-    """Project one native host envelope into the checkpoint wire shape."""
+    """Project one host-input envelope into the aggregate wire shape."""
     result = {
         "event": event,
         "event_id": event_id,
+        "cause_id": event_id,
+        "source": {"host": True},
         "target": copy.deepcopy(dict(target)),
         "payload": typed_value(dict(payload)),
     }
     if correlation_id is not None:
         result["correlation_id"] = correlation_id
-    if not validate_execution_checkpoint_member("envelope", result):
+    from .queueing import _valid_envelope_shape
+
+    if not _valid_envelope_shape(result):
         raise ExecutionHostError(PreAcceptanceCode.MALFORMED_DELIVERY)
     return result
 
@@ -209,7 +213,7 @@ def validate_host_profile(
         {DURABLE_SINGLE_WRITER, DURABLE_CONCURRENT}.intersection(capabilities)
     )
     common = durable and ROOT_IDENTITY_RETENTION in capabilities
-    atomic = "atomic_checkpoint_processing" in host_features
+    atomic = "atomic_accept_process" in host_features
     valid = False
     if profile == "durable_embedded_processing":
         valid = common and atomic
@@ -225,7 +229,7 @@ def validate_host_profile(
             common
             and atomic
             and {
-                "acknowledge_after_checkpoint_commit",
+                "ingress_ack_after_commit",
                 "durable_redelivery",
                 "outbox_worker",
             }.issubset(host_features)
@@ -233,7 +237,6 @@ def validate_host_profile(
     elif profile == "strict_durable_outbox":
         valid = (
             common
-            and atomic
             and PERMANENT_OUTBOX_TERMINAL_RETENTION in capabilities
             and {
                 "outbox_worker",
@@ -244,20 +247,18 @@ def validate_host_profile(
     elif profile == "compact_durable_outbox":
         valid = (
             common
-            and atomic
             and COMPACT_EFFECT_IDENTITY_RETENTION in capabilities
             and {
                 "outbox_worker",
                 "total_outbox_lifecycle",
-                "retain_referenced_effect_tombstones",
+                "retain_receipt_references",
             }.issubset(host_features)
         )
     elif profile == "shared_application_transaction":
         valid = (
             common
-            and atomic
             and SHARED_APPLICATION_TRANSACTION in capabilities
-            and "native_shared_application_transaction" in host_features
+            and "native_shared_transaction_used" in host_features
         )
     if not valid:
         raise ExecutionHostError(AdapterCode.ADAPTER_CAPABILITY_MISMATCH)
@@ -310,7 +311,7 @@ class ExecutionHost:
         required_capabilities: set[str] | frozenset[str] = frozenset(),
         profile: str | None = None,
         host_features: set[str] | frozenset[str] = frozenset(
-            {"atomic_checkpoint_processing"}
+            {"atomic_accept_process"}
         ),
         fault_injector: FaultInjector | None = None,
     ) -> None:
@@ -336,7 +337,7 @@ class ExecutionHost:
         required_capabilities: set[str] | frozenset[str] = frozenset(),
         profile: str | None = None,
         host_features: set[str] | frozenset[str] = frozenset(
-            {"atomic_checkpoint_processing"}
+            {"atomic_accept_process"}
         ),
         fault_injector: FaultInjector | None = None,
     ) -> ExecutionHost:
@@ -598,6 +599,8 @@ class ExecutionHost:
         root_instance_id: str,
         cutoff_receipt_sequence: str,
         *,
+        target_mode: str | None = None,
+        policy_identifier: str | None = None,
         expected_revision: str,
         expected_checkpoint_digest: str,
     ) -> dict[str, Any]:
@@ -613,6 +616,8 @@ class ExecutionHost:
                 prior,
                 cutoff_receipt_sequence,
                 self.artifact_resolver,
+                target_mode=target_mode,
+                policy_identifier=policy_identifier,
                 expected_revision=expected_revision,
                 expected_checkpoint_digest=expected_checkpoint_digest,
             )
@@ -813,7 +818,10 @@ class ExecutionHost:
             root_record = prior["root_record"]
             if root_record["status"] == "tombstone":
                 if root_record["tombstone_operation_id"] == operation_id:
-                    return prior
+                    return {
+                        "result": "tombstoned",
+                        "tombstone": copy.deepcopy(root_record),
+                    }
                 raise ExecutionHostError(HostCode.OPERATION_ID_CONFLICT)
             self._check_expected(prior, expected_revision, expected_checkpoint_digest)
             aggregate = root_record["aggregate_state"]
@@ -860,8 +868,9 @@ class ExecutionHost:
             }
             candidate = seal_execution_checkpoint(candidate)
             self._stage_replace(transaction, prior, candidate)
+            tombstone = copy.deepcopy(candidate["root_record"])
         self._after_commit()
-        return candidate
+        return {"result": "tombstoned", "tombstone": tombstone}
 
     def update_pending_outbox(
         self,
@@ -1291,6 +1300,8 @@ class SharedExecutionTransaction:
         self,
         cutoff_receipt_sequence: str,
         *,
+        target_mode: str | None = None,
+        policy_identifier: str | None = None,
         expected_revision: str,
         expected_checkpoint_digest: str,
     ) -> StagedExecutionResult:
@@ -1299,6 +1310,8 @@ class SharedExecutionTransaction:
             lambda: self._host.prune_v2(
                 self.root_instance_id,
                 cutoff_receipt_sequence,
+                target_mode=target_mode,
+                policy_identifier=policy_identifier,
                 expected_revision=expected_revision,
                 expected_checkpoint_digest=expected_checkpoint_digest,
             ),

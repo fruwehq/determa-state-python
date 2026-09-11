@@ -20,6 +20,7 @@ from .host import (
 from .queueing import (
     _entry_digest,
     _valid_envelope_shape,
+    _validate_new_deliveries,
     admit_aggregate_v2,
     create_aggregate_v2,
     restore_aggregate_v2,
@@ -468,10 +469,7 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
         raise _invalid()
     referenced_audits = set(referenced_audit_sequences)
     available_audits = set(audit_by_sequence)
-    if not referenced_audits.issubset(available_audits) or (
-        document["replay_retention"]["mode"] == "permanent"
-        and referenced_audits != available_audits
-    ):
+    if not referenced_audits.issubset(available_audits):
         raise _invalid()
 
 
@@ -514,9 +512,16 @@ def _append_external_intent(
     emission: Mapping[str, Any],
     emission_index: int,
 ) -> None:
+    intent = {
+        "effect_id": emission["effect_id"],
+        "sequence": emission["sequence"],
+        "event": emission["event"],
+        "payload": copy.deepcopy(emission["payload"]),
+        "correlation_id": emission["correlation_id"],
+    }
     checkpoint["pending_outbox_intents"].append(
         {
-            "intent": copy.deepcopy(dict(emission)),
+            "intent": intent,
             "state_revision": checkpoint["revision"],
             "delivery_state": {"status": "not_attempted"},
         }
@@ -538,7 +543,14 @@ def create_checkpoint_v2(
     bindings: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Create a fresh queue-bearing checkpoint from the public v2 core result."""
-    result = create_aggregate_v2(bundle, machine_id, root_instance_id, creation_id, bindings)
+    result = create_aggregate_v2(
+        bundle,
+        machine_id,
+        root_instance_id,
+        creation_id,
+        bindings,
+        _include_host_evidence=True,
+    )
     aggregate = result["state"]
     if aggregate is None:
         raise ArtifactError(CheckpointHostFailureCode.CREATION_REJECTED)
@@ -580,7 +592,10 @@ def create_checkpoint_v2(
     checkpoint["next_operation_receipt_sequence"] = str(1 + len(lifecycle_sequences))
     for index, emission in enumerate(result["emissions"]):
         if "kind" not in emission:
-            _append_external_intent(checkpoint, receipt["emission_references"], emission, index)
+            emission_index = int(emission.get("_determa_v2_emission_index", index))
+            _append_external_intent(
+                checkpoint, receipt["emission_references"], emission, emission_index
+            )
         elif emission["kind"] == "internal_mailbox":
             receipt["emission_references"].append(copy.deepcopy(emission))
         else:
@@ -799,6 +814,10 @@ def admit_checkpoint_v2(
         for delivery, evidence in zip(deliveries, replay_evidence, strict=True)
         if evidence is None
     ]
+    restored_aggregate = restore_aggregate_v2(aggregate, definition_resolver)
+    validation_code = _validate_new_deliveries(restored_aggregate, new_deliveries)
+    if validation_code is not None:
+        raise ArtifactError(validation_code)
     admission = admit_aggregate_v2(aggregate, new_deliveries, definition_resolver)
     if admission["result"] == "rejected":
         raise ArtifactError(admission["rejection"]["code"])
@@ -861,7 +880,33 @@ def step_checkpoint_v2(
     selected = (
         copy.deepcopy(runtime["ready_mailbox"][0]) if runtime and runtime["ready_mailbox"] else None
     )
-    result = step_aggregate_v2(aggregate, target_runtime_id, definition_resolver)
+    if runtime is not None and selected is None:
+        root_status = next(
+            item["status"]
+            for item in aggregate["runtimes"]
+            if item["runtime_id"] == aggregate["root_runtime_id"]
+        )
+        return {
+            "result": "not_committed",
+            "step_result": {
+                "core_step_result_format": "determa.core_step_result",
+                "core_step_result_schema_version": 2,
+                "status": root_status,
+                "disposition": "not_runnable",
+                "state": copy.deepcopy(aggregate),
+                "emissions": [],
+                "lifecycle_dispositions": [],
+                "fault": None,
+                "rejection": None,
+            },
+            "checkpoint": document,
+        }
+    result = step_aggregate_v2(
+        aggregate,
+        target_runtime_id,
+        definition_resolver,
+        _include_host_evidence=True,
+    )
     if selected is None or result["disposition"] in {"not_runnable", "rejected"}:
         return {
             "result": "not_committed",
@@ -894,7 +939,12 @@ def step_checkpoint_v2(
     references: list[dict[str, Any]] = []
     for emission_index, emission in enumerate(result["emissions"]):
         if "kind" not in emission:
-            _append_external_intent(candidate, references, emission, emission_index)
+            action_emission_index = int(
+                emission.get("_determa_v2_emission_index", emission_index)
+            )
+            _append_external_intent(
+                candidate, references, emission, action_emission_index
+            )
             continue
         if emission["kind"] != "internal_disposed":
             references.append(copy.deepcopy(emission))
@@ -960,13 +1010,28 @@ def prune_checkpoint_v2(
     cutoff_receipt_sequence: str,
     definition_resolver: DefinitionResolver,
     *,
+    target_mode: str | None = None,
+    policy_identifier: str | None = None,
     expected_revision: str,
     expected_checkpoint_digest: str,
 ) -> dict[str, Any]:
     """Advance bounded replay retention through one dependency-closed cutoff."""
     restored = restore_execution_checkpoint_v2(source, definition_resolver)
     document = restored.document
-    if document["replay_retention"]["mode"] == "permanent":
+    current_mode = document["replay_retention"]["mode"]
+    selected_mode = current_mode if target_mode is None else target_mode
+    if selected_mode not in {"permanent", "bounded"}:
+        raise _invalid()
+    if current_mode == "bounded" and selected_mode != "bounded":
+        raise _invalid()
+    if selected_mode == "permanent":
+        raise _invalid()
+    selected_policy = (
+        document["replay_retention"]["policy_identifier"]
+        if policy_identifier is None
+        else policy_identifier
+    )
+    if not isinstance(selected_policy, str) or not selected_policy:
         raise _invalid()
     prior_value = document["replay_retention"]["pruned_through_receipt_sequence"]
     prior = decimal(prior_value) if prior_value is not None else -1
@@ -1036,6 +1101,14 @@ def prune_checkpoint_v2(
                 raise _invalid()
 
     candidate = copy.deepcopy(document)
+    candidate["replay_retention"] = {
+        "mode": "bounded",
+        "permanent_replay_eligible": False,
+        "pruned_through_receipt_sequence": candidate["replay_retention"][
+            "pruned_through_receipt_sequence"
+        ],
+        "policy_identifier": selected_policy,
+    }
     tombstones = list(candidate["event_identity_tombstones"])
     for receipt in removed:
         if receipt["operation_kind"] == "event_terminal":

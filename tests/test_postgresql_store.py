@@ -225,7 +225,7 @@ def test_postgresql_configured_permanent_strict_profile() -> None:
         _resolver(),
         profile="strict_durable_outbox",
         host_features={
-            "atomic_checkpoint_processing",
+            "atomic_accept_process",
             "outbox_worker",
             "total_outbox_lifecycle",
             "retain_unresolved_outbox",
@@ -244,10 +244,10 @@ def test_postgresql_configured_permanent_strict_profile() -> None:
         _resolver(),
         profile="compact_durable_outbox",
         host_features={
-            "atomic_checkpoint_processing",
+            "atomic_accept_process",
             "outbox_worker",
             "total_outbox_lifecycle",
-            "retain_referenced_effect_tombstones",
+            "retain_receipt_references",
         },
     )
 
