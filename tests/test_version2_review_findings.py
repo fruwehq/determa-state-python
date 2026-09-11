@@ -1699,6 +1699,153 @@ def test_restore_v2_rejects_resealed_maintenance_receipt_digest() -> None:
         restore_execution_checkpoint_v2(future_revision, resolver)
 
 
+def test_restore_v2_rejects_resealed_maintenance_revision_regressions() -> None:
+    source = _bundle()
+    target_document = copy.deepcopy(source.raw)
+    target_document["events"]["extra"] = {"direction": "input"}
+    target = load_bundle(target_document)
+    descriptor = _compatible_v2_descriptor(source, target)
+    resolver = MemoryArtifactResolver(
+        definitions={source.fingerprint: source, target.fingerprint: target},
+        migration_descriptors={descriptor["migration_descriptor_digest"]: descriptor},
+    )
+    checkpoint = create_checkpoint_v2(source, "machine", "root", "create", {})
+    host = ExecutionHost(
+        MemoryExecutionStore({"root": serialize_execution_checkpoint(checkpoint)}),
+        resolver,
+    )
+    host.maintenance_migration_v2(
+        "root",
+        "historical-no-operation",
+        source.fingerprint,
+        [],
+        expected_revision=checkpoint["revision"],
+        expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+    )
+    no_operation = host.read_checkpoint("root")
+    assert no_operation is not None
+    host.maintenance_migration_v2(
+        "root",
+        "later-applied",
+        target.fingerprint,
+        [descriptor["migration_descriptor_digest"]],
+        expected_revision=no_operation.document["revision"],
+        expected_checkpoint_digest=no_operation.document[
+            "execution_checkpoint_digest"
+        ],
+    )
+    migrated = host.read_checkpoint("root")
+    assert migrated is not None
+
+    historical_no_operation_at_later_revision = copy.deepcopy(migrated.document)
+    historical_no_operation_at_later_revision["operation_receipts"][1][
+        "committed_revision"
+    ] = "2"
+    with pytest.raises(ArtifactError, match="invalid_execution_checkpoint"):
+        restore_execution_checkpoint_v2(
+            seal_execution_checkpoint(historical_no_operation_at_later_revision),
+            resolver,
+        )
+
+    later_applied_at_earlier_revision = copy.deepcopy(migrated.document)
+    later_applied_at_earlier_revision["operation_receipts"][2][
+        "committed_revision"
+    ] = "1"
+    with pytest.raises(ArtifactError, match="invalid_execution_checkpoint"):
+        restore_execution_checkpoint_v2(
+            seal_execution_checkpoint(later_applied_at_earlier_revision), resolver
+        )
+
+
+def test_v2_maintenance_tombstone_precedence_is_replay_then_cas_then_eligibility() -> None:
+    bundle = load_bundle(
+        {
+            "format": 1,
+            "namespace": "tests.review85.tombstone_precedence",
+            "events": {},
+            "machines": [{"machine_id": "machine", "root": {"type": "final"}}],
+        }
+    )
+    target_document = copy.deepcopy(bundle.raw)
+    target_document["events"]["extra"] = {"direction": "input"}
+    target = load_bundle(target_document)
+    descriptor = _compatible_v2_descriptor(bundle, target)
+    resolver = MemoryArtifactResolver(
+        definitions={bundle.fingerprint: bundle, target.fingerprint: target},
+        migration_descriptors={descriptor["migration_descriptor_digest"]: descriptor},
+    )
+    checkpoint = create_checkpoint_v2(bundle, "machine", "root", "create", {})
+    store = MemoryExecutionStore(
+        {"root": serialize_execution_checkpoint(checkpoint)}
+    )
+    host = ExecutionHost(store, resolver)
+    committed = host.maintenance_migration_v2(
+        "root",
+        "before-tombstone",
+        target.fingerprint,
+        [descriptor["migration_descriptor_digest"]],
+        expected_revision=checkpoint["revision"],
+        expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+    )
+    migrated = host.read_checkpoint("root")
+    assert migrated is not None
+    host.tombstone_root_v2(
+        "root",
+        "tombstone",
+        expected_revision=migrated.document["revision"],
+        expected_checkpoint_digest=migrated.document[
+            "execution_checkpoint_digest"
+        ],
+    )
+    tombstone = host.read_checkpoint("root")
+    assert tombstone is not None
+
+    replay = host.maintenance_migration_v2(
+        "root",
+        "before-tombstone",
+        target.fingerprint,
+        [descriptor["migration_descriptor_digest"]],
+        expected_revision=checkpoint["revision"],
+        expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+    )
+    assert replay == committed
+    with pytest.raises(ExecutionHostError, match="operation_id_conflict"):
+        host.maintenance_migration_v2(
+            "root",
+            "before-tombstone",
+            target.fingerprint,
+            [descriptor["migration_descriptor_digest"]],
+            expected_revision=checkpoint["revision"],
+            expected_checkpoint_digest=checkpoint[
+                "execution_checkpoint_digest"
+            ],
+            maintenance_mode=False,
+        )
+    with pytest.raises(ExecutionHostError, match="checkpoint_revision_conflict"):
+        host.maintenance_migration_v2(
+            "root",
+            "new-stale-operation",
+            target.fingerprint,
+            [],
+            expected_revision=checkpoint["revision"],
+            expected_checkpoint_digest=checkpoint[
+                "execution_checkpoint_digest"
+            ],
+        )
+    with pytest.raises(ExecutionHostError, match="tombstoned_root"):
+        host.maintenance_migration_v2(
+            "root",
+            "new-current-operation",
+            target.fingerprint,
+            [],
+            expected_revision=tombstone.document["revision"],
+            expected_checkpoint_digest=tombstone.document[
+                "execution_checkpoint_digest"
+            ],
+        )
+    assert host.read_checkpoint("root") == tombstone
+
+
 def test_bounded_v2_pruning_removes_migration_receipt_and_owned_audit() -> None:
     source = _bundle()
     target_document = copy.deepcopy(source.raw)

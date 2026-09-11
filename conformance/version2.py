@@ -104,7 +104,11 @@ def _resolver(path: Path) -> MemoryArtifactResolver:
     )
 
 
-def _invoke(item: Version2Vector, request: dict[str, Any]) -> Any:
+def _invoke(
+    item: Version2Vector,
+    request: dict[str, Any],
+    observation: dict[str, Any] | None = None,
+) -> Any:
     path = item.path
     vector = item.vector
     operation = vector["operation"]
@@ -171,6 +175,9 @@ def _invoke(item: Version2Vector, request: dict[str, Any]) -> Any:
         store = MemoryExecutionStore(
             {before["root_instance_id"]: serialize_execution_checkpoint(before)}
         )
+        if observation is not None:
+            observation["store"] = store
+            observation["root_instance_id"] = before["root_instance_id"]
         host = ExecutionHost(store, resolver)
         result = host.maintenance_migration_v2(
             before["root_instance_id"],
@@ -220,14 +227,28 @@ def _invoke(item: Version2Vector, request: dict[str, Any]) -> Any:
     raise AssertionError(f"unsupported version-2 operation: {operation}")
 
 
+def _assert_checkpoint_unchanged(
+    item: Version2Vector, observation: dict[str, Any]
+) -> None:
+    store = observation.get("store")
+    root_instance_id = observation.get("root_instance_id")
+    assert isinstance(store, MemoryExecutionStore)
+    assert isinstance(root_instance_id, str)
+    with store.transaction(root_instance_id) as transaction:
+        actual = transaction.load()
+    unchanged_file = item.vector["expect"]["unchanged_file"]
+    assert actual == (item.path / unchanged_file).read_bytes()
+
+
 def run_version2_vector(item: Version2Vector) -> None:
     vector = item.vector
     request = copy.deepcopy(
         _pointer(_json(item.path / vector["request_file"]), vector["request_pointer"])
     )
     request_snapshot = copy.deepcopy(request)
+    observation: dict[str, Any] = {}
     try:
-        actual = _invoke(item, request)
+        actual = _invoke(item, request, observation)
         code = None
     except (ArtifactError, ExecutionHostError) as error:
         actual = None
@@ -238,6 +259,10 @@ def run_version2_vector(item: Version2Vector) -> None:
         actual = None
     if expected["result"] == "failure":
         assert code == expected["code"]
+        if vector["operation"] == "checkpoint_migrate_v2" and expected.get(
+            "unchanged_file"
+        ):
+            _assert_checkpoint_unchanged(item, observation)
     else:
         assert code is None
         assert actual == _json(item.path / expected["exact_result_file"])

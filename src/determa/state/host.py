@@ -972,10 +972,10 @@ class ExecutionHost:
                             "receipt": copy.deepcopy(receipt),
                         }
                     raise ExecutionHostError(HostCode.OPERATION_ID_CONFLICT)
+            self._check_expected(prior, expected_revision, expected_checkpoint_digest)
             aggregate = prior["root_record"].get("aggregate_state")
             if aggregate is None:
                 raise ExecutionHostError(PreAcceptanceCode.TOMBSTONED_ROOT)
-            self._check_expected(prior, expected_revision, expected_checkpoint_digest)
             source_aggregate_state_digest = aggregate["aggregate_state_digest"]
             request_digest = maintenance_migration_request_digest(
                 root_instance_id,
@@ -1510,11 +1510,11 @@ class ExecutionHost:
                             "receipt": copy.deepcopy(receipt),
                         }
                     raise ExecutionHostError(HostCode.OPERATION_ID_CONFLICT)
-            if restored.aggregate is None:
-                raise ExecutionHostError(PreAcceptanceCode.TOMBSTONED_ROOT)
             self._check_expected(
                 checkpoint, expected_revision, expected_checkpoint_digest
             )
+            if restored.aggregate is None:
+                raise ExecutionHostError(PreAcceptanceCode.TOMBSTONED_ROOT)
             current_source_digest = restored.aggregate.aggregate_envelope[
                 "aggregate_state_digest"
             ]

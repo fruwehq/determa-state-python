@@ -423,6 +423,39 @@ def _validate_audit_and_root(
     ):
         raise _invalid()
     audit_by_sequence = {item["migration_sequence"]: item for item in audits}
+    fingerprints_by_aggregate_digest: dict[str, set[str]] = {}
+
+    def remember_fingerprint(aggregate_digest: str, fingerprint: str) -> None:
+        fingerprints_by_aggregate_digest.setdefault(aggregate_digest, set()).add(
+            fingerprint
+        )
+
+    for audit in audits:
+        remember_fingerprint(
+            audit["source_aggregate_state_digest"],
+            audit["source_validated_bundle_fingerprint"],
+        )
+        remember_fingerprint(
+            audit["target_aggregate_state_digest"],
+            audit["target_validated_bundle_fingerprint"],
+        )
+    if root_record["status"] == "retained":
+        aggregate = root_record["aggregate_state"]
+        remember_fingerprint(
+            aggregate["aggregate_state_digest"],
+            aggregate["validated_bundle_fingerprint"],
+        )
+        root_runtime = next(
+            runtime
+            for runtime in aggregate["runtimes"]
+            if runtime["runtime_id"] == aggregate["root_runtime_id"]
+        )
+        remember_fingerprint(
+            creation["resulting_aggregate_state_digest"],
+            root_runtime["identity_origin"]["definition"][
+                "validated_bundle_fingerprint"
+            ],
+        )
     operation_ids: set[str] = set()
     for receipt in document["operation_receipts"]:
         if receipt["operation_kind"] != "maintenance_migration":
@@ -445,15 +478,14 @@ def _validate_audit_and_root(
                 != receipt["resulting_aggregate_state_digest"]
             ):
                 raise _invalid()
-            if (
-                root_record["status"] != "retained"
-                or root_record["aggregate_state"]["aggregate_state_digest"]
-                != receipt["resulting_aggregate_state_digest"]
-            ):
+            fingerprints = fingerprints_by_aggregate_digest.get(
+                receipt["source_aggregate_state_digest"], set()
+            )
+            if not fingerprints and root_record["status"] == "tombstone":
                 continue
-            target_fingerprint = root_record["aggregate_state"][
-                "validated_bundle_fingerprint"
-            ]
+            if len(fingerprints) != 1:
+                raise _invalid()
+            target_fingerprint = next(iter(fingerprints))
             descriptor_route: list[str] = []
         elif (
             not linked

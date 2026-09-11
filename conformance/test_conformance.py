@@ -10,7 +10,7 @@ import pytest
 import yaml
 from jsonschema import Draft202012Validator
 
-from determa.state import PORTABLE_CODE_SETS, load_bundle
+from determa.state import PORTABLE_CODE_SETS, MemoryExecutionStore, load_bundle
 from determa.state.validator import schema as bundled_schema
 from determa.state.wire import artifact_schema
 
@@ -32,6 +32,7 @@ from .persistence_profiles import (
     run_persistence_profile,
 )
 from .version2 import (
+    _assert_checkpoint_unchanged,
     run_version2_vector,
     validate_version2_artifact,
     version2_vectors,
@@ -63,6 +64,28 @@ def test_suite_present() -> None:
     assert len(core_cases()) == 114
     assert len(execution_checkpoint_vectors()) == 102
     assert len(version2_vectors()) == 113
+
+
+@pytest.mark.parametrize("stored", [b"mutated", None])
+def test_v2_maintenance_failure_requires_exact_unchanged_checkpoint(
+    stored: bytes | None,
+) -> None:
+    item = next(
+        item
+        for item in version2_vectors()
+        if item.vector["name"] == "native_v2_maintenance_stale_writer"
+    )
+    before = json.loads(
+        (item.path / item.vector["checkpoint_before"]).read_text(encoding="utf-8")
+    )
+    initial = {} if stored is None else {before["root_instance_id"]: stored}
+    observation = {
+        "store": MemoryExecutionStore(initial),
+        "root_instance_id": before["root_instance_id"],
+    }
+
+    with pytest.raises(AssertionError):
+        _assert_checkpoint_unchanged(item, observation)
 
 
 def test_portable_code_sets_match_authoritative_registry() -> None:

@@ -640,18 +640,40 @@ def test_restore_checks_status_evidence_across_maintenance_migration() -> None:
     ]
     host.maintenance_migration(
         "migration-root",
-        "migration",
-        target.fingerprint,
-        [descriptor["migration_descriptor_digest"]],
+        "historical-no-operation",
+        source.fingerprint,
+        [],
         source_aggregate_state_digest=source_digest,
         expected_revision=created.document["revision"],
         expected_checkpoint_digest=created.document[
             "execution_checkpoint_digest"
         ],
     )
+    no_operation = host.read_checkpoint("migration-root")
+    assert no_operation is not None
+    host.maintenance_migration(
+        "migration-root",
+        "migration",
+        target.fingerprint,
+        [descriptor["migration_descriptor_digest"]],
+        source_aggregate_state_digest=source_digest,
+        expected_revision=no_operation.document["revision"],
+        expected_checkpoint_digest=no_operation.document[
+            "execution_checkpoint_digest"
+        ],
+    )
     migrated = host.read_checkpoint("migration-root")
     assert migrated is not None
     checkpoint = migrated.document
+    forged_no_operation = copy.deepcopy(checkpoint)
+    forged_no_operation["operation_receipts"][1]["request_digest"] = (
+        "sha256:" + ("0" * 64)
+    )
+    with pytest.raises(ArtifactError) as no_operation_error:
+        restore_execution_checkpoint(
+            seal_execution_checkpoint(forged_no_operation), resolver
+        )
+    assert no_operation_error.value.code == "invalid_execution_checkpoint"
     assert (
         checkpoint["operation_receipts"][0]["resulting_aggregate_state_digest"]
         != checkpoint["root_record"]["aggregate_state"]["aggregate_state_digest"]

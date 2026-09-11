@@ -158,7 +158,6 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
     ] = {}
     legacy_terminal_events: dict[str, dict[str, Any]] = {}
     referenced_effects: set[str] = set()
-    committed_order: list[tuple[int, int]] = []
     for receipt in receipts:
         kind = receipt["operation_kind"]
         if kind == "acceptance":
@@ -175,12 +174,6 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
             if event_id in terminals:
                 raise _invalid()
             terminals[event_id] = receipt
-            committed_order.append(
-                (
-                    decimal(receipt["committed_revision"]),
-                    decimal(receipt["receipt_sequence"]),
-                )
-            )
         elif kind == "creation" and decimal(receipt["committed_revision"]) > revision:
             raise _invalid()
         elif kind == "legacy_v1_operation":
@@ -221,11 +214,6 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
                 referenced_effects.add(effect_id)
     if legacy_wrappers and receipts[: len(legacy_wrappers)] != legacy_wrappers:
         raise _invalid()
-    if committed_order != sorted(committed_order) or len(committed_order) != len(
-        set(committed_order)
-    ):
-        raise _invalid()
-
     def validate_internal_legacy_producer(
         event_id: str,
         acceptance_sequence: str,
@@ -454,6 +442,86 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
         )
         if evidence_sequence is None or reference["terminal_receipt_sequence"] != evidence_sequence:
             raise _invalid()
+
+    upgrade_acceptance_sequences: set[int] = set()
+    if legacy_wrappers:
+        source_revision = max(
+            decimal(receipt["legacy_receipt"]["committed_revision"])
+            for receipt in legacy_wrappers
+        )
+        next_upgrade_sequence: int | None = None
+        for receipt in receipts[len(legacy_wrappers) :]:
+            receipt_sequence = decimal(receipt["receipt_sequence"])
+            accepted_revision = decimal(receipt.get("accepted_revision", "0"))
+            if (
+                receipt["operation_kind"] != "acceptance"
+                or (
+                    next_upgrade_sequence is not None
+                    and receipt_sequence != next_upgrade_sequence
+                )
+                or accepted_revision > source_revision + 1
+            ):
+                break
+            event_id = receipt["event_id"]
+            upgrade_entry = pending_by_event.get(event_id)
+            upgrade_terminal = terminals.get(event_id)
+            upgrade_tombstone = tombstones_by_event.get(event_id)
+            live_match = upgrade_entry is not None and (
+                receipt["request_digest"] == upgrade_entry["envelope_digest"]
+                and receipt["acceptance_sequence"]
+                == upgrade_entry["acceptance_sequence"]
+                and receipt["delivery_mode"] == upgrade_entry["delivery_mode"]
+            )
+            terminal_match = upgrade_terminal is not None and (
+                receipt["request_digest"] == upgrade_terminal["request_digest"]
+                and receipt["acceptance_sequence"]
+                == upgrade_terminal["acceptance_sequence"]
+            )
+            tombstone_match = upgrade_tombstone is not None and (
+                upgrade_tombstone.get(
+                    "request_digest_domain", "determa-inbox-envelope-digest-2"
+                )
+                == "determa-inbox-envelope-digest-2"
+                and receipt["request_digest"]
+                == upgrade_tombstone["request_digest"]
+                and receipt["acceptance_sequence"]
+                == upgrade_tombstone["acceptance_sequence"]
+            )
+            if not (live_match or terminal_match or tombstone_match):
+                break
+            validate_legacy_evidence(
+                receipt, upgrade_entry if live_match else None
+            )
+            if (
+                receipt["delivery_mode"] == "internal"
+                and "legacy_v1_delivery" not in receipt
+            ):
+                raise _invalid()
+            upgrade_acceptance_sequences.add(receipt_sequence)
+            next_upgrade_sequence = receipt_sequence + 1
+            source_revision = max(source_revision, accepted_revision)
+
+    receipt_chronology: list[tuple[int, int]] = []
+    greatest_prior_revision = -1
+    for receipt, receipt_sequence in zip(receipts, sequences, strict=True):
+        if receipt_sequence in upgrade_acceptance_sequences:
+            continue
+        if "committed_revision" in receipt:
+            effective_revision = receipt["committed_revision"]
+        elif "accepted_revision" in receipt:
+            effective_revision = receipt["accepted_revision"]
+        else:
+            effective_revision = receipt["legacy_receipt"]["committed_revision"]
+        effective_revision_value = decimal(effective_revision)
+        if (
+            receipt["operation_kind"] == "maintenance_migration"
+            and effective_revision_value <= greatest_prior_revision
+        ):
+            raise _invalid()
+        receipt_chronology.append((effective_revision_value, receipt_sequence))
+        greatest_prior_revision = max(greatest_prior_revision, effective_revision_value)
+    if receipt_chronology != sorted(receipt_chronology):
+        raise _invalid()
 
     allocation_acceptances = (
         [decimal(entry["acceptance_sequence"]) for entry in pending_entries]
