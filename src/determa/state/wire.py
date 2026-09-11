@@ -445,8 +445,8 @@ def _format_code(document: Any, kind: str) -> str | None:
             "determa.core_step_result",
             "core_step_result_schema_version",
             2,
-            PersistenceCode.INVALID_AGGREGATE_STATE,
-            PersistenceCode.INVALID_AGGREGATE_STATE,
+            "invalid_core_step_result",
+            "invalid_core_step_result",
         ),
     }
     (
@@ -478,7 +478,7 @@ def load_json_artifact(source: ArtifactSource, kind: str) -> tuple[dict[str, Any
             "aggregate_state_package_v2": PersistenceCode.INVALID_AGGREGATE_STATE_PACKAGE,
             "execution_checkpoint": CheckpointCode.INVALID_EXECUTION_CHECKPOINT,
             "execution_checkpoint_v2": CheckpointCode.INVALID_EXECUTION_CHECKPOINT,
-            "core_step_result_v2": PersistenceCode.INVALID_AGGREGATE_STATE,
+            "core_step_result_v2": "invalid_core_step_result",
         }[kind]
         raise ArtifactError(code) from exc
     unsupported = _format_code(document, kind)
@@ -497,7 +497,7 @@ def load_json_artifact(source: ArtifactSource, kind: str) -> tuple[dict[str, Any
             "aggregate_state_package_v2": PersistenceCode.INVALID_AGGREGATE_STATE_PACKAGE,
             "execution_checkpoint": CheckpointCode.INVALID_EXECUTION_CHECKPOINT,
             "execution_checkpoint_v2": CheckpointCode.INVALID_EXECUTION_CHECKPOINT,
-            "core_step_result_v2": PersistenceCode.INVALID_AGGREGATE_STATE,
+            "core_step_result_v2": "invalid_core_step_result",
         }[kind]
         raise ArtifactError(code)
     return document, raw

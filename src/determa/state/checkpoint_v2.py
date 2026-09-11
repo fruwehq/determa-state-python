@@ -58,6 +58,40 @@ def _mailbox_entries(aggregate: Mapping[str, Any]) -> list[dict[str, Any]]:
     ]
 
 
+def _synchronize_mailbox_references(checkpoint: dict[str, Any]) -> None:
+    aggregate = checkpoint["root_record"].get("aggregate_state")
+    if aggregate is None:
+        return
+    locations = {
+        (entry["envelope"]["event_id"], entry["acceptance_sequence"]): entry["queue_sequence"]
+        for entry in _mailbox_entries(aggregate)
+    }
+    for receipt in checkpoint["operation_receipts"]:
+        for reference in receipt.get("emission_references", []):
+            if reference.get("kind") != "internal_mailbox":
+                continue
+            key = (reference["event_id"], reference["acceptance_sequence"])
+            if key in locations:
+                reference["queue_sequence"] = locations[key]
+
+
+def _terminalize_mailbox_reference(
+    checkpoint: dict[str, Any],
+    entry: Mapping[str, Any],
+    terminal_receipt_sequence: str,
+) -> None:
+    for receipt in checkpoint["operation_receipts"]:
+        for reference in receipt.get("emission_references", []):
+            if (
+                reference.get("kind") == "internal_mailbox"
+                and reference.get("event_id") == entry["envelope"]["event_id"]
+                and reference.get("acceptance_sequence") == entry["acceptance_sequence"]
+            ):
+                reference.pop("queue_sequence")
+                reference["kind"] = "internal_terminal"
+                reference["terminal_receipt_sequence"] = terminal_receipt_sequence
+
+
 def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
     revision = decimal(document["revision"])
     next_receipt = decimal(document["next_operation_receipt_sequence"])
@@ -102,6 +136,8 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
     terminals: dict[str, dict[str, Any]] = {}
     referenced_pending: dict[str, dict[str, Any]] = {}
     referenced_terminal: dict[str, dict[str, Any]] = {}
+    pending_producers: dict[str, dict[str, Any]] = {}
+    terminal_producers: dict[str, dict[str, Any]] = {}
     referenced_effects: set[str] = set()
     committed_order: list[tuple[int, int]] = []
     for receipt in receipts:
@@ -141,11 +177,13 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
                 if event_id in referenced_pending:
                     raise _invalid()
                 referenced_pending[event_id] = reference
+                pending_producers[event_id] = receipt
             elif reference_kind == "internal_terminal":
                 event_id = reference["event_id"]
                 if event_id in referenced_terminal:
                     raise _invalid()
                 referenced_terminal[event_id] = reference
+                terminal_producers[event_id] = receipt
             elif reference_kind == "external_outbox":
                 effect_id = reference["effect_id"]
                 if effect_id in referenced_effects:
@@ -160,6 +198,8 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
         acceptance = acceptances.get(event_id)
         producer = referenced_pending.get(event_id)
         if acceptance is None and not producer:
+            raise _invalid()
+        if acceptance is not None and producer is not None:
             raise _invalid()
         if acceptance is not None and (
             acceptance["request_digest"] != entry["envelope_digest"]
@@ -179,14 +219,22 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
         producer = referenced_terminal.get(event_id)
         if acceptance is None and producer is None and cutoff is None:
             raise _invalid()
+        if acceptance is not None and producer is not None:
+            raise _invalid()
         if acceptance is not None and (
             terminal["request_digest"] != acceptance["request_digest"]
             or terminal["acceptance_sequence"] != acceptance["acceptance_sequence"]
+            or decimal(acceptance["receipt_sequence"]) >= decimal(terminal["receipt_sequence"])
+            or decimal(acceptance["accepted_revision"]) > decimal(terminal["committed_revision"])
         ):
             raise _invalid()
         if producer is not None and (
             producer["terminal_receipt_sequence"] != terminal["receipt_sequence"]
             or producer["acceptance_sequence"] != terminal["acceptance_sequence"]
+            or decimal(terminal_producers[event_id]["receipt_sequence"])
+            >= decimal(terminal["receipt_sequence"])
+            or decimal(terminal_producers[event_id].get("committed_revision", "0"))
+            > decimal(terminal["committed_revision"])
         ):
             raise _invalid()
 
@@ -205,6 +253,15 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
     ):
         raise _invalid()
     tombstones_by_event = {item["event_id"]: item for item in tombstones}
+    if any(
+        event_id not in pending_by_event and event_id not in terminals for event_id in acceptances
+    ):
+        raise _invalid()
+    if any(
+        decimal(producer["receipt_sequence"]) >= next_receipt
+        for producer in [*pending_producers.values(), *terminal_producers.values()]
+    ):
+        raise _invalid()
     for event_id, reference in referenced_terminal.items():
         terminal_evidence = terminals.get(event_id)
         tombstone = tombstones_by_event.get(event_id)
@@ -295,6 +352,21 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
         or any(
             value >= decimal(document["next_outbox_terminal_sequence"])
             for value in terminal_sequences
+        )
+    ):
+        raise _invalid()
+
+    audits = document["migration_audit_records"]
+    audit_sequences = [decimal(item["migration_sequence"]) for item in audits]
+    if (
+        audit_sequences != sorted(audit_sequences)
+        or len(audit_sequences) != len(set(audit_sequences))
+        or any(item["root_instance_id"] != document["root_instance_id"] for item in audits)
+        or (
+            aggregate is not None
+            and any(
+                sequence > decimal(aggregate["migration_sequence"]) for sequence in audit_sequences
+            )
         )
     ):
         raise _invalid()
@@ -681,8 +753,9 @@ def admit_checkpoint_v2(
         raise ArtifactError("malformed_delivery")
 
     canonical_digests: list[str] = []
-    replay_evidence: list[dict[str, Any] | None] = []
     event_ids: list[str] = []
+    target_roots: list[Any] = []
+    legacy_domains: list[bool] = []
     for delivery in deliveries:
         legacy_domain = (
             isinstance(delivery, Mapping)
@@ -717,17 +790,28 @@ def admit_checkpoint_v2(
         identity = next(iter(target.values()))
         if not isinstance(identity, Mapping):
             raise ArtifactError("malformed_delivery")
-        if identity.get("root_instance_id") != document["root_instance_id"]:
-            raise ArtifactError("wrong_root")
-        if event_id in event_ids:
-            raise ArtifactError("duplicate_event_id_in_batch")
         event_ids.append(event_id)
+        target_roots.append(identity.get("root_instance_id"))
+        legacy_domains.append(legacy_domain)
         digest = (
             delivery_request_digest(document["root_instance_id"], str(mode), envelope)
             if legacy_domain
             else _entry_digest(document["root_instance_id"], str(mode), envelope)
         )
         canonical_digests.append(digest)
+
+    if any(root != document["root_instance_id"] for root in target_roots):
+        raise ArtifactError("wrong_root")
+    if len(event_ids) != len(set(event_ids)):
+        raise ArtifactError("duplicate_event_id_in_batch")
+
+    replay_evidence: list[dict[str, Any] | None] = []
+    for delivery, digest, legacy_domain in zip(
+        deliveries, canonical_digests, legacy_domains, strict=True
+    ):
+        envelope = delivery["envelope"]
+        mode = delivery["delivery_mode"]
+        event_id = envelope["event_id"]
         v1_envelope = {
             key: copy.deepcopy(value)
             for key, value in envelope.items()
@@ -845,6 +929,7 @@ def step_checkpoint_v2(
     candidate["revision"] = str(int(candidate["revision"]) + 1)
     candidate["root_record"]["aggregate_state"] = result["state"]
     if result["disposition"] == "deferred":
+        _synchronize_mailbox_references(candidate)
         return seal_execution_checkpoint(candidate)
     receipt_sequence = candidate["next_operation_receipt_sequence"]
     lifecycle_sequences = [
@@ -854,16 +939,15 @@ def step_checkpoint_v2(
     candidate["next_operation_receipt_sequence"] = str(
         int(receipt_sequence) + 1 + len(lifecycle_sequences)
     )
-    for producer in candidate["operation_receipts"]:
-        for reference in producer.get("emission_references", []):
-            if (
-                reference.get("kind") == "internal_mailbox"
-                and reference.get("event_id") == selected["envelope"]["event_id"]
-                and reference.get("acceptance_sequence") == selected["acceptance_sequence"]
-            ):
-                reference.pop("queue_sequence")
-                reference["kind"] = "internal_terminal"
-                reference["terminal_receipt_sequence"] = receipt_sequence
+    _terminalize_mailbox_reference(candidate, selected, receipt_sequence)
+    for lifecycle, terminal_sequence in zip(
+        result["lifecycle_dispositions"], lifecycle_sequences, strict=True
+    ):
+        lifecycle_entry = {
+            "acceptance_sequence": lifecycle["acceptance_sequence"],
+            "envelope": {"event_id": lifecycle["event_id"]},
+        }
+        _terminalize_mailbox_reference(candidate, lifecycle_entry, terminal_sequence)
     references: list[dict[str, Any]] = []
     for emission_index, emission in enumerate(result["emissions"]):
         if "kind" not in emission:
@@ -924,6 +1008,7 @@ def step_checkpoint_v2(
                 "emission_references": [],
             }
         )
+    _synchronize_mailbox_references(candidate)
     return seal_execution_checkpoint(candidate)
 
 
@@ -965,6 +1050,7 @@ def prune_checkpoint_v2(
         )
     }
     removed_sequences = {receipt["receipt_sequence"] for receipt in removed}
+    pending_effects = {item["intent"]["effect_id"] for item in document["pending_outbox_intents"]}
     acceptance_by_event = {
         receipt["event_id"]: receipt
         for receipt in receipts
@@ -987,6 +1073,12 @@ def prune_checkpoint_v2(
         raise _invalid()
     if any(
         reference.get("kind") == "internal_mailbox" and reference.get("event_id") in pending_ids
+        for receipt in removed
+        for reference in receipt.get("emission_references", [])
+    ):
+        raise _invalid()
+    if any(
+        reference.get("kind") == "external_outbox" and reference.get("effect_id") in pending_effects
         for receipt in removed
         for reference in receipt.get("emission_references", [])
     ):

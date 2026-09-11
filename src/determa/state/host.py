@@ -61,12 +61,16 @@ _MAX_DECIMAL_DIGITS = 4096
 
 
 def _bundle_requires_v2(bundle: Bundle) -> bool:
-    def has_deferral(state: Mapping[str, Any]) -> bool:
-        return "deferred_events" in state or any(
-            has_deferral(child) for child in (state.get("states") or {}).values()
-        )
+    def has_deferral(value: Any) -> bool:
+        if isinstance(value, Mapping):
+            return "deferred_events" in value or any(
+                has_deferral(child) for child in value.values()
+            )
+        if isinstance(value, list):
+            return any(has_deferral(child) for child in value)
+        return False
 
-    return any(has_deferral(machine["root"]) for machine in bundle.raw["machines"])
+    return has_deferral(bundle.raw["machines"])
 
 
 class ExecutionHostError(DetermaError):
@@ -893,24 +897,15 @@ class ExecutionHost:
         status: str,
         migration_descriptor_digest: str | None = None,
     ) -> None:
+        from .checkpoint_v2 import _terminalize_mailbox_reference
+
         for entry in entries:
             receipt_sequence = checkpoint["next_operation_receipt_sequence"]
             checkpoint["next_operation_receipt_sequence"] = (
                 _increment_checkpoint_number(receipt_sequence)
             )
             event_id = entry["envelope"]["event_id"]
-            for producer in checkpoint["operation_receipts"]:
-                references = producer.get("emission_references", [])
-                for reference in references:
-                    if (
-                        reference.get("kind") == "internal_mailbox"
-                        and reference.get("event_id") == event_id
-                        and reference.get("acceptance_sequence")
-                        == entry["acceptance_sequence"]
-                    ):
-                        reference.pop("queue_sequence")
-                        reference["kind"] = "internal_terminal"
-                        reference["terminal_receipt_sequence"] = receipt_sequence
+            _terminalize_mailbox_reference(checkpoint, entry, receipt_sequence)
             outcome: dict[str, Any] = {
                 "status": status,
                 "disposition": disposition,
@@ -947,6 +942,7 @@ class ExecutionHost:
         limits: MigrationLimits | None = None,
     ) -> dict[str, Any]:
         """Migrate a v2 aggregate and all queue ownership in one transaction."""
+        from .checkpoint_v2 import _synchronize_mailbox_references
         from .queueing import migrate_aggregate_v2
 
         with self._transaction(root_instance_id) as transaction:
@@ -965,25 +961,18 @@ class ExecutionHost:
                 self.artifact_resolver,
                 maintenance_mode=maintenance_mode,
                 resource_limits=limits,
+                _include_host_evidence=True,
             )
             migrated = migration["aggregate_state"]
-            retained_ids = {
-                entry["envelope"]["event_id"]
-                for runtime in migrated["runtimes"]
-                for mailbox in ("ready_mailbox", "deferred_mailbox")
-                for entry in runtime[mailbox]
-            }
-            removed = [
-                entry
-                for runtime in aggregate["runtimes"]
-                for mailbox in ("ready_mailbox", "deferred_mailbox")
-                for entry in runtime[mailbox]
-                if entry["envelope"]["event_id"] not in retained_ids
-            ]
             candidate = _mutate(prior)
             candidate["root_record"]["aggregate_state"] = migrated
+            candidate["migration_audit_records"].extend(
+                copy.deepcopy(migration["_audit_records"])
+            )
             for entry, disposition in zip(
-                removed, migration["dispositions"], strict=True
+                migration["_disposed_entries"],
+                migration["dispositions"],
+                strict=True,
             ):
                 self._terminalize_v2_entries(
                     candidate,
@@ -1000,6 +989,7 @@ class ExecutionHost:
                         "migration_descriptor_digest"
                     ],
                 )
+            _synchronize_mailbox_references(candidate)
             candidate = seal_execution_checkpoint(candidate)
             self._stage_replace(transaction, prior, candidate)
         self._after_commit()
@@ -1038,11 +1028,19 @@ class ExecutionHost:
                 or prior["pending_outbox_intents"]
             ):
                 raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
+            from .queueing import _lifecycle_runtime_order, restore_aggregate_v2
+
+            restored_aggregate = restore_aggregate_v2(aggregate, self.artifact_resolver)
+            runtime_by_id = {
+                runtime["runtime_id"]: runtime for runtime in aggregate["runtimes"]
+            }
             entries = [
                 entry
-                for runtime in aggregate["runtimes"]
+                for runtime_id in _lifecycle_runtime_order(
+                    restored_aggregate.bundle, restored_aggregate.state
+                )
                 for mailbox in ("ready_mailbox", "deferred_mailbox")
-                for entry in runtime[mailbox]
+                for entry in runtime_by_id[runtime_id][mailbox]
             ]
             candidate = _mutate(prior)
             self._terminalize_v2_entries(

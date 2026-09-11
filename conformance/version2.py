@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import json
 from dataclasses import dataclass
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -77,23 +78,29 @@ def _pointer(document: Any, pointer: str) -> Any:
     return current
 
 
-def _resolver(path: Path) -> MemoryArtifactResolver:
+@cache
+def _conformance_definitions() -> dict[str, Any]:
     definitions = {}
-    descriptors = {}
-    definition_root = path.parent if path.parent.name == "execution-checkpoint" else path
-    for candidate in definition_root.glob("**/*.yaml"):
+    for candidate in (conformance_root() / "conformance").glob("**/*.yaml"):
         try:
             bundle = load_bundle(candidate.read_text(encoding="utf-8"))
         except Exception:
             continue
         definitions[bundle.fingerprint] = bundle
+    return definitions
+
+
+def _resolver(path: Path) -> MemoryArtifactResolver:
+    descriptors = {}
     for candidate in path.glob("*descriptor*.json"):
         document = _json(candidate)
         try:
             descriptors[migration_descriptor_digest(document)] = document
         except ArtifactError:
             continue
-    return MemoryArtifactResolver(definitions=definitions, migration_descriptors=descriptors)
+    return MemoryArtifactResolver(
+        definitions=_conformance_definitions(), migration_descriptors=descriptors
+    )
 
 
 def _invoke(item: Version2Vector, request: dict[str, Any]) -> Any:
@@ -239,8 +246,4 @@ def validate_version2_artifact(path: Path, artifact: dict[str, Any]) -> None:
         code = None
     except ArtifactError as error:
         code = error.code
-        if artifact["valid"] and code == "source_definition_unavailable":
-            code = None
-        if artifact["kind"] == "core_step_result_v2" and code == "invalid_aggregate_state":
-            code = "invalid_core_step_result"
     assert code == (None if artifact["valid"] else artifact["error"])
