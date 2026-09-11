@@ -6,7 +6,7 @@ import copy
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from .checkpoint import (
     RestoredExecutionCheckpoint,
@@ -49,11 +49,28 @@ from .wire import (
     aggregate_envelope,
     decoded_typed_value,
     hash_value,
+    strict_json,
     typed_value,
 )
 
+if TYPE_CHECKING:
+    from .checkpoint_v2 import RestoredExecutionCheckpointV2
+
 FaultInjector = Callable[[str], None]
 _MAX_DECIMAL_DIGITS = 4096
+
+
+def _bundle_requires_v2(bundle: Bundle) -> bool:
+    def has_deferral(value: Any) -> bool:
+        if isinstance(value, Mapping):
+            return "deferred_events" in value or any(
+                has_deferral(child) for child in value.values()
+            )
+        if isinstance(value, list):
+            return any(has_deferral(child) for child in value)
+        return False
+
+    return has_deferral(bundle.raw["machines"])
 
 
 class ExecutionHostError(DetermaError):
@@ -186,9 +203,7 @@ def maintenance_migration_request_digest(
     )
 
 
-def outbox_intent_digest(
-    root_instance_id: str, intent: Mapping[str, Any]
-) -> str:
+def outbox_intent_digest(root_instance_id: str, intent: Mapping[str, Any]) -> str:
     """Compute the compact evidence digest for one complete outbox intent."""
     return hash_value(
         [
@@ -225,11 +240,15 @@ def validate_host_profile(
             and PERMANENT_RECEIPT_RETENTION in capabilities
         )
     elif profile == "broker_integrated":
-        valid = common and atomic and {
-            "acknowledge_after_checkpoint_commit",
-            "durable_redelivery",
-            "outbox_worker",
-        }.issubset(host_features)
+        valid = (
+            common
+            and atomic
+            and {
+                "acknowledge_after_checkpoint_commit",
+                "durable_redelivery",
+                "outbox_worker",
+            }.issubset(host_features)
+        )
     elif profile == "strict_durable_outbox":
         valid = (
             common
@@ -306,9 +325,7 @@ def _project_emission(emission: Mapping[str, Any]) -> dict[str, Any]:
     return projected
 
 
-def _project_core_result(
-    bundle: Bundle, result: Mapping[str, Any]
-) -> dict[str, Any]:
+def _project_core_result(bundle: Bundle, result: Mapping[str, Any]) -> dict[str, Any]:
     aggregate = (
         aggregate_envelope(bundle, result["state"])
         if result["state"] is not None
@@ -529,8 +546,19 @@ class ExecutionHost:
         self,
         source: bytes,
         root_instance_id: str,
-    ) -> RestoredExecutionCheckpoint:
-        restored = restore_execution_checkpoint(source, self.artifact_resolver)
+    ) -> Any:
+        document, _ = strict_json(source)
+        if (
+            isinstance(document, Mapping)
+            and document.get("execution_checkpoint_schema_version") == 2
+        ):
+            from .checkpoint_v2 import restore_execution_checkpoint_v2
+
+            restored: Any = restore_execution_checkpoint_v2(
+                source, self.artifact_resolver
+            )
+        else:
+            restored = restore_execution_checkpoint(source, self.artifact_resolver)
         if restored.document["root_instance_id"] != root_instance_id:
             raise ExecutionHostError("transaction_root_mismatch")
         if (
@@ -593,15 +621,16 @@ class ExecutionHost:
     ) -> None:
         if (
             checkpoint["revision"] != expected_revision
-            or checkpoint["execution_checkpoint_digest"]
-            != expected_checkpoint_digest
+            or checkpoint["execution_checkpoint_digest"] != expected_checkpoint_digest
         ):
             raise ExecutionHostError(HostCode.CHECKPOINT_REVISION_CONFLICT)
 
     def _stage_insert(
         self, transaction: ExecutionStoreTransaction, candidate: dict[str, Any]
     ) -> None:
-        restore_execution_checkpoint(candidate, self.artifact_resolver)
+        self._restore(
+            serialize_execution_checkpoint(candidate), candidate["root_instance_id"]
+        )
         self._fault("before_commit")
         if not transaction.insert(serialize_execution_checkpoint(candidate)):
             raise ExecutionHostError(HostCode.CHECKPOINT_REVISION_CONFLICT)
@@ -612,7 +641,9 @@ class ExecutionHost:
         previous: Mapping[str, Any],
         candidate: dict[str, Any],
     ) -> None:
-        restore_execution_checkpoint(candidate, self.artifact_resolver)
+        self._restore(
+            serialize_execution_checkpoint(candidate), candidate["root_instance_id"]
+        )
         self._fault("before_commit")
         if not transaction.replace(
             previous["revision"],
@@ -624,14 +655,10 @@ class ExecutionHost:
     def read_checkpoint(
         self,
         root_instance_id: str,
-    ) -> RestoredExecutionCheckpoint | None:
+    ) -> RestoredExecutionCheckpoint | RestoredExecutionCheckpointV2 | None:
         with self._transaction(root_instance_id) as transaction:
             source = transaction.load()
-            return (
-                None
-                if source is None
-                else self._restore(source, root_instance_id)
-            )
+            return None if source is None else self._restore(source, root_instance_id)
 
     def create(
         self,
@@ -643,8 +670,7 @@ class ExecutionHost:
     ) -> dict[str, Any]:
         validated = bundle if isinstance(bundle, Bundle) else load_bundle(bundle)
         normalized_bindings = {
-            name: copy.deepcopy(dict(value))
-            for name, value in (bindings or {}).items()
+            name: copy.deepcopy(dict(value)) for name, value in (bindings or {}).items()
         }
         request_digest = creation_request_digest(
             validated,
@@ -680,6 +706,363 @@ class ExecutionHost:
             receipt = copy.deepcopy(candidate["operation_receipts"][0])
         self._after_commit()
         return {"result": "committed", "receipt": receipt}
+
+    def create_v2(
+        self,
+        bundle: Bundle | BundleSource,
+        machine_id: str,
+        root_instance_id: str,
+        creation_id: str,
+        bindings: Mapping[str, Mapping[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """Create and transactionally retain one queue-bearing checkpoint."""
+        from .checkpoint_v2 import create_checkpoint_v2
+
+        normalized = {name: dict(value) for name, value in (bindings or {}).items()}
+        with self._transaction(root_instance_id) as transaction:
+            source = transaction.load()
+            if source is not None:
+                restored = self._restore(source, root_instance_id)
+                receipt = restored.document["operation_receipts"][0]
+                request_digest = creation_request_digest(
+                    bundle, machine_id, root_instance_id, creation_id, normalized
+                )
+                receipt_value = receipt.get("legacy_receipt", receipt)
+                if (
+                    receipt_value["creation_id"] == creation_id
+                    and receipt_value["request_digest"] == request_digest
+                ):
+                    return {"result": "committed", "receipt": copy.deepcopy(receipt)}
+                raise ExecutionHostError(HostCode.CREATION_ID_CONFLICT)
+            candidate = create_checkpoint_v2(
+                bundle, machine_id, root_instance_id, creation_id, normalized
+            )
+            self._stage_insert(transaction, candidate)
+            receipt = copy.deepcopy(candidate["operation_receipts"][0])
+        self._after_commit()
+        return {"result": "committed", "receipt": receipt}
+
+    @staticmethod
+    def _v2_committed_checkpoint(result: Mapping[str, Any]) -> dict[str, Any] | None:
+        if result.get("execution_checkpoint_schema_version") == 2:
+            return copy.deepcopy(dict(result))
+        checkpoint = result.get("checkpoint")
+        if (
+            isinstance(checkpoint, Mapping)
+            and checkpoint.get("execution_checkpoint_schema_version") == 2
+        ):
+            return copy.deepcopy(dict(checkpoint))
+        return None
+
+    def admit_v2(
+        self,
+        root_instance_id: str,
+        deliveries: Sequence[Mapping[str, Any]],
+        *,
+        expected_revision: str,
+        expected_checkpoint_digest: str,
+    ) -> dict[str, Any]:
+        """Admit one v2 batch inside the store transaction."""
+        from .checkpoint_v2 import admit_checkpoint_v2
+
+        with self._transaction(root_instance_id) as transaction:
+            source = transaction.load()
+            if source is None:
+                raise ExecutionHostError(PreAcceptanceCode.WRONG_ROOT)
+            prior: dict[str, Any] = self._restore(source, root_instance_id).document
+            result = admit_checkpoint_v2(
+                prior,
+                deliveries,
+                self.artifact_resolver,
+                expected_revision=expected_revision,
+                expected_checkpoint_digest=expected_checkpoint_digest,
+            )
+            candidate = self._v2_committed_checkpoint(result)
+            if (
+                candidate is not None
+                and candidate["execution_checkpoint_digest"]
+                != prior["execution_checkpoint_digest"]
+            ):
+                self._stage_replace(transaction, prior, candidate)
+        if (
+            candidate is not None
+            and candidate["execution_checkpoint_digest"]
+            != prior["execution_checkpoint_digest"]
+        ):
+            self._after_commit()
+        return result
+
+    def process_ready_v2(
+        self,
+        root_instance_id: str,
+        target_runtime_id: str,
+        *,
+        expected_revision: str,
+        expected_checkpoint_digest: str,
+    ) -> dict[str, Any]:
+        """Process one v2 ready head inside the store transaction."""
+        from .checkpoint_v2 import step_checkpoint_v2
+
+        with self._transaction(root_instance_id) as transaction:
+            source = transaction.load()
+            if source is None:
+                raise ExecutionHostError(PreAcceptanceCode.WRONG_ROOT)
+            prior = self._restore(source, root_instance_id).document
+            result = step_checkpoint_v2(
+                prior,
+                target_runtime_id,
+                self.artifact_resolver,
+                expected_revision=expected_revision,
+                expected_checkpoint_digest=expected_checkpoint_digest,
+            )
+            candidate = self._v2_committed_checkpoint(result)
+            if (
+                candidate is not None
+                and candidate["execution_checkpoint_digest"]
+                != prior["execution_checkpoint_digest"]
+            ):
+                self._stage_replace(transaction, prior, candidate)
+        if (
+            candidate is not None
+            and candidate["execution_checkpoint_digest"]
+            != prior["execution_checkpoint_digest"]
+        ):
+            self._after_commit()
+        return result
+
+    def upgrade_checkpoint_v2(
+        self,
+        root_instance_id: str,
+        *,
+        expected_revision: str,
+        expected_checkpoint_digest: str,
+    ) -> dict[str, Any]:
+        """Atomically upgrade one retained v1 checkpoint to v2."""
+        from .checkpoint_v2 import upgrade_checkpoint_v1_to_v2
+
+        with self._transaction(root_instance_id) as transaction:
+            source = transaction.load()
+            if source is None:
+                raise ExecutionHostError(PreAcceptanceCode.WRONG_ROOT)
+            prior = self._restore(source, root_instance_id).document
+            self._check_expected(prior, expected_revision, expected_checkpoint_digest)
+            candidate = upgrade_checkpoint_v1_to_v2(prior, self.artifact_resolver)
+            self._stage_replace(transaction, prior, candidate)
+        self._after_commit()
+        return candidate
+
+    def prune_v2(
+        self,
+        root_instance_id: str,
+        cutoff_receipt_sequence: str,
+        *,
+        expected_revision: str,
+        expected_checkpoint_digest: str,
+    ) -> dict[str, Any]:
+        """Atomically prune one dependency-closed bounded v2 checkpoint."""
+        from .checkpoint_v2 import prune_checkpoint_v2
+
+        with self._transaction(root_instance_id) as transaction:
+            source = transaction.load()
+            if source is None:
+                raise ExecutionHostError(PreAcceptanceCode.WRONG_ROOT)
+            prior = self._restore(source, root_instance_id).document
+            candidate = prune_checkpoint_v2(
+                prior,
+                cutoff_receipt_sequence,
+                self.artifact_resolver,
+                expected_revision=expected_revision,
+                expected_checkpoint_digest=expected_checkpoint_digest,
+            )
+            if (
+                candidate["execution_checkpoint_digest"]
+                != prior["execution_checkpoint_digest"]
+            ):
+                self._stage_replace(transaction, prior, candidate)
+        if (
+            candidate["execution_checkpoint_digest"]
+            != prior["execution_checkpoint_digest"]
+        ):
+            self._after_commit()
+        return candidate
+
+    @staticmethod
+    def _terminalize_v2_entries(
+        checkpoint: dict[str, Any],
+        entries: Sequence[Mapping[str, Any]],
+        *,
+        disposition: str,
+        reason: str,
+        resulting_digest: str,
+        status: str,
+        migration_descriptor_digest: str | None = None,
+    ) -> None:
+        from .checkpoint_v2 import _terminalize_mailbox_reference
+
+        for entry in entries:
+            receipt_sequence = checkpoint["next_operation_receipt_sequence"]
+            checkpoint["next_operation_receipt_sequence"] = (
+                _increment_checkpoint_number(receipt_sequence)
+            )
+            event_id = entry["envelope"]["event_id"]
+            _terminalize_mailbox_reference(checkpoint, entry, receipt_sequence)
+            outcome: dict[str, Any] = {
+                "status": status,
+                "disposition": disposition,
+                "reason": reason,
+                "fault": None,
+                "rejection": None,
+            }
+            if migration_descriptor_digest is not None:
+                outcome["migration_descriptor_digest"] = migration_descriptor_digest
+            checkpoint["operation_receipts"].append(
+                {
+                    "operation_kind": "event_terminal",
+                    "receipt_sequence": receipt_sequence,
+                    "event_id": event_id,
+                    "request_digest": entry["envelope_digest"],
+                    "acceptance_sequence": entry["acceptance_sequence"],
+                    "final_queue_sequence": entry["queue_sequence"],
+                    "committed_revision": checkpoint["revision"],
+                    "resulting_aggregate_state_digest": resulting_digest,
+                    "outcome": outcome,
+                    "emission_references": [],
+                }
+            )
+
+    def maintenance_migration_v2(
+        self,
+        root_instance_id: str,
+        target_validated_bundle_fingerprint: str,
+        migration_descriptor_digest_route: Sequence[str],
+        *,
+        expected_revision: str,
+        expected_checkpoint_digest: str,
+        maintenance_mode: bool = True,
+        limits: MigrationLimits | None = None,
+    ) -> dict[str, Any]:
+        """Migrate a v2 aggregate and all queue ownership in one transaction."""
+        from .checkpoint_v2 import _synchronize_mailbox_references
+        from .queueing import migrate_aggregate_v2
+
+        with self._transaction(root_instance_id) as transaction:
+            source = transaction.load()
+            if source is None:
+                raise ExecutionHostError(PreAcceptanceCode.WRONG_ROOT)
+            prior = self._restore(source, root_instance_id).document
+            self._check_expected(prior, expected_revision, expected_checkpoint_digest)
+            aggregate = prior["root_record"].get("aggregate_state")
+            if aggregate is None:
+                raise ExecutionHostError(PreAcceptanceCode.TOMBSTONED_ROOT)
+            migration = migrate_aggregate_v2(
+                aggregate,
+                target_validated_bundle_fingerprint,
+                migration_descriptor_digest_route,
+                self.artifact_resolver,
+                maintenance_mode=maintenance_mode,
+                resource_limits=limits,
+                _include_host_evidence=True,
+            )
+            migrated = migration["aggregate_state"]
+            candidate = _mutate(prior)
+            candidate["root_record"]["aggregate_state"] = migrated
+            candidate["migration_audit_records"].extend(
+                copy.deepcopy(migration["audit_records"])
+            )
+            for entry, disposition in zip(
+                migration["_disposed_entries"],
+                migration["dispositions"],
+                strict=True,
+            ):
+                self._terminalize_v2_entries(
+                    candidate,
+                    [entry],
+                    disposition="migration_disposed",
+                    reason=disposition["reason"],
+                    resulting_digest=migrated["aggregate_state_digest"],
+                    status=next(
+                        runtime["status"]
+                        for runtime in migrated["runtimes"]
+                        if runtime["runtime_id"] == migrated["root_runtime_id"]
+                    ),
+                    migration_descriptor_digest=disposition[
+                        "migration_descriptor_digest"
+                    ],
+                )
+            _synchronize_mailbox_references(candidate)
+            candidate = seal_execution_checkpoint(candidate)
+            self._stage_replace(transaction, prior, candidate)
+        self._after_commit()
+        return candidate
+
+    def tombstone_root_v2(
+        self,
+        root_instance_id: str,
+        operation_id: str,
+        *,
+        expected_revision: str,
+        expected_checkpoint_digest: str,
+    ) -> dict[str, Any]:
+        """Tombstone one v2 root and terminalize all engine-owned work."""
+        if not operation_id:
+            raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
+        with self._transaction(root_instance_id) as transaction:
+            source = transaction.load()
+            if source is None:
+                raise ExecutionHostError(PreAcceptanceCode.WRONG_ROOT)
+            prior: dict[str, Any] = self._restore(source, root_instance_id).document
+            root_record = prior["root_record"]
+            if root_record["status"] == "tombstone":
+                if root_record["tombstone_operation_id"] == operation_id:
+                    return prior
+                raise ExecutionHostError(HostCode.OPERATION_ID_CONFLICT)
+            self._check_expected(prior, expected_revision, expected_checkpoint_digest)
+            aggregate = root_record["aggregate_state"]
+            root_runtime = next(
+                runtime
+                for runtime in aggregate["runtimes"]
+                if runtime["runtime_id"] == aggregate["root_runtime_id"]
+            )
+            if (
+                root_runtime["status"] not in {"completed", "faulted"}
+                or prior["pending_outbox_intents"]
+            ):
+                raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
+            from .queueing import _lifecycle_runtime_order, restore_aggregate_v2
+
+            restored_aggregate = restore_aggregate_v2(aggregate, self.artifact_resolver)
+            runtime_by_id = {
+                runtime["runtime_id"]: runtime for runtime in aggregate["runtimes"]
+            }
+            entries = [
+                entry
+                for runtime_id in _lifecycle_runtime_order(
+                    restored_aggregate.bundle, restored_aggregate.state
+                )
+                for mailbox in ("ready_mailbox", "deferred_mailbox")
+                for entry in runtime_by_id[runtime_id][mailbox]
+            ]
+            candidate = _mutate(prior)
+            self._terminalize_v2_entries(
+                candidate,
+                entries,
+                disposition="disposed",
+                reason="root_tombstoned",
+                resulting_digest=aggregate["aggregate_state_digest"],
+                status=root_runtime["status"],
+            )
+            candidate["root_record"] = {
+                "status": "tombstone",
+                "root_runtime_id": aggregate["root_runtime_id"],
+                "creation_id": aggregate["creation_id"],
+                "terminal_status": root_runtime["status"],
+                "final_aggregate_state_digest": aggregate["aggregate_state_digest"],
+                "tombstone_operation_id": operation_id,
+            }
+            candidate = seal_execution_checkpoint(candidate)
+            self._stage_replace(transaction, prior, candidate)
+        self._after_commit()
+        return candidate
 
     def _delivery_candidate(
         self, candidate: Any
@@ -718,9 +1101,7 @@ class ExecutionHost:
             supplied_digest,
         )
 
-    def _not_accepted(
-        self, code: PreAcceptanceCode
-    ) -> dict[str, Any]:
+    def _not_accepted(self, code: PreAcceptanceCode) -> dict[str, Any]:
         return {"result": "not_accepted", "failure": {"code": code.value}}
 
     def _delivery_replay(
@@ -740,7 +1121,10 @@ class ExecutionHost:
                     "accepted_revision": pending["accepted_revision"],
                 }
         for receipt in checkpoint["operation_receipts"]:
-            if receipt["operation_kind"] == "delivery" and receipt["event_id"] == event_id:
+            if (
+                receipt["operation_kind"] == "delivery"
+                and receipt["event_id"] == event_id
+            ):
                 if receipt["request_digest"] != digest:
                     return self._not_accepted(PreAcceptanceCode.EVENT_ID_CONFLICT)
                 return {"result": "committed", "receipt": copy.deepcopy(receipt)}
@@ -750,6 +1134,7 @@ class ExecutionHost:
         self,
         checkpoint: Mapping[str, Any],
         candidate: Any,
+        bundle: Bundle | None = None,
     ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
         parsed = self._delivery_candidate(candidate)
         root_instance_id, mode, origin, envelope, supplied_digest = parsed
@@ -759,19 +1144,19 @@ class ExecutionHost:
             return None, self._not_accepted(PreAcceptanceCode.WRONG_ROOT)
 
         digest = delivery_request_digest(root_instance_id, mode, envelope)
-        replay = self._delivery_replay(
-            checkpoint, envelope["event_id"], digest
-        )
+        replay = self._delivery_replay(checkpoint, envelope["event_id"], digest)
         if replay is not None:
             return None, replay
         if checkpoint["root_record"]["status"] == "tombstone":
             return None, self._not_accepted(PreAcceptanceCode.TOMBSTONED_ROOT)
+        if bundle is not None and _bundle_requires_v2(bundle):
+            return None, self._not_accepted(
+                PreAcceptanceCode.CHECKPOINT_UPGRADE_REQUIRED
+            )
 
         valid_mode = mode in {"input", "internal"}
         valid_origin = validate_execution_checkpoint_member("deliveryOrigin", origin)
-        valid_pair = (
-            mode == "input" and origin == {"kind": "host_input"}
-        ) or (
+        valid_pair = (mode == "input" and origin == {"kind": "host_input"}) or (
             mode == "internal"
             and isinstance(origin, Mapping)
             and origin.get("kind") == "internal_emission"
@@ -781,9 +1166,7 @@ class ExecutionHost:
         if not valid_origin or not valid_pair:
             return None, self._not_accepted(PreAcceptanceCode.INVALID_DELIVERY_ORIGIN)
         if supplied_digest is not None and supplied_digest != digest:
-            return None, self._not_accepted(
-                PreAcceptanceCode.DELIVERY_DIGEST_MISMATCH
-            )
+            return None, self._not_accepted(PreAcceptanceCode.DELIVERY_DIGEST_MISMATCH)
         if (
             _target_root_instance_id(envelope["target"])
             != checkpoint["root_instance_id"]
@@ -804,13 +1187,27 @@ class ExecutionHost:
         *,
         expected_revision: str,
         expected_checkpoint_digest: str,
+        selected_bundle: Bundle | BundleSource | None = None,
     ) -> dict[str, Any]:
         with self._transaction(root_instance_id) as transaction:
             source = transaction.load()
             if source is None:
                 return self._not_accepted(PreAcceptanceCode.WRONG_ROOT)
-            checkpoint = self._restore(source, root_instance_id).document
-            prepared, result = self._prepare_acceptance(checkpoint, candidate)
+            restored = self._restore(source, root_instance_id)
+            checkpoint = restored.document
+            prepared, result = self._prepare_acceptance(
+                checkpoint,
+                candidate,
+                (
+                    selected_bundle
+                    if isinstance(selected_bundle, Bundle)
+                    else load_bundle(selected_bundle)
+                    if selected_bundle is not None
+                    else restored.aggregate.bundle
+                    if restored.aggregate is not None
+                    else None
+                ),
+            )
             if result is not None:
                 return result
             assert prepared is not None
@@ -875,8 +1272,8 @@ class ExecutionHost:
                 "envelope_digest": pending["envelope_digest"],
             }
         receipt_sequence = candidate["next_operation_receipt_sequence"]
-        candidate["next_operation_receipt_sequence"] = (
-            _increment_checkpoint_number(receipt_sequence)
+        candidate["next_operation_receipt_sequence"] = _increment_checkpoint_number(
+            receipt_sequence
         )
         aggregate = copy.deepcopy(projected["aggregate_state"])
         if aggregate is None or restored.aggregate is None:
@@ -892,9 +1289,7 @@ class ExecutionHost:
             "delivery_mode": request["delivery_mode"],
             "origin": copy.deepcopy(request["origin"]),
             "committed_revision": candidate["revision"],
-            "resulting_aggregate_state_digest": aggregate[
-                "aggregate_state_digest"
-            ],
+            "resulting_aggregate_state_digest": aggregate["aggregate_state_digest"],
             "outcome": {
                 "status": projected["status"],
                 "disposition": projected["disposition"],
@@ -933,9 +1328,7 @@ class ExecutionHost:
             digest = delivery_request_digest(root_instance_id, mode, envelope)
             if supplied_digest is not None and supplied_digest != digest:
                 raise ExecutionHostError(PreAcceptanceCode.DELIVERY_DIGEST_MISMATCH)
-            replay = self._delivery_replay(
-                checkpoint, envelope["event_id"], digest
-            )
+            replay = self._delivery_replay(checkpoint, envelope["event_id"], digest)
             if replay is not None and replay["result"] == "committed":
                 return replay
             if replay is not None and replay["result"] == "not_accepted":
@@ -958,9 +1351,7 @@ class ExecutionHost:
             result = core_dispatch(
                 restored.aggregate.bundle,
                 restored.aggregate.state,
-                _delivery_from_wire(
-                    pending["delivery_mode"], pending["envelope"]
-                ),
+                _delivery_from_wire(pending["delivery_mode"], pending["envelope"]),
             )
             projected = _project_core_result(restored.aggregate.bundle, result)
             next_checkpoint, receipt = self._commit_delivery(
@@ -990,7 +1381,11 @@ class ExecutionHost:
                 raise ExecutionHostError(PreAcceptanceCode.WRONG_ROOT)
             restored = self._restore(source, root_instance_id)
             checkpoint = restored.document
-            prepared, replay = self._prepare_acceptance(checkpoint, candidate)
+            prepared, replay = self._prepare_acceptance(
+                checkpoint,
+                candidate,
+                restored.aggregate.bundle if restored.aggregate is not None else None,
+            )
             if replay is not None:
                 return replay
             assert prepared is not None
@@ -1002,9 +1397,7 @@ class ExecutionHost:
             result = core_dispatch(
                 restored.aggregate.bundle,
                 restored.aggregate.state,
-                _delivery_from_wire(
-                    prepared["delivery_mode"], prepared["envelope"]
-                ),
+                _delivery_from_wire(prepared["delivery_mode"], prepared["envelope"]),
             )
             projected = _project_core_result(restored.aggregate.bundle, result)
             next_checkpoint, receipt = self._commit_delivery(
@@ -1032,11 +1425,8 @@ class ExecutionHost:
         maintenance_mode: bool = True,
         limits: MigrationLimits | None = None,
     ) -> dict[str, Any]:
-        if (
-            not operation_id
-            or not validate_execution_checkpoint_member(
-                "sha256", source_aggregate_state_digest
-            )
+        if not operation_id or not validate_execution_checkpoint_member(
+            "sha256", source_aggregate_state_digest
         ):
             raise ExecutionHostError(PersistenceCode.INVALID_MIGRATION_REQUEST)
         request_digest = maintenance_migration_request_digest(
@@ -1091,8 +1481,8 @@ class ExecutionHost:
                 raise ExecutionHostError(code)
             candidate = _mutate(checkpoint)
             receipt_sequence = candidate["next_operation_receipt_sequence"]
-            candidate["next_operation_receipt_sequence"] = (
-                _increment_checkpoint_number(receipt_sequence)
+            candidate["next_operation_receipt_sequence"] = _increment_checkpoint_number(
+                receipt_sequence
             )
             migration_sequences = [
                 item["migration_sequence"] for item in result.audit_records
@@ -1227,8 +1617,8 @@ class ExecutionHost:
             )
             candidate["pending_outbox_intents"].remove(candidate_pending)
             terminal_sequence = candidate["next_outbox_terminal_sequence"]
-            candidate["next_outbox_terminal_sequence"] = (
-                _increment_checkpoint_number(terminal_sequence)
+            candidate["next_outbox_terminal_sequence"] = _increment_checkpoint_number(
+                terminal_sequence
             )
             record = {
                 "terminal_sequence": terminal_sequence,
@@ -1381,7 +1771,10 @@ class ExecutionHost:
             checkpoint = self._restore(source, root_instance_id).document
             current = checkpoint["replay_retention"]
             if current == target:
-                return {"result": "committed", "replay_retention": copy.deepcopy(current)}
+                return {
+                    "result": "committed",
+                    "replay_retention": copy.deepcopy(current),
+                }
             if current["mode"] == "bounded" and target["mode"] == "permanent":
                 raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
             current_cutoff = current["pruned_through_receipt_sequence"]
@@ -1389,26 +1782,18 @@ class ExecutionHost:
             if target["mode"] == "bounded":
                 if (
                     current["mode"] == "bounded"
-                    and current["policy_identifier"]
-                    != target["policy_identifier"]
+                    and current["policy_identifier"] != target["policy_identifier"]
                 ):
                     raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
-                if (
-                    current_cutoff is not None
-                    and (
-                        target_cutoff is None
-                        or _checkpoint_number(target_cutoff)
-                        < _checkpoint_number(current_cutoff)
-                    )
+                if current_cutoff is not None and (
+                    target_cutoff is None
+                    or _checkpoint_number(target_cutoff)
+                    < _checkpoint_number(current_cutoff)
                 ):
                     raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
-                if (
-                    target_cutoff is not None
-                    and _checkpoint_number(target_cutoff)
-                    >= _checkpoint_number(
-                        checkpoint["next_operation_receipt_sequence"]
-                    )
-                ):
+                if target_cutoff is not None and _checkpoint_number(
+                    target_cutoff
+                ) >= _checkpoint_number(checkpoint["next_operation_receipt_sequence"]):
                     raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
             self._check_expected(
                 checkpoint, expected_revision, expected_checkpoint_digest
@@ -1455,7 +1840,9 @@ class ExecutionHost:
                 self._stage_replace(transaction, checkpoint, candidate)
             except Exception as exc:
                 if getattr(exc, "code", None) == HostCode.INVALID_EXECUTION_CHECKPOINT:
-                    raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT) from exc
+                    raise ExecutionHostError(
+                        HostCode.INVALID_EXECUTION_CHECKPOINT
+                    ) from exc
                 raise
             response = {
                 "result": "committed",
@@ -1509,9 +1896,7 @@ class ExecutionHost:
                 "root_runtime_id": aggregate["root_runtime_id"],
                 "creation_id": aggregate["creation_id"],
                 "terminal_status": root_runtime["status"],
-                "final_aggregate_state_digest": aggregate[
-                    "aggregate_state_digest"
-                ],
+                "final_aggregate_state_digest": aggregate["aggregate_state_digest"],
                 "tombstone_operation_id": operation_id,
             }
             candidate["root_record"] = tombstone

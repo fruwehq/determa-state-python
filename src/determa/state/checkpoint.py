@@ -43,10 +43,15 @@ class RestoredExecutionCheckpoint:
 
 
 def execution_checkpoint_digest(document: Mapping[str, Any]) -> str:
-    """Compute the exact schema-version-1 checkpoint digest."""
+    """Compute the exact versioned checkpoint digest."""
     body = copy.deepcopy(dict(document))
     body.pop("execution_checkpoint_digest", None)
-    return hash_value(["determa-execution-checkpoint-digest-1", body])
+    domain = (
+        "determa-execution-checkpoint-digest-2"
+        if body.get("execution_checkpoint_schema_version") == 2
+        else "determa-execution-checkpoint-digest-1"
+    )
+    return hash_value([domain, body])
 
 
 def seal_execution_checkpoint(document: Mapping[str, Any]) -> dict[str, Any]:

@@ -30,11 +30,20 @@ class CheckpointHostFailureCode(StrEnum):
 
 
 class CheckpointPreAcceptanceFailureCode(StrEnum):
+    CHECKPOINT_UPGRADE_REQUIRED = "checkpoint_upgrade_required"
     DELIVERY_DIGEST_MISMATCH = "delivery_digest_mismatch"
+    DUPLICATE_EVENT_ID_IN_BATCH = "duplicate_event_id_in_batch"
     EVENT_ID_CONFLICT = "event_id_conflict"
+    INACTIVE_COMPONENT_TARGET = "inactive_component_target"
+    INVALID_CORRELATION = "invalid_correlation"
     INVALID_DELIVERY_MODE = "invalid_delivery_mode"
     INVALID_DELIVERY_ORIGIN = "invalid_delivery_origin"
+    INVALID_DELIVERY_SOURCE = "invalid_delivery_source"
+    INVALID_EVENT = "invalid_event"
+    INVALID_INSTANCE_TARGET = "invalid_instance_target"
+    INVALID_PAYLOAD = "invalid_payload"
     MALFORMED_DELIVERY = "malformed_delivery"
+    TERMINAL_ROOT = "terminal_root"
     TOMBSTONED_ROOT = "tombstoned_root"
     WRONG_ROOT = "wrong_root"
 
@@ -56,8 +65,10 @@ class DispatchRejectionCode(StrEnum):
 
 
 class DispositionCode(StrEnum):
+    DEFERRED = "deferred"
     FAULTED = "faulted"
     HANDLED = "handled"
+    NOT_RUNNABLE = "not_runnable"
     REJECTED = "rejected"
     UNHANDLED = "unhandled"
 
@@ -67,6 +78,7 @@ class EngineFaultCode(StrEnum):
     BINDING_NOT_EMPTY = "binding_not_empty"
     CASCADE_FAULT = "cascade_fault"
     CONTAINED_RUNTIME_FAULT = "contained_runtime_fault"
+    DEFERRED_EVENT_CAPACITY_EXCEEDED = "deferred_event_capacity_exceeded"
     GUARD_FAULT = "guard_fault"
     INACTIVE_COMPONENT_TARGET = "inactive_component_target"
     INVALID_INSTANCE_TARGET = "invalid_instance_target"

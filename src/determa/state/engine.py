@@ -24,10 +24,20 @@ from .codes import (
 from .codes import (
     MachineLoadFailureCode as LoadCode,
 )
-from .definition import Bundle, BundleSource, _escape_pointer, hash_identity, load_bundle
+from .definition import (
+    Bundle,
+    BundleSource,
+    _escape_pointer,
+    hash_identity,
+    load_bundle,
+)
 from .errors import CelError, StepFault, ValidationError
 from .model import BundleModel, MachineModel, StateNode
-from .yaml12 import normalize_portable_values, validate_portable_values, validate_unicode
+from .yaml12 import (
+    normalize_portable_values,
+    validate_portable_values,
+    validate_unicode,
+)
 
 Result = dict[str, Any]
 Delivery = dict[str, dict[str, Any]] | None
@@ -282,6 +292,8 @@ def create(
     root_instance_id: str,
     creation_id: str,
     bindings: dict[str, dict[str, Any]] | None = None,
+    *,
+    _capture_emission_provenance: bool = False,
 ) -> Result:
     """Create and synchronously initialize one root ownership aggregate."""
     validated = _coerce_bundle(bundle)
@@ -322,7 +334,13 @@ def create(
         "runtimes": {},
         "fault": None,
     }
-    execution = _Execution(validated, models, state, step_sequence=0)
+    execution = _Execution(
+        validated,
+        models,
+        state,
+        step_sequence=0,
+        capture_emission_provenance=_capture_emission_provenance,
+    )
     runtime = execution.new_runtime(
         machine,
         root_id,
@@ -372,6 +390,8 @@ def dispatch(
     bundle: Bundle | BundleSource,
     prior_state: dict[str, Any],
     delivery: Delivery = None,
+    *,
+    _capture_emission_provenance: bool = False,
 ) -> Result:
     """Validate and process at most one envelope against an aggregate copy."""
     validated = _coerce_bundle(bundle)
@@ -409,7 +429,13 @@ def dispatch(
         return _rejected(prior_state, rejection)
     state = _copy_normalized_prior_state(prior_state)
     step_sequence = int(state["next_logical_step_sequence"])
-    execution = _Execution(validated, models, state, step_sequence=step_sequence)
+    execution = _Execution(
+        validated,
+        models,
+        state,
+        step_sequence=step_sequence,
+        capture_emission_provenance=_capture_emission_provenance,
+    )
     runtime = execution.runtime_for_target(envelope["target"])
     normalized_envelope = copy.deepcopy(envelope)
     declaration = execution.event_declaration(runtime, envelope["event"])
@@ -435,11 +461,17 @@ def dispatch(
     execution.cause_id = str(envelope["event_id"])
     before = copy.deepcopy(state)
     try:
-        handled = execution.process(runtime, normalized_envelope)
+        disposition = execution.process(runtime, normalized_envelope)
     except StepFault as fault:
         state.clear()
         state.update(before)
-        execution = _Execution(validated, models, state, step_sequence=step_sequence)
+        execution = _Execution(
+            validated,
+            models,
+            state,
+            step_sequence=step_sequence,
+            capture_emission_provenance=_capture_emission_provenance,
+        )
         runtime = execution.runtime_for_target(envelope["target"])
         execution.finalize_fault(runtime, fault, str(envelope["event_id"]))
         state["next_logical_step_sequence"] = step_sequence + 1
@@ -454,11 +486,11 @@ def dispatch(
         result["fault"] = copy.deepcopy(runtime["fault"])
         result["emissions"] = execution.emissions
         return result
-    if not handled:
+    if disposition != Disposition.HANDLED.value:
         result = _empty_result(
             status=prior_state["status"],
             state=prior_state,
-            disposition=Disposition.UNHANDLED.value,
+            disposition=disposition,
         )
         result["fault"] = copy.deepcopy(prior_state.get("fault"))
         return result
@@ -939,8 +971,7 @@ def _valid_spawned_identity(state: dict[str, Any], runtime: dict[str, Any]) -> b
         )
         or (
             not migrated
-            and runtime["instance_reference"].get("machine_version")
-            != runtime["machine_version"]
+            and runtime["instance_reference"].get("machine_version") != runtime["machine_version"]
         )
     ):
         return False
@@ -1073,8 +1104,7 @@ def _valid_spawned_relation(
     if (
         state_path not in owner["active"]
         or state_path not in owner_machine.states
-        or owner["state_activation_sequence"].get(state_path)
-        != holder["state_activation_sequence"]
+        or owner["state_activation_sequence"].get(state_path) != holder["state_activation_sequence"]
     ):
         return False
     state = owner_machine.states[state_path]
@@ -1103,6 +1133,7 @@ def _valid_fault(
     }
     system_locators = {
         FaultCode.CONTAINED_RUNTIME_FAULT.value: "system:unhandled_contained_failure",
+        FaultCode.DEFERRED_EVENT_CAPACITY_EXCEEDED.value: "system:deferred_event_capacity",
         FaultCode.CASCADE_FAULT.value: "system:cascade_cleanup",
         FaultCode.INVARIANT_FAULT.value: "system:invariant",
     }
@@ -1307,9 +1338,7 @@ def _reserved_events() -> set[str]:
     }
 
 
-def _validate_reserved_payload(
-    event: str, envelope: dict[str, Any]
-) -> DispatchCode | None:
+def _validate_reserved_payload(event: str, envelope: dict[str, Any]) -> DispatchCode | None:
     payload = envelope.get("payload")
     if not isinstance(payload, dict):
         return DispatchCode.INVALID_PAYLOAD
@@ -1351,7 +1380,11 @@ def _validate_reserved_payload(
     else:
         relationship = payload.get("relationship")
         if relationship == "parallel":
-            valid = set(payload) == {"relationship", "state_path", "owner_runtime_id"} and all(
+            valid = set(payload) == {
+                "relationship",
+                "state_path",
+                "owner_runtime_id",
+            } and all(
                 isinstance(payload[name], str) and bool(payload[name])
                 for name in ("state_path", "owner_runtime_id")
             )
@@ -1437,9 +1470,7 @@ def _locate_target(
     return DispatchCode.INVALID_INSTANCE_TARGET, None
 
 
-def _target_eligibility(
-    state: dict[str, Any], runtime: dict[str, Any]
-) -> DispatchCode | None:
+def _target_eligibility(state: dict[str, Any], runtime: dict[str, Any]) -> DispatchCode | None:
     code = (
         DispatchCode.INACTIVE_COMPONENT_TARGET
         if runtime["role"] == "component"
@@ -1467,6 +1498,7 @@ class _Execution:
     emissions: list[dict[str, Any]]
     cause_id: str
     event: dict[str, Any] | None
+    capture_emission_provenance: bool
 
     def __init__(
         self,
@@ -1475,6 +1507,7 @@ class _Execution:
         state: dict[str, Any],
         *,
         step_sequence: int,
+        capture_emission_provenance: bool = False,
     ) -> None:
         self.bundle = bundle
         self.models = models
@@ -1483,6 +1516,25 @@ class _Execution:
         self.emissions = []
         self.cause_id = ""
         self.event = None
+        self.capture_emission_provenance = capture_emission_provenance
+
+    def append_emission(
+        self,
+        emission: dict[str, Any],
+        source: dict[str, Any],
+        *,
+        system_locator: str | None = None,
+    ) -> None:
+        if self.capture_emission_provenance and emission.get("target") != "external":
+            emission["_determa_v2_provenance"] = {
+                "cause_id": self.cause_id,
+                "source": (
+                    {"system": system_locator}
+                    if system_locator is not None
+                    else {"runtime": self.target_for(source)}
+                ),
+            }
+        self.emissions.append(emission)
 
     def new_runtime(
         self,
@@ -1541,9 +1593,7 @@ class _Execution:
         code, runtime = _locate_target(self.state, target)
         if code is not None or runtime is None:
             fault_code = (
-                FaultCode(code.value)
-                if code is not None
-                else FaultCode.INVALID_INSTANCE_TARGET
+                FaultCode(code.value) if code is not None else FaultCode.INVALID_INSTANCE_TARGET
             )
             raise StepFault(fault_code, "system:invariant")
         return runtime
@@ -1792,21 +1842,24 @@ class _Execution:
             for name in sorted(supplied, key=lambda item: item.encode("utf-8")):
                 expression = supplied[name]
                 value = self.evaluate(
-                    expression, activation, f"{pointer}/with/{kind}/{_escape_pointer(name)}"
+                    expression,
+                    activation,
+                    f"{pointer}/with/{kind}/{_escape_pointer(name)}",
                 )
                 declaration = declarations[name]
                 try:
                     result[kind][name] = _normalize_value(value, str(declaration["type"]))
                 except ValueError as exc:
                     raise StepFault(
-                        FaultCode.ACTION_FAULT, f"{pointer}/with/{kind}/{_escape_pointer(name)}"
+                        FaultCode.ACTION_FAULT,
+                        f"{pointer}/with/{kind}/{_escape_pointer(name)}",
                     ) from exc
             for name, declaration in declarations.items():
                 if declaration.get(kind) and name not in result[kind]:
                     result[kind][name] = copy.deepcopy(declaration["init"])
         return result
 
-    def process(self, runtime: dict[str, Any], envelope: dict[str, Any]) -> bool:
+    def process(self, runtime: dict[str, Any], envelope: dict[str, Any]) -> str:
         machine = self.model_for(runtime)
         active = machine.states[runtime["active"][-1]] if runtime["active"] else machine.root
         selected: tuple[StateNode, dict[str, Any], str] | None = None
@@ -1839,6 +1892,8 @@ class _Execution:
                         break
                 if selected is not None:
                     break
+            if envelope["event"] in (current.raw.get("deferred_events") or []):
+                return Disposition.DEFERRED.value
             current = current.parent
         if selected is None:
             if envelope["event"] in {
@@ -1849,7 +1904,7 @@ class _Execution:
                     FaultCode.CONTAINED_RUNTIME_FAULT,
                     "system:unhandled_contained_failure",
                 )
-            return False
+            return Disposition.UNHANDLED.value
         source, transition, pointer = selected
         try:
             target, history = self.resolve_compound_transition(
@@ -1861,7 +1916,7 @@ class _Execution:
                 event_visible=True,
             )
             if target is None:
-                return True
+                return Disposition.HANDLED.value
             self.apply_transition(
                 runtime,
                 machine,
@@ -1872,7 +1927,7 @@ class _Execution:
             )
         except _StopRuntime:
             self.complete_runtime(runtime, machine)
-        return True
+        return Disposition.HANDLED.value
 
     def resolve_compound_transition(
         self,
@@ -2096,7 +2151,7 @@ class _Execution:
                 }
                 if correlation is not None:
                     emission["correlation_id"] = correlation
-            self.emissions.append(emission)
+            self.append_emission(emission, runtime)
 
     def resolve_send_target(
         self,
@@ -2265,11 +2320,7 @@ class _Execution:
         if not _is_instance_reference(reference):
             return
         child = self.state["runtimes"].get(reference["instance_id"])
-        if (
-            child is None
-            or child["role"] != "spawned"
-            or not self.owns_descendant(runtime, child)
-        ):
+        if child is None or child["role"] != "spawned" or not self.owns_descendant(runtime, child):
             return
         self.cleanup_descendant(child)
 
@@ -2539,13 +2590,15 @@ class _Execution:
             locator,
             ordinal,
         )
-        self.emissions.append(
+        self.append_emission(
             {
                 "event": event,
                 "event_id": event_id,
                 "target": target,
                 "payload": copy.deepcopy(payload),
-            }
+            },
+            source,
+            system_locator=locator,
         )
 
     def finalize_fault(
