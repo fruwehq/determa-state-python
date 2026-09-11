@@ -165,7 +165,10 @@ def _upgraded_legacy_internal_checkpoint() -> tuple[Any, MemoryArtifactResolver,
         {
             "format": 1,
             "namespace": "tests.review83.legacy_provenance",
-            "events": {"work": {"direction": "internal"}},
+            "events": {
+                "go": {"direction": "input"},
+                "work": {"direction": "internal"},
+            },
             "machines": [
                 {
                     "machine_id": "machine",
@@ -183,6 +186,44 @@ def _upgraded_legacy_internal_checkpoint() -> tuple[Any, MemoryArtifactResolver,
     host.create(bundle, "machine", "root", "create", {})
     upgraded = upgrade_checkpoint_v1_to_v2(host.read_checkpoint("root").document, resolver)
     return bundle, resolver, upgraded
+
+
+def _upgraded_legacy_terminal_with_native_allocations() -> tuple[
+    MemoryArtifactResolver, dict[str, Any]
+]:
+    bundle, resolver, _checkpoint = _upgraded_legacy_internal_checkpoint()
+    host = ExecutionHost(MemoryExecutionStore(), resolver)
+    host.create(bundle, "machine", "root", "create", {})
+    created = host.read_checkpoint("root")
+    assert created is not None
+    pending = created.document["pending_deliveries"][0]
+    host.process_pending_delivery(
+        "root",
+        {
+            "root_instance_id": "root",
+            "delivery_mode": pending["delivery_mode"],
+            "origin": copy.deepcopy(pending["origin"]),
+            "envelope": copy.deepcopy(pending["envelope"]),
+            "envelope_digest": pending["envelope_digest"],
+        },
+        expected_revision=created.document["revision"],
+        expected_checkpoint_digest=created.document["execution_checkpoint_digest"],
+    )
+    processed = host.read_checkpoint("root")
+    assert processed is not None
+    checkpoint = upgrade_checkpoint_v1_to_v2(processed.document, resolver)
+    checkpoint = admit_checkpoint_v2(
+        checkpoint,
+        [
+            _delivery(checkpoint["root_record"]["aggregate_state"], "native-1"),
+            _delivery(checkpoint["root_record"]["aggregate_state"], "native-2"),
+        ],
+        resolver,
+        expected_revision=checkpoint["revision"],
+        expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+    )
+    assert checkpoint["root_record"]["aggregate_state"]["next_acceptance_sequence"] == "3"
+    return resolver, checkpoint
 
 
 def test_create_v2_routes_initial_internal_and_external_work_with_provenance() -> None:
@@ -1284,6 +1325,57 @@ def test_checkpoint_restore_rejects_resealed_processed_legacy_terminal_origin() 
         if receipt["operation_kind"] == "acceptance"
     )
     acceptance["legacy_v1_delivery"]["origin"]["emission_index"] = "999"
+    checkpoint = seal_execution_checkpoint(checkpoint)
+
+    with pytest.raises(ArtifactError, match="invalid_execution_checkpoint"):
+        restore_execution_checkpoint_v2(checkpoint, resolver)
+
+
+def _set_wrapped_legacy_terminal_allocation(
+    checkpoint: dict[str, Any], sequence: str
+) -> None:
+    wrapper = next(
+        receipt
+        for receipt in checkpoint["operation_receipts"]
+        if receipt["operation_kind"] == "legacy_v1_operation"
+        and receipt["legacy_receipt"]["operation_kind"] == "delivery"
+    )
+    legacy = wrapper["legacy_receipt"]
+    legacy["accepted_delivery_sequence"] = sequence
+    producer_sequence = legacy["origin"]["producing_receipt_sequence"]
+    producer = next(
+        receipt
+        for receipt in checkpoint["operation_receipts"]
+        if receipt["receipt_sequence"] == producer_sequence
+    )
+    reference = next(
+        item
+        for item in producer["legacy_receipt"]["emission_references"]
+        if item["event_id"] == legacy["event_id"]
+    )
+    reference["delivery_sequence"] = sequence
+
+
+def test_checkpoint_restore_rejects_legacy_allocation_collision_with_native() -> None:
+    resolver, checkpoint = _upgraded_legacy_terminal_with_native_allocations()
+    native_acceptance = next(
+        receipt
+        for receipt in checkpoint["operation_receipts"]
+        if receipt["operation_kind"] == "acceptance"
+    )
+    _set_wrapped_legacy_terminal_allocation(
+        checkpoint, native_acceptance["acceptance_sequence"]
+    )
+    checkpoint = seal_execution_checkpoint(checkpoint)
+
+    with pytest.raises(ArtifactError, match="invalid_execution_checkpoint"):
+        restore_execution_checkpoint_v2(checkpoint, resolver)
+
+
+def test_checkpoint_restore_rejects_legacy_allocation_at_or_above_next_counter() -> None:
+    resolver, checkpoint = _upgraded_legacy_terminal_with_native_allocations()
+    assert checkpoint["root_record"]["aggregate_state"]["next_acceptance_sequence"] == "3"
+    _set_wrapped_legacy_terminal_allocation(checkpoint, "999")
     checkpoint = seal_execution_checkpoint(checkpoint)
 
     with pytest.raises(ArtifactError, match="invalid_execution_checkpoint"):

@@ -454,6 +454,10 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
         + [decimal(item["acceptance_sequence"]) for item in acceptances.values()]
         + [decimal(item["acceptance_sequence"]) for item in terminals.values()]
         + [decimal(item["acceptance_sequence"]) for item in tombstones]
+        + [
+            decimal(item["accepted_delivery_sequence"])
+            for item in legacy_terminal_events.values()
+        ]
     )
     allocation_queues = [decimal(entry["queue_sequence"]) for entry in pending_entries] + [
         decimal(item["final_queue_sequence"]) for item in terminals.values()
@@ -470,6 +474,11 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
         sequence = decimal(item["acceptance_sequence"])
         envelope = item.get("envelope", {})
         event_id = item.get("event_id", envelope.get("event_id"))
+        prior_owner = acceptance_owners.setdefault(sequence, event_id)
+        if prior_owner != event_id:
+            raise _invalid()
+    for event_id, item in legacy_terminal_events.items():
+        sequence = decimal(item["accepted_delivery_sequence"])
         prior_owner = acceptance_owners.setdefault(sequence, event_id)
         if prior_owner != event_id:
             raise _invalid()
