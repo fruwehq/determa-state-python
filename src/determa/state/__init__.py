@@ -17,6 +17,7 @@ from .checkpoint import (
 from .checkpoint_v2 import (
     RestoredExecutionCheckpointV2,
     admit_checkpoint_v2,
+    create_checkpoint_v2,
     prune_checkpoint_v2,
     restore_execution_checkpoint_v2,
     step_checkpoint_v2,
@@ -136,6 +137,7 @@ __all__ = [
     "Delivery",
     "CreationRejectionCode",
     "create_aggregate_v2",
+    "create_checkpoint_v2",
     "DispatchRejectionCode",
     "downgrade_aggregate_v2_to_v1",
     "DispositionCode",

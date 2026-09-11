@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 from collections.abc import Mapping, Sequence
+from functools import cache
 from typing import Any, Literal, cast
 
 from .codes import (
@@ -17,13 +18,14 @@ from .codes import (
 )
 from .definition import Bundle, BundleSource, load_bundle
 from .engine import (
+    _Execution,
     _normalize_payload,
     _runtime_model,
     _validate_envelope,
     create,
     dispatch,
 )
-from .errors import ArtifactError
+from .errors import ArtifactError, StepFault
 from .migration import MigrationLimits, migrate_aggregate
 from .model import BundleModel, StateNode
 from .wire import (
@@ -31,8 +33,10 @@ from .wire import (
     DefinitionResolver,
     MemoryArtifactResolver,
     RestoredAggregate,
+    _schema_registry,
     aggregate_envelope,
     aggregate_state_digest,
+    artifact_schema,
     canonical_bytes,
     decimal,
     decoded_typed_value,
@@ -62,7 +66,10 @@ def seal_aggregate_v2(document: Mapping[str, Any]) -> dict[str, Any]:
             )
         )
         runtime["history"].sort(key=lambda item: _utf8(item["history_declaration_pointer"]))
-        for name in ("next_state_activation_sequences", "next_component_activation_sequences"):
+        for name in (
+            "next_state_activation_sequences",
+            "next_component_activation_sequences",
+        ):
             runtime[name].sort(key=lambda item: _utf8(item["definition_pointer"]))
         for name in ("ready_mailbox", "deferred_mailbox"):
             runtime[name].sort(key=lambda item: int(item["queue_sequence"]))
@@ -120,6 +127,8 @@ def downgrade_aggregate_v2_to_v1(
     if aggregate_state_digest(document) != document["aggregate_state_digest"]:
         raise ArtifactError(PersistenceFailureCode.AGGREGATE_STATE_DIGEST_MISMATCH)
     _validate_mailboxes(document)
+    if document["next_acceptance_sequence"] != "0" or document["next_queue_sequence"] != "0":
+        raise ArtifactError(PersistenceFailureCode.MIGRATION_TOTALITY_FAILURE)
     if any(
         runtime[mailbox]
         for runtime in document["runtimes"]
@@ -136,12 +145,59 @@ def create_aggregate_v2(
     creation_id: str,
     bindings: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Create and encode one queue-bearing aggregate."""
+    """Create one queue-bearing aggregate and route initialization emissions."""
     validated = bundle if isinstance(bundle, Bundle) else load_bundle(bundle)
-    result = create(validated, machine_id, root_instance_id, creation_id, bindings)
+    result = create(
+        validated,
+        machine_id,
+        root_instance_id,
+        creation_id,
+        bindings,
+        _capture_emission_provenance=True,
+    )
     if result["state"] is None:
-        return result
-    return _upgrade_document(aggregate_envelope(validated, result["state"]))
+        return {**result, "lifecycle_dispositions": []}
+    encoded = _upgrade_document(aggregate_envelope(validated, result["state"]))
+    root_runtime = next(
+        runtime
+        for runtime in encoded["runtimes"]
+        if runtime["runtime_id"] == encoded["root_runtime_id"]
+    )
+    lifecycle: list[dict[str, Any]] = []
+    emissions = _enqueue_emissions(
+        encoded,
+        encoded,
+        root_runtime,
+        cast(list[Mapping[str, Any]], result["emissions"]),
+        lifecycle,
+    )
+    encoded = seal_aggregate_v2(encoded)
+    result_fault = copy.deepcopy(root_runtime["fault"]) if result["status"] == "faulted" else None
+    return {
+        "status": result["status"],
+        "disposition": None,
+        "state": encoded,
+        "emissions": emissions,
+        "lifecycle_dispositions": lifecycle,
+        "fault": result_fault,
+        "rejection": copy.deepcopy(result["rejection"]),
+    }
+
+
+@cache
+def _envelope_validator() -> Any:
+    import jsonschema
+
+    schema = artifact_schema("aggregate_state_v2")
+    return jsonschema.Draft202012Validator(
+        {"$ref": f"{schema['$id']}#/$defs/envelope"}, registry=_schema_registry()
+    )
+
+
+def _valid_envelope_shape(value: Any) -> bool:
+    return (
+        isinstance(value, Mapping) and next(_envelope_validator().iter_errors(value), None) is None
+    )
 
 
 def _entry_digest(root_instance_id: str, mode: str, envelope: Mapping[str, Any]) -> str:
@@ -290,18 +346,33 @@ def admit_aggregate_v2(
         return _admission_rejection(AdmissionCode.MALFORMED_DELIVERY.value, document)
     event_ids: list[str] = []
     for delivery in deliveries:
-        if not isinstance(delivery, Mapping) or not isinstance(delivery.get("envelope"), Mapping):
+        if (
+            not isinstance(delivery, Mapping)
+            or set(delivery) != {"delivery_mode", "envelope", "envelope_digest"}
+            or not isinstance(delivery.get("delivery_mode"), str)
+            or not isinstance(delivery.get("envelope_digest"), str)
+            or not _valid_envelope_shape(delivery.get("envelope"))
+        ):
             return _admission_rejection(AdmissionCode.MALFORMED_DELIVERY.value, document)
         event_id = delivery["envelope"].get("event_id")
         if not isinstance(event_id, str) or not event_id:
             return _admission_rejection(AdmissionCode.MALFORMED_DELIVERY.value, document)
+        try:
+            target_root = next(iter(delivery["envelope"]["target"].values()))["root_instance_id"]
+        except (KeyError, StopIteration, TypeError):
+            return _admission_rejection(AdmissionCode.MALFORMED_DELIVERY.value, document)
+        if target_root != document["root_instance_id"]:
+            return _admission_rejection(AdmissionCode.WRONG_ROOT.value, document)
         event_ids.append(event_id)
     if len(event_ids) != len(set(event_ids)):
         return _admission_rejection(AdmissionCode.DUPLICATE_EVENT_ID_IN_BATCH.value, document)
 
     existing: dict[str, tuple[str, dict[str, Any]]] = {}
     for runtime in document["runtimes"]:
-        for mailbox, location in (("ready_mailbox", "ready"), ("deferred_mailbox", "deferred")):
+        for mailbox, location in (
+            ("ready_mailbox", "ready"),
+            ("deferred_mailbox", "deferred"),
+        ):
             for entry in runtime[mailbox]:
                 existing[entry["envelope"]["event_id"]] = (location, entry)
 
@@ -312,11 +383,7 @@ def admit_aggregate_v2(
         envelope = delivery["envelope"]
         event_id = envelope["event_id"]
         prior = existing.get(event_id)
-        candidate_digest = (
-            _entry_digest(document["root_instance_id"], mode, envelope)
-            if mode in {"input", "internal"}
-            else None
-        )
+        candidate_digest = _entry_digest(document["root_instance_id"], str(mode), envelope)
         if prior is not None:
             if candidate_digest != prior[1]["envelope_digest"]:
                 return _admission_rejection(AdmissionCode.EVENT_ID_CONFLICT.value, document)
@@ -351,15 +418,33 @@ def admit_aggregate_v2(
             or (mode == "input" and envelope.get("cause_id") != envelope.get("event_id"))
         ):
             return _admission_rejection(AdmissionCode.INVALID_DELIVERY_SOURCE.value, document)
+        if mode == "internal":
+            assert isinstance(source_value, Mapping)
+            source_runtime = source_value.get("runtime")
+            source_system = source_value.get("system")
+            valid_runtime_source = source_runtime is not None and any(
+                runtime["target_identity"] == source_runtime for runtime in document["runtimes"]
+            )
+            valid_system_source = source_system in {
+                "system:component_completion",
+                "system:spawned_completion",
+                "system:component_failure",
+                "system:spawned_failure",
+            }
+            if not valid_runtime_source and not valid_system_source:
+                return _admission_rejection(AdmissionCode.INVALID_DELIVERY_SOURCE.value, document)
         supplied_digest = delivery.get("envelope_digest")
-        expected_digest = _entry_digest(document["root_instance_id"], mode, envelope)
+        expected_digest = _entry_digest(document["root_instance_id"], str(mode), envelope)
         if supplied_digest != expected_digest:
             return _admission_rejection(AdmissionCode.DELIVERY_DIGEST_MISMATCH.value, document)
         try:
             native = _native_envelope(delivery)
         except (ArtifactError, KeyError, TypeError):
             return _admission_rejection(AdmissionCode.INVALID_PAYLOAD.value, document)
-        runtime_id = _runtime_id_for_target(envelope["target"])
+        try:
+            runtime_id = _runtime_id_for_target(envelope["target"])
+        except (KeyError, TypeError):
+            return _admission_rejection(AdmissionCode.INVALID_INSTANCE_TARGET.value, document)
         target_runtime = runtime_by_id.get(runtime_id)
         if target_runtime is None or target_runtime["target_identity"] != envelope["target"]:
             return _admission_rejection(AdmissionCode.INVALID_INSTANCE_TARGET.value, document)
@@ -402,7 +487,9 @@ def admit_aggregate_v2(
     }
 
 
-def _mailbox_maps(document: Mapping[str, Any]) -> dict[str, tuple[list[Any], list[Any]]]:
+def _mailbox_maps(
+    document: Mapping[str, Any],
+) -> dict[str, tuple[list[Any], list[Any]]]:
     return {
         runtime["runtime_id"]: (
             copy.deepcopy(runtime["ready_mailbox"]),
@@ -421,39 +508,6 @@ def _wire_target(target: Mapping[str, Any]) -> dict[str, Any]:
             result["spawned_instance"]["machine_version"]
         )
     return result
-
-
-def _emission_source_target(
-    before: Mapping[str, Any],
-    encoded: Mapping[str, Any],
-    selected_runtime: Mapping[str, Any],
-    emission: Mapping[str, Any],
-) -> dict[str, Any]:
-    payload = emission.get("payload")
-    source_runtime_id: str | None = None
-    if isinstance(payload, Mapping):
-        if emission.get("event") in {
-            "determa.component_completed",
-            "determa.component_failed",
-        }:
-            value = payload.get("component_runtime_id")
-            source_runtime_id = value if isinstance(value, str) else None
-        elif emission.get("event") == "determa.spawned_instance_failed":
-            value = payload.get("instance_id")
-            source_runtime_id = value if isinstance(value, str) else None
-    if source_runtime_id is not None:
-        source = next(
-            (
-                runtime
-                for aggregate in (encoded, before)
-                for runtime in aggregate["runtimes"]
-                if runtime["runtime_id"] == source_runtime_id
-            ),
-            None,
-        )
-        if source is not None:
-            return copy.deepcopy(source["target_identity"])
-    return copy.deepcopy(selected_runtime["target_identity"])
 
 
 def _lifecycle_disposition(
@@ -498,13 +552,14 @@ def _enqueue_emissions(
         queue = encoded["next_queue_sequence"]
         encoded["next_acceptance_sequence"] = str(int(acceptance) + 1)
         encoded["next_queue_sequence"] = str(int(queue) + 1)
+        provenance = emission.get("_determa_v2_provenance")
+        if not isinstance(provenance, Mapping):
+            raise ArtifactError(PersistenceFailureCode.INVALID_AGGREGATE_STATE)
         envelope = {
             "event": emission["event"],
             "event_id": emission["event_id"],
-            "cause_id": emission["event_id"],
-            "source": {
-                "runtime": _emission_source_target(before, encoded, selected_runtime, emission)
-            },
+            "cause_id": provenance["cause_id"],
+            "source": copy.deepcopy(provenance["source"]),
             "target": target_wire,
             "payload": typed_value(emission["payload"]),
         }
@@ -593,6 +648,18 @@ def _structurally_deferred(
     return False
 
 
+def _runtime_is_runnable(state: Mapping[str, Any], runtime_id: str) -> bool:
+    runtime = state["runtimes"].get(runtime_id)
+    while isinstance(runtime, Mapping):
+        if runtime["status"] != "running":
+            return False
+        owner_id = runtime.get("owner_runtime_id")
+        if owner_id is None:
+            return True
+        runtime = state["runtimes"].get(owner_id)
+    return False
+
+
 def _step_result(
     state: dict[str, Any],
     disposition: str,
@@ -650,37 +717,65 @@ def step_aggregate_v2(
     selected = wire_runtime["ready_mailbox"][0]
     mailboxes = _mailbox_maps(before)
     ready, deferred = mailboxes[target_runtime_id]
-    ready.pop(0)
     native = _native_envelope(selected)
     result = dispatch(
         restored.bundle,
         restored.state,
         {selected["delivery_mode"]: native},
+        _capture_emission_provenance=True,
     )
     disposition = result["disposition"]
+    if disposition == DispositionCode.REJECTED.value:
+        return _step_result(
+            before,
+            disposition,
+            fault=copy.deepcopy(result.get("fault")),
+            rejection=(result.get("rejection") or {}).get("code"),
+        )
+    ready.pop(0)
     if disposition == DispositionCode.DEFERRED.value:
         capacity = _runtime_capacity(restored.bundle, restored.state, target_runtime_id)
         if capacity is not None and len(deferred) >= capacity:
             state = copy.deepcopy(restored.state)
             runtime = state["runtimes"][target_runtime_id]
-            overflow_fault = {
-                "runtime_id": target_runtime_id,
-                "cause_id": selected["envelope"]["cause_id"],
-                "code": EngineFaultCode.DEFERRED_EVENT_CAPACITY_EXCEEDED.value,
-                "step_sequence": state["next_logical_step_sequence"],
-                "source_locator": "system:deferred_event_capacity",
-            }
-            runtime["status"] = "faulted"
-            runtime["fault"] = copy.deepcopy(overflow_fault)
+            execution = _Execution(
+                restored.bundle,
+                BundleModel(restored.bundle),
+                state,
+                step_sequence=state["next_logical_step_sequence"],
+                capture_emission_provenance=True,
+            )
+            cause_id = selected["envelope"]["cause_id"]
+            execution.cause_id = cause_id
+            execution.finalize_fault(
+                runtime,
+                StepFault(
+                    EngineFaultCode.DEFERRED_EVENT_CAPACITY_EXCEEDED,
+                    "system:deferred_event_capacity",
+                ),
+                cause_id,
+            )
             state["next_logical_step_sequence"] += 1
             if runtime["role"] == "root":
                 state["status"] = "faulted"
-                state["fault"] = copy.deepcopy(overflow_fault)
+                state["fault"] = copy.deepcopy(runtime["fault"])
+            else:
+                execution.emit_failure(runtime, cause_id)
             encoded = _encode_after_dispatch(restored.bundle, state, before, mailboxes)
-            encoded_fault = copy.deepcopy(overflow_fault)
+            overflow_lifecycle: list[dict[str, Any]] = []
+            emissions = _enqueue_emissions(
+                encoded, before, wire_runtime, execution.emissions, overflow_lifecycle
+            )
+            encoded_fault = copy.deepcopy(runtime["fault"])
             encoded_fault["step_sequence"] = str(encoded_fault["step_sequence"])
             encoded_fault["definition_fingerprint"] = restored.bundle.fingerprint
-            return _step_result(encoded, DispositionCode.FAULTED.value, fault=encoded_fault)
+            return _step_result(
+                seal_aggregate_v2(encoded),
+                DispositionCode.FAULTED.value,
+                emissions=emissions,
+                lifecycle=overflow_lifecycle,
+                fault=encoded_fault,
+            )
         moved = copy.deepcopy(selected)
         moved["queue_sequence"] = before["next_queue_sequence"]
         moved["deferral_count"] = str(int(moved["deferral_count"]) + 1)
@@ -697,9 +792,6 @@ def step_aggregate_v2(
         return _step_result(seal_aggregate_v2(candidate), disposition)
 
     state = cast(dict[str, Any], result["state"])
-    if disposition == DispositionCode.UNHANDLED.value:
-        state = copy.deepcopy(state)
-        state["next_logical_step_sequence"] += 1
     encoded = _encode_after_dispatch(restored.bundle, state, before, mailboxes)
     lifecycle: list[dict[str, Any]] = []
     live = {runtime["runtime_id"]: runtime for runtime in encoded["runtimes"]}
@@ -715,33 +807,15 @@ def step_aggregate_v2(
             if current is not None
             else "runtime_cancelled"
         )
-        entries = sorted(
-            [*mailboxes[runtime["runtime_id"]][0], *mailboxes[runtime["runtime_id"]][1]],
-            key=lambda entry: int(entry["queue_sequence"]),
-        )
+        entries = [
+            *mailboxes[runtime["runtime_id"]][0],
+            *mailboxes[runtime["runtime_id"]][1],
+        ]
         for entry in entries:
             lifecycle.append(_lifecycle_disposition(entry, runtime["runtime_id"], reason))
         if current is not None:
             current["ready_mailbox"] = []
             current["deferred_mailbox"] = []
-    if (
-        disposition == DispositionCode.HANDLED.value
-        and target_runtime_id in live
-        and live[target_runtime_id]["status"] == "running"
-    ):
-        for deferred_entry in list(deferred):
-            if not _structurally_deferred(
-                restored.bundle, state, target_runtime_id, deferred_entry["envelope"]["event"]
-            ):
-                deferred.remove(deferred_entry)
-                deferred_entry["queue_sequence"] = encoded["next_queue_sequence"]
-                encoded["next_queue_sequence"] = str(int(encoded["next_queue_sequence"]) + 1)
-                ready.append(deferred_entry)
-        runtime = next(
-            item for item in encoded["runtimes"] if item["runtime_id"] == target_runtime_id
-        )
-        runtime["ready_mailbox"] = ready
-        runtime["deferred_mailbox"] = deferred
     emissions = _enqueue_emissions(
         encoded,
         before,
@@ -749,6 +823,27 @@ def step_aggregate_v2(
         cast(list[Mapping[str, Any]], result["emissions"]),
         lifecycle,
     )
+    if (
+        disposition == DispositionCode.HANDLED.value
+        and target_runtime_id in live
+        and live[target_runtime_id]["status"] == "running"
+    ):
+        runtime = next(
+            item for item in encoded["runtimes"] if item["runtime_id"] == target_runtime_id
+        )
+        current_ready = runtime["ready_mailbox"]
+        current_deferred = runtime["deferred_mailbox"]
+        for deferred_entry in list(current_deferred):
+            if not _structurally_deferred(
+                restored.bundle,
+                state,
+                target_runtime_id,
+                deferred_entry["envelope"]["event"],
+            ):
+                current_deferred.remove(deferred_entry)
+                deferred_entry["queue_sequence"] = encoded["next_queue_sequence"]
+                encoded["next_queue_sequence"] = str(int(encoded["next_queue_sequence"]) + 1)
+                current_ready.append(deferred_entry)
     encoded = seal_aggregate_v2(encoded)
     result_fault = result.get("fault")
     if isinstance(result_fault, dict):
@@ -882,9 +977,8 @@ def migrate_aggregate_v2(
     candidate = _upgrade_document(migration.aggregate_envelope)
     candidate["next_acceptance_sequence"] = restored.aggregate_envelope["next_acceptance_sequence"]
     candidate["next_queue_sequence"] = restored.aggregate_envelope["next_queue_sequence"]
-    source_runtimes = {
-        runtime["runtime_id"]: runtime for runtime in restored.aggregate_envelope["runtimes"]
-    }
+    source_runtimes = restored.aggregate_envelope["runtimes"]
+    target_runtimes = {runtime["runtime_id"]: runtime for runtime in candidate["runtimes"]}
     dispositions: list[dict[str, Any]] = []
     target_bundle_source = artifact_resolver.resolve_definition(target_validated_bundle_fingerprint)
     if target_bundle_source is None:
@@ -894,27 +988,20 @@ def migrate_aggregate_v2(
         if isinstance(target_bundle_source, Bundle)
         else load_bundle(target_bundle_source)
     )
-    for runtime in candidate["runtimes"]:
-        source_runtime = source_runtimes[runtime["runtime_id"]]
-        ready: list[dict[str, Any]] = []
-        deferred: list[dict[str, Any]] = []
-        for mailbox, output in (
-            (source_runtime["ready_mailbox"], ready),
-            (source_runtime["deferred_mailbox"], deferred),
-        ):
-            for entry in mailbox:
-                rule = next(
-                    (
-                        _queue_rule(descriptor, runtime, entry)
-                        for descriptor in descriptors
-                        if _queue_rule(descriptor, runtime, entry) is not None
-                    ),
-                    None,
-                )
-                if rule is not None and rule["action"] == "dispose":
-                    descriptor = next(
-                        item for item in descriptors if rule in item["queued_event_rules"]
-                    )
+    target_state = restore_aggregate(_project_v1(candidate), artifact_resolver).state
+    for source_runtime in source_runtimes:
+        runtime = target_runtimes.get(source_runtime["runtime_id"])
+        for mailbox_name in ("ready_mailbox", "deferred_mailbox"):
+            output = runtime[mailbox_name] if runtime is not None else None
+            for entry in source_runtime[mailbox_name]:
+                matching_rule: tuple[dict[str, Any], Mapping[str, Any]] | None = None
+                for descriptor in descriptors:
+                    rule = _queue_rule(descriptor, source_runtime, entry)
+                    if rule is not None:
+                        matching_rule = (descriptor, rule)
+                        break
+                if matching_rule is not None and matching_rule[1]["action"] == "dispose":
+                    descriptor, rule = matching_rule
                     dispositions.append(
                         {
                             "disposition": "migration_disposed",
@@ -925,16 +1012,28 @@ def migrate_aggregate_v2(
                         }
                     )
                     continue
-                if not _queue_compatible(target_bundle, runtime, entry):
+                if runtime is None or not _queue_compatible(target_bundle, runtime, entry):
                     raise ArtifactError(PersistenceFailureCode.MIGRATION_TOTALITY_FAILURE)
+                assert output is not None
                 output.append(copy.deepcopy(entry))
-        runtime["ready_mailbox"] = ready
-        runtime["deferred_mailbox"] = deferred
-        capacity = _runtime_capacity(
-            target_bundle,
-            restore_aggregate(_project_v1(candidate), artifact_resolver).state,
-            runtime["runtime_id"],
-        )
+    for runtime in candidate["runtimes"]:
+        ready = runtime["ready_mailbox"]
+        deferred = runtime["deferred_mailbox"]
+        if _runtime_is_runnable(target_state, runtime["runtime_id"]):
+            for entry in list(deferred):
+                if not _structurally_deferred(
+                    target_bundle,
+                    target_state,
+                    runtime["runtime_id"],
+                    entry["envelope"]["event"],
+                ):
+                    deferred.remove(entry)
+                    entry["queue_sequence"] = candidate["next_queue_sequence"]
+                    candidate["next_queue_sequence"] = str(
+                        int(candidate["next_queue_sequence"]) + 1
+                    )
+                    ready.append(entry)
+        capacity = _runtime_capacity(target_bundle, target_state, runtime["runtime_id"])
         if capacity is not None and len(deferred) > capacity:
             raise ArtifactError(PersistenceFailureCode.MIGRATION_TOTALITY_FAILURE)
     candidate = seal_aggregate_v2(candidate)

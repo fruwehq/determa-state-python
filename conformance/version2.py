@@ -10,7 +10,15 @@ from typing import Any
 
 import yaml
 
-from determa.state import ArtifactError, MemoryArtifactResolver, load_bundle
+from determa.state import (
+    ArtifactError,
+    ExecutionHost,
+    MemoryArtifactResolver,
+    MemoryExecutionStore,
+    load_bundle,
+    restore_aggregate_package,
+    serialize_execution_checkpoint,
+)
 from determa.state.checkpoint_v2 import (
     admit_checkpoint_v2,
     prune_checkpoint_v2,
@@ -108,7 +116,7 @@ def _invoke(item: Version2Vector, request: dict[str, Any]) -> Any:
             request["root_instance_id"],
             request["creation_id"],
             request["bindings"],
-        )
+        )["state"]
     if operation == "admit_v2":
         return admit_aggregate_v2(before, request["deliveries"], resolver)
     if operation == "step_v2":
@@ -153,20 +161,35 @@ def _invoke(item: Version2Vector, request: dict[str, Any]) -> Any:
         )
     if operation == "checkpoint_v1_accept":
         assert bundle is not None
-        if any(
-            "deferred_events" in node
-            for machine in bundle.raw["machines"]
-            for node in _state_nodes(machine["root"])
-        ):
-            raise ArtifactError("checkpoint_upgrade_required")
+        delivery = request["deliveries"][0]
+        envelope = {
+            key: copy.deepcopy(value)
+            for key, value in delivery["envelope"].items()
+            if key not in {"cause_id", "source"}
+        }
+        candidate = {
+            "root_instance_id": before["root_instance_id"],
+            "delivery_mode": delivery["delivery_mode"],
+            "origin": {"kind": "host_input"},
+            "envelope": envelope,
+        }
+        host = ExecutionHost(
+            MemoryExecutionStore(
+                {before["root_instance_id"]: serialize_execution_checkpoint(before)}
+            ),
+            resolver,
+        )
+        result = host.accept_delivery(
+            before["root_instance_id"],
+            candidate,
+            expected_revision=request["expected_revision"],
+            expected_checkpoint_digest=request["expected_checkpoint_digest"],
+            selected_bundle=bundle,
+        )
+        if result["result"] == "not_accepted":
+            raise ArtifactError(result["failure"]["code"])
+        return result
     raise AssertionError(f"unsupported version-2 operation: {operation}")
-
-
-def _state_nodes(root: dict[str, Any]) -> list[dict[str, Any]]:
-    result = [root]
-    for child in (root.get("states") or {}).values():
-        result.extend(_state_nodes(child))
-    return result
 
 
 def run_version2_vector(item: Version2Vector) -> None:
@@ -204,9 +227,10 @@ def validate_version2_artifact(path: Path, artifact: dict[str, Any]) -> None:
                 assert restored.canonical_bytes == source
         elif artifact["kind"] == "execution_checkpoint_v2":
             restore_execution_checkpoint_v2(source, resolver)
+        elif artifact["kind"] == "aggregate_state_package_v2":
+            restore_aggregate_package(source, resolver)
         elif artifact["kind"] in {
             "migration_descriptor_v2",
-            "aggregate_state_package_v2",
             "core_step_result_v2",
         }:
             load_json_artifact(source, artifact["kind"])
