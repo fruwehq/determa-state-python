@@ -62,7 +62,7 @@ def test_suite_present() -> None:
     assert CORE_DIR.exists(), "pinned conformance suite is unavailable"
     assert len(core_cases()) == 114
     assert len(execution_checkpoint_vectors()) == 99
-    assert len(version2_vectors()) == 103
+    assert len(version2_vectors()) == 104
 
 
 def test_portable_code_sets_match_authoritative_registry() -> None:
