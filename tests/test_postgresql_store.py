@@ -118,6 +118,41 @@ def test_postgresql_cas_and_shared_native_transaction() -> None:
             value = value.decode("ascii")
         assert value == "shared-root"
 
+    host.create_v2(
+        load_bundle(MACHINE),
+        "counter",
+        "migration-root",
+        "migration-root-create",
+        {},
+    )
+    migration_checkpoint = host.read_checkpoint("migration-root")
+    assert migration_checkpoint is not None
+    migration_aggregate = migration_checkpoint.document["root_record"][
+        "aggregate_state"
+    ]
+
+    def migrate_callback(connection, execution) -> None:
+        connection.execute(
+            f"INSERT INTO {application_table} (root_instance_id) VALUES (%s)",
+            ("migration-root",),
+        )
+        staged = execution.maintenance_migration_v2(
+            "postgresql-empty-migration",
+            migration_aggregate["validated_bundle_fingerprint"],
+            [],
+            expected_revision=migration_checkpoint.document["revision"],
+            expected_checkpoint_digest=migration_checkpoint.document[
+                "execution_checkpoint_digest"
+            ],
+        )
+        assert staged == StagedExecutionResult("maintenance_migration_v2")
+
+    migration_result = host.run_shared_transaction(
+        "migration-root", migrate_callback
+    )
+    assert migration_result["receipt"]["result_code"] == "migration_no_operation"
+    assert host.read_checkpoint("migration-root").document["revision"] == "1"
+
     def rollback_callback(connection, execution) -> None:
         connection.execute(
             f"INSERT INTO {application_table} (root_instance_id) VALUES (%s)",

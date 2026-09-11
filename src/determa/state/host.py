@@ -933,6 +933,7 @@ class ExecutionHost:
     def maintenance_migration_v2(
         self,
         root_instance_id: str,
+        operation_id: str,
         target_validated_bundle_fingerprint: str,
         migration_descriptor_digest_route: Sequence[str],
         *,
@@ -941,19 +942,49 @@ class ExecutionHost:
         maintenance_mode: bool = True,
         limits: MigrationLimits | None = None,
     ) -> dict[str, Any]:
-        """Migrate a v2 aggregate and all queue ownership in one transaction."""
+        """Commit one keyed v2 aggregate migration and its durable receipt."""
         from .checkpoint_v2 import _synchronize_mailbox_references
         from .queueing import migrate_aggregate_v2
 
+        if not operation_id:
+            raise ExecutionHostError(PersistenceCode.INVALID_MIGRATION_REQUEST)
         with self._transaction(root_instance_id) as transaction:
             source = transaction.load()
             if source is None:
                 raise ExecutionHostError(PreAcceptanceCode.WRONG_ROOT)
             prior = self._restore(source, root_instance_id).document
-            self._check_expected(prior, expected_revision, expected_checkpoint_digest)
+            for receipt in prior["operation_receipts"]:
+                if (
+                    receipt["operation_kind"] == "maintenance_migration"
+                    and receipt["operation_id"] == operation_id
+                ):
+                    replay_digest = maintenance_migration_request_digest(
+                        root_instance_id,
+                        operation_id,
+                        receipt["source_aggregate_state_digest"],
+                        target_validated_bundle_fingerprint,
+                        migration_descriptor_digest_route,
+                        maintenance_mode,
+                    )
+                    if receipt["request_digest"] == replay_digest:
+                        return {
+                            "result": "committed",
+                            "receipt": copy.deepcopy(receipt),
+                        }
+                    raise ExecutionHostError(HostCode.OPERATION_ID_CONFLICT)
             aggregate = prior["root_record"].get("aggregate_state")
             if aggregate is None:
                 raise ExecutionHostError(PreAcceptanceCode.TOMBSTONED_ROOT)
+            self._check_expected(prior, expected_revision, expected_checkpoint_digest)
+            source_aggregate_state_digest = aggregate["aggregate_state_digest"]
+            request_digest = maintenance_migration_request_digest(
+                root_instance_id,
+                operation_id,
+                source_aggregate_state_digest,
+                target_validated_bundle_fingerprint,
+                migration_descriptor_digest_route,
+                maintenance_mode,
+            )
             migration = migrate_aggregate_v2(
                 aggregate,
                 target_validated_bundle_fingerprint,
@@ -969,6 +1000,31 @@ class ExecutionHost:
             candidate["migration_audit_records"].extend(
                 copy.deepcopy(migration["audit_records"])
             )
+            receipt_sequence = candidate["next_operation_receipt_sequence"]
+            candidate["next_operation_receipt_sequence"] = (
+                _increment_checkpoint_number(receipt_sequence)
+            )
+            migration_sequences = [
+                item["migration_sequence"] for item in migration["audit_records"]
+            ]
+            receipt = {
+                "operation_kind": "maintenance_migration",
+                "receipt_sequence": receipt_sequence,
+                "operation_id": operation_id,
+                "request_digest": request_digest,
+                "committed_revision": candidate["revision"],
+                "source_aggregate_state_digest": source_aggregate_state_digest,
+                "resulting_aggregate_state_digest": migrated[
+                    "aggregate_state_digest"
+                ],
+                "migration_sequences": migration_sequences,
+                "result_code": (
+                    "migration_applied"
+                    if migration_sequences
+                    else "migration_no_operation"
+                ),
+            }
+            candidate["operation_receipts"].append(receipt)
             for entry, disposition in zip(
                 migration["_disposed_entries"],
                 migration["dispositions"],
@@ -993,7 +1049,7 @@ class ExecutionHost:
             candidate = seal_execution_checkpoint(candidate)
             self._stage_replace(transaction, prior, candidate)
         self._after_commit()
-        return candidate
+        return {"result": "committed", "receipt": copy.deepcopy(receipt)}
 
     def tombstone_root_v2(
         self,
@@ -1456,14 +1512,14 @@ class ExecutionHost:
                     raise ExecutionHostError(HostCode.OPERATION_ID_CONFLICT)
             if restored.aggregate is None:
                 raise ExecutionHostError(PreAcceptanceCode.TOMBSTONED_ROOT)
+            self._check_expected(
+                checkpoint, expected_revision, expected_checkpoint_digest
+            )
             current_source_digest = restored.aggregate.aggregate_envelope[
                 "aggregate_state_digest"
             ]
             if source_aggregate_state_digest != current_source_digest:
                 raise ExecutionHostError(PersistenceCode.INVALID_MIGRATION_REQUEST)
-            self._check_expected(
-                checkpoint, expected_revision, expected_checkpoint_digest
-            )
             result = migrate_aggregate(
                 restored.aggregate.aggregate_envelope,
                 target_validated_bundle_fingerprint,
@@ -1976,6 +2032,31 @@ class SharedExecutionTransaction:
                 self.root_instance_id,
                 creation_id,
                 bindings,
+            ),
+        )
+
+    def maintenance_migration_v2(
+        self,
+        operation_id: str,
+        target_validated_bundle_fingerprint: str,
+        migration_descriptor_digest_route: Sequence[str],
+        *,
+        expected_revision: str,
+        expected_checkpoint_digest: str,
+        maintenance_mode: bool = True,
+        limits: MigrationLimits | None = None,
+    ) -> StagedExecutionResult:
+        return self._stage(
+            "maintenance_migration_v2",
+            lambda: self._host.maintenance_migration_v2(
+                self.root_instance_id,
+                operation_id,
+                target_validated_bundle_fingerprint,
+                migration_descriptor_digest_route,
+                expected_revision=expected_revision,
+                expected_checkpoint_digest=expected_checkpoint_digest,
+                maintenance_mode=maintenance_mode,
+                limits=limits,
             ),
         )
 

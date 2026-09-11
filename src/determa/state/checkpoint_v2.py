@@ -15,7 +15,11 @@ from .checkpoint import (
 )
 from .codes import CheckpointArtifactFailureCode, CheckpointHostFailureCode
 from .errors import ArtifactError
-from .host import creation_request_digest, delivery_request_digest
+from .host import (
+    creation_request_digest,
+    delivery_request_digest,
+    maintenance_migration_request_digest,
+)
 from .queueing import (
     _entry_digest,
     _runtime_id_for_target,
@@ -108,6 +112,8 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
         raise _invalid()
     cutoff_value = document["replay_retention"]["pruned_through_receipt_sequence"]
     cutoff = decimal(cutoff_value) if cutoff_value is not None else None
+    if cutoff is not None and cutoff >= next_receipt:
+        raise _invalid()
     first_retained = 1 if cutoff is None else cutoff + 1
     if len(sequences) != 1 + max(0, next_receipt - first_retained):
         raise _invalid()
@@ -550,6 +556,129 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
                 sequence > decimal(aggregate["migration_sequence"]) for sequence in audit_sequences
             )
         )
+    ):
+        raise _invalid()
+
+    audit_by_sequence = {item["migration_sequence"]: item for item in audits}
+    root_runtime_id = (
+        aggregate["root_runtime_id"] if aggregate is not None else root["root_runtime_id"]
+    )
+    if any(item["root_runtime_id"] != root_runtime_id for item in audits):
+        raise _invalid()
+    if aggregate is not None and audit_sequences and max(audit_sequences) > decimal(
+        aggregate["migration_sequence"]
+    ):
+        raise _invalid()
+
+    fingerprints_by_aggregate_digest: dict[str, set[str]] = {}
+
+    def remember_fingerprint(aggregate_digest: str, fingerprint: str) -> None:
+        fingerprints_by_aggregate_digest.setdefault(aggregate_digest, set()).add(
+            fingerprint
+        )
+
+    for audit in audits:
+        remember_fingerprint(
+            audit["source_aggregate_state_digest"],
+            audit["source_validated_bundle_fingerprint"],
+        )
+        remember_fingerprint(
+            audit["target_aggregate_state_digest"],
+            audit["target_validated_bundle_fingerprint"],
+        )
+    if aggregate is not None:
+        remember_fingerprint(
+            aggregate["aggregate_state_digest"],
+            aggregate["validated_bundle_fingerprint"],
+        )
+        identity_fingerprint = next(
+            runtime
+            for runtime in aggregate["runtimes"]
+            if runtime["relation"]["kind"] == "root"
+        )["identity_origin"]["definition"]["validated_bundle_fingerprint"]
+        remember_fingerprint(
+            legacy_creation["resulting_aggregate_state_digest"], identity_fingerprint
+        )
+
+    operation_ids: set[str] = set()
+    referenced_audit_sequences: list[str] = []
+    for receipt in receipts:
+        if receipt["operation_kind"] != "maintenance_migration":
+            continue
+        operation_id = receipt["operation_id"]
+        committed_revision = decimal(receipt["committed_revision"])
+        if (
+            operation_id in operation_ids
+            or committed_revision == 0
+            or committed_revision > revision
+        ):
+            raise _invalid()
+        operation_ids.add(operation_id)
+        sequences_for_receipt = receipt["migration_sequences"]
+        selected = [audit_by_sequence.get(sequence) for sequence in sequences_for_receipt]
+        if any(item is None for item in selected):
+            raise _invalid()
+        linked = [item for item in selected if item is not None]
+        referenced_audit_sequences.extend(sequences_for_receipt)
+        if receipt["result_code"] == "migration_no_operation":
+            if (
+                sequences_for_receipt
+                or receipt["source_aggregate_state_digest"]
+                != receipt["resulting_aggregate_state_digest"]
+            ):
+                raise _invalid()
+            fingerprints = fingerprints_by_aggregate_digest.get(
+                receipt["source_aggregate_state_digest"], set()
+            )
+            if len(fingerprints) != 1:
+                raise _invalid()
+            target_fingerprint = next(iter(fingerprints))
+            descriptor_route: list[str] = []
+        else:
+            if (
+                not linked
+                or [item["migration_sequence"] for item in linked]
+                != sequences_for_receipt
+                or any(
+                    decimal(right["migration_sequence"])
+                    != decimal(left["migration_sequence"]) + 1
+                    for left, right in zip(linked, linked[1:], strict=False)
+                )
+                or linked[0]["source_aggregate_state_digest"]
+                != receipt["source_aggregate_state_digest"]
+                or linked[-1]["target_aggregate_state_digest"]
+                != receipt["resulting_aggregate_state_digest"]
+                or any(
+                    left["target_aggregate_state_digest"]
+                    != right["source_aggregate_state_digest"]
+                    or left["target_validated_bundle_fingerprint"]
+                    != right["source_validated_bundle_fingerprint"]
+                    for left, right in zip(linked, linked[1:], strict=False)
+                )
+            ):
+                raise _invalid()
+            target_fingerprint = linked[-1]["target_validated_bundle_fingerprint"]
+            descriptor_route = [item["migration_descriptor_digest"] for item in linked]
+        possible_request_digests = {
+            maintenance_migration_request_digest(
+                document["root_instance_id"],
+                operation_id,
+                receipt["source_aggregate_state_digest"],
+                target_fingerprint,
+                descriptor_route,
+                maintenance_mode,
+            )
+            for maintenance_mode in (False, True)
+        }
+        if receipt["request_digest"] not in possible_request_digests:
+            raise _invalid()
+    if len(referenced_audit_sequences) != len(set(referenced_audit_sequences)):
+        raise _invalid()
+    referenced_audits = set(referenced_audit_sequences)
+    available_audits = set(audit_by_sequence)
+    if not referenced_audits.issubset(available_audits) or (
+        document["replay_retention"]["mode"] == "permanent"
+        and referenced_audits != available_audits
     ):
         raise _invalid()
 
@@ -1317,6 +1446,17 @@ def prune_checkpoint_v2(
                 }
             )
     candidate["operation_receipts"] = retained
+    referenced_migrations = {
+        sequence
+        for receipt in retained
+        if receipt["operation_kind"] == "maintenance_migration"
+        for sequence in receipt["migration_sequences"]
+    }
+    candidate["migration_audit_records"] = [
+        audit
+        for audit in candidate["migration_audit_records"]
+        if audit["migration_sequence"] in referenced_migrations
+    ]
     candidate["event_identity_tombstones"] = sorted(
         tombstones, key=lambda item: int(item["terminal_receipt_sequence"])
     )

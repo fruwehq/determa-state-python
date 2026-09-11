@@ -31,7 +31,7 @@ SCHEMAS = (
     "execution-checkpoint-v2.schema.json",
     "core-step-result-v2.schema.json",
 )
-SPEC_COMMIT = "2e33036563cb966b07124197db672159b4b7e1f4"
+SPEC_COMMIT = "e22f9db295d632f3f46a9d1260c63b5af92efa7e"
 
 
 def _fetch(name: str) -> str:

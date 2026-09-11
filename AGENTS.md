@@ -11,10 +11,10 @@ package so it can coexist with the umbrella `determa` launcher.
 The implementation is conformant only when it passes the language-neutral suite.
 The implementation uses these immutable inputs:
 
-- specification: `2e33036563cb966b07124197db672159b4b7e1f4`;
-- conformance: `531468c59c7a2dc32f5cbe92cfabf89805d27f6a` (114 core cases,
-  108 persistence vectors, 12 persistence-profile steps, 99 execution-checkpoint
-  vectors, 106 version-2 vectors, and 101 closed-code registry entries).
+- specification: `e22f9db295d632f3f46a9d1260c63b5af92efa7e`;
+- conformance: `8f6a4d9101fd6554e9a51da72ca48160368d4e83` (114 core cases,
+  108 persistence vectors, 12 persistence-profile steps, 102 execution-checkpoint
+  vectors, 113 version-2 vectors, and 164 generated version-2 artifacts).
 
 The package metadata remains `0.2.0`.
 

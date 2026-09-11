@@ -14,6 +14,7 @@ import yaml
 from determa.state import (
     ArtifactError,
     ExecutionHost,
+    ExecutionHostError,
     MemoryArtifactResolver,
     MemoryExecutionStore,
     load_bundle,
@@ -166,6 +167,26 @@ def _invoke(item: Version2Vector, request: dict[str, Any]) -> Any:
             expected_revision=request["expected_revision"],
             expected_checkpoint_digest=request["expected_checkpoint_digest"],
         )
+    if operation == "checkpoint_migrate_v2":
+        store = MemoryExecutionStore(
+            {before["root_instance_id"]: serialize_execution_checkpoint(before)}
+        )
+        host = ExecutionHost(store, resolver)
+        result = host.maintenance_migration_v2(
+            before["root_instance_id"],
+            request["operation_id"],
+            request["target_bundle"]["validated_bundle_fingerprint"],
+            request["migration_descriptor_digest_route"],
+            expected_revision=request["expected_revision"],
+            expected_checkpoint_digest=request["expected_checkpoint_digest"],
+            maintenance_mode=request["maintenance_mode"],
+        )
+        expected_after = vector.get("checkpoint_after")
+        if expected_after is not None:
+            restored = host.read_checkpoint(before["root_instance_id"])
+            assert restored is not None
+            assert restored.document == _json(path / expected_after)
+        return result
     if operation == "checkpoint_v1_accept":
         assert bundle is not None
         delivery = request["deliveries"][0]
@@ -208,7 +229,7 @@ def run_version2_vector(item: Version2Vector) -> None:
     try:
         actual = _invoke(item, request)
         code = None
-    except ArtifactError as error:
+    except (ArtifactError, ExecutionHostError) as error:
         actual = None
         code = error.code
     expected = vector["expect"]

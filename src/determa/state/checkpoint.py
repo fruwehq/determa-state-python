@@ -423,9 +423,14 @@ def _validate_audit_and_root(
     ):
         raise _invalid()
     audit_by_sequence = {item["migration_sequence"]: item for item in audits}
+    operation_ids: set[str] = set()
     for receipt in document["operation_receipts"]:
         if receipt["operation_kind"] != "maintenance_migration":
             continue
+        operation_id = receipt["operation_id"]
+        if operation_id in operation_ids:
+            raise _invalid()
+        operation_ids.add(operation_id)
         linked = [
             audit_by_sequence[sequence]
             for sequence in receipt["migration_sequences"]
@@ -433,8 +438,33 @@ def _validate_audit_and_root(
         ]
         if len(linked) != len(receipt["migration_sequences"]):
             raise _invalid()
-        if linked and (
-            linked[0]["source_aggregate_state_digest"]
+        if receipt["result_code"] == "migration_no_operation":
+            if (
+                linked
+                or receipt["source_aggregate_state_digest"]
+                != receipt["resulting_aggregate_state_digest"]
+            ):
+                raise _invalid()
+            if (
+                root_record["status"] != "retained"
+                or root_record["aggregate_state"]["aggregate_state_digest"]
+                != receipt["resulting_aggregate_state_digest"]
+            ):
+                continue
+            target_fingerprint = root_record["aggregate_state"][
+                "validated_bundle_fingerprint"
+            ]
+            descriptor_route: list[str] = []
+        elif (
+            not linked
+            or [item["migration_sequence"] for item in linked]
+            != receipt["migration_sequences"]
+            or any(
+                _decimal(right["migration_sequence"])
+                != _decimal(left["migration_sequence"]) + 1
+                for left, right in zip(linked, linked[1:], strict=False)
+            )
+            or linked[0]["source_aggregate_state_digest"]
             != receipt["source_aggregate_state_digest"]
             or linked[-1]["target_aggregate_state_digest"]
             != receipt["resulting_aggregate_state_digest"]
@@ -444,6 +474,26 @@ def _validate_audit_and_root(
                 for left, right in zip(linked, linked[1:], strict=False)
             )
         ):
+            raise _invalid()
+        else:
+            target_fingerprint = linked[-1]["target_validated_bundle_fingerprint"]
+            descriptor_route = [item["migration_descriptor_digest"] for item in linked]
+        possible_request_digests = {
+            hash_value(
+                [
+                    "determa-maintenance-migration-request-digest-1",
+                    "1",
+                    root_instance_id,
+                    operation_id,
+                    receipt["source_aggregate_state_digest"],
+                    target_fingerprint,
+                    descriptor_route,
+                    maintenance_mode,
+                ]
+            )
+            for maintenance_mode in (False, True)
+        }
+        if receipt["request_digest"] not in possible_request_digests:
             raise _invalid()
 
     final_digest = (

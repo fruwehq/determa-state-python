@@ -8,6 +8,7 @@ import pytest
 from determa.state import (
     ArtifactError,
     ExecutionHost,
+    ExecutionHostError,
     MemoryArtifactResolver,
     MemoryExecutionStore,
     admit_aggregate_v2,
@@ -18,6 +19,7 @@ from determa.state import (
     downgrade_aggregate_v2_to_v1,
     load_bundle,
     migrate_aggregate_v2,
+    prune_checkpoint_v2,
     restore_aggregate_package,
     restore_aggregate_v2,
     restore_execution_checkpoint_v2,
@@ -819,6 +821,7 @@ def test_migration_structurally_recalls_with_fresh_queue_sequence() -> None:
     )
     host.maintenance_migration_v2(
         "host-root",
+        "recall-host-migration",
         target.fingerprint,
         [descriptor["migration_descriptor_digest"]],
         expected_revision=checkpoint["revision"],
@@ -1561,6 +1564,7 @@ def test_host_v2_empty_route_maintenance_migration_commits_no_operation() -> Non
 
     result = host.maintenance_migration_v2(
         "root",
+        "empty-route",
         bundle.fingerprint,
         [],
         expected_revision=checkpoint["revision"],
@@ -1568,12 +1572,178 @@ def test_host_v2_empty_route_maintenance_migration_commits_no_operation() -> Non
         maintenance_mode=False,
     )
 
-    assert int(result["revision"]) == int(checkpoint["revision"]) + 1
-    assert result["root_record"]["aggregate_state"] == checkpoint["root_record"][
+    migrated = host.read_checkpoint("root").document
+    assert result["result"] == "committed"
+    assert result["receipt"]["result_code"] == "migration_no_operation"
+    assert int(migrated["revision"]) == int(checkpoint["revision"]) + 1
+    assert migrated["root_record"]["aggregate_state"] == checkpoint["root_record"][
         "aggregate_state"
     ]
-    assert result["migration_audit_records"] == checkpoint["migration_audit_records"]
-    assert host.read_checkpoint("root").document == result
+    assert migrated["migration_audit_records"] == checkpoint["migration_audit_records"]
+
+
+def test_host_v2_migration_replay_precedes_cas_and_conflict_is_total() -> None:
+    bundle = _bundle()
+    resolver = _resolver(bundle)
+    checkpoint = create_checkpoint_v2(bundle, "machine", "root", "create", {})
+    store = MemoryExecutionStore(
+        {"root": serialize_execution_checkpoint(checkpoint)}
+    )
+    host = ExecutionHost(store, resolver)
+
+    committed = host.maintenance_migration_v2(
+        "root",
+        "keyed-empty",
+        bundle.fingerprint,
+        [],
+        expected_revision=checkpoint["revision"],
+        expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+    )
+    committed_checkpoint = host.read_checkpoint("root").document
+
+    replay = host.maintenance_migration_v2(
+        "root",
+        "keyed-empty",
+        bundle.fingerprint,
+        [],
+        expected_revision=checkpoint["revision"],
+        expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+    )
+    assert replay == committed
+    assert host.read_checkpoint("root").document == committed_checkpoint
+
+    with pytest.raises(ExecutionHostError, match="operation_id_conflict"):
+        host.maintenance_migration_v2(
+            "root",
+            "keyed-empty",
+            "sha256:" + ("1" * 64),
+            [],
+            expected_revision=checkpoint["revision"],
+            expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+        )
+    with pytest.raises(ExecutionHostError, match="checkpoint_revision_conflict"):
+        host.maintenance_migration_v2(
+            "root",
+            "new-operation",
+            bundle.fingerprint,
+            [],
+            expected_revision=checkpoint["revision"],
+            expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+        )
+    assert host.read_checkpoint("root").document == committed_checkpoint
+
+
+def test_host_v2_migration_recovers_exact_receipt_after_response_loss() -> None:
+    bundle = _bundle()
+    resolver = _resolver(bundle)
+    checkpoint = create_checkpoint_v2(bundle, "machine", "root", "create", {})
+    store = MemoryExecutionStore(
+        {"root": serialize_execution_checkpoint(checkpoint)}
+    )
+
+    def lose_response(boundary: str) -> None:
+        if boundary == "after_commit_before_response":
+            raise ExecutionHostError("response_lost_after_commit")
+
+    first = ExecutionHost(store, resolver, fault_injector=lose_response)
+    with pytest.raises(ExecutionHostError, match="response_lost_after_commit"):
+        first.maintenance_migration_v2(
+            "root",
+            "lost-response",
+            bundle.fingerprint,
+            [],
+            expected_revision=checkpoint["revision"],
+            expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+        )
+    committed_checkpoint = ExecutionHost(store, resolver).read_checkpoint("root")
+    assert committed_checkpoint is not None
+
+    replay = ExecutionHost(store, resolver).maintenance_migration_v2(
+        "root",
+        "lost-response",
+        bundle.fingerprint,
+        [],
+        expected_revision=checkpoint["revision"],
+        expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+    )
+    assert replay["receipt"] == committed_checkpoint.document["operation_receipts"][-1]
+    assert ExecutionHost(store, resolver).read_checkpoint("root") == committed_checkpoint
+
+def test_restore_v2_rejects_resealed_maintenance_receipt_digest() -> None:
+    bundle = _bundle()
+    resolver = _resolver(bundle)
+    checkpoint = create_checkpoint_v2(bundle, "machine", "root", "create", {})
+    host = ExecutionHost(
+        MemoryExecutionStore({"root": serialize_execution_checkpoint(checkpoint)}),
+        resolver,
+    )
+    host.maintenance_migration_v2(
+        "root",
+        "keyed-empty",
+        bundle.fingerprint,
+        [],
+        expected_revision=checkpoint["revision"],
+        expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+    )
+    forged = copy.deepcopy(host.read_checkpoint("root").document)
+    forged["operation_receipts"][-1]["request_digest"] = "sha256:" + ("0" * 64)
+    forged = seal_execution_checkpoint(forged)
+
+    with pytest.raises(ArtifactError, match="invalid_execution_checkpoint"):
+        restore_execution_checkpoint_v2(forged, resolver)
+
+    future_revision = copy.deepcopy(host.read_checkpoint("root").document)
+    future_revision["operation_receipts"][-1]["committed_revision"] = "2"
+    future_revision = seal_execution_checkpoint(future_revision)
+    with pytest.raises(ArtifactError, match="invalid_execution_checkpoint"):
+        restore_execution_checkpoint_v2(future_revision, resolver)
+
+
+def test_bounded_v2_pruning_removes_migration_receipt_and_owned_audit() -> None:
+    source = _bundle()
+    target_document = copy.deepcopy(source.raw)
+    target_document["events"]["extra"] = {"direction": "input"}
+    target = load_bundle(target_document)
+    descriptor = _compatible_v2_descriptor(source, target)
+    resolver = MemoryArtifactResolver(
+        definitions={source.fingerprint: source, target.fingerprint: target},
+        migration_descriptors={descriptor["migration_descriptor_digest"]: descriptor},
+    )
+    checkpoint = create_checkpoint_v2(source, "machine", "root", "create", {})
+    checkpoint["replay_retention"] = {
+        "mode": "bounded",
+        "permanent_replay_eligible": False,
+        "pruned_through_receipt_sequence": None,
+        "policy_identifier": "bounded-test-v1",
+    }
+    checkpoint = seal_execution_checkpoint(checkpoint)
+    host = ExecutionHost(
+        MemoryExecutionStore({"root": serialize_execution_checkpoint(checkpoint)}),
+        resolver,
+    )
+    host.maintenance_migration_v2(
+        "root",
+        "one-hop",
+        target.fingerprint,
+        [descriptor["migration_descriptor_digest"]],
+        expected_revision=checkpoint["revision"],
+        expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+    )
+    migrated = host.read_checkpoint("root").document
+    assert len(migrated["migration_audit_records"]) == 1
+
+    pruned = prune_checkpoint_v2(
+        migrated,
+        "1",
+        resolver,
+        expected_revision=migrated["revision"],
+        expected_checkpoint_digest=migrated["execution_checkpoint_digest"],
+    )
+    assert [receipt["receipt_sequence"] for receipt in pruned["operation_receipts"]] == [
+        "0"
+    ]
+    assert pruned["migration_audit_records"] == []
+    restore_execution_checkpoint_v2(pruned, resolver)
 
 
 def test_multihop_migration_recalls_each_hop_and_host_appends_exact_audit() -> None:
@@ -1629,13 +1799,16 @@ def test_multihop_migration_recalls_each_hop_and_host_appends_exact_audit() -> N
         MemoryExecutionStore({"root": serialize_execution_checkpoint(checkpoint)}),
         resolver,
     )
-    migrated = host.maintenance_migration_v2(
+    response = host.maintenance_migration_v2(
         "root",
+        "multi-hop",
         target.fingerprint,
         [first["migration_descriptor_digest"], second["migration_descriptor_digest"]],
         expected_revision=checkpoint["revision"],
         expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
     )
+    assert response["result"] == "committed"
+    migrated = host.read_checkpoint("root").document
     runtime = migrated["root_record"]["aggregate_state"]["runtimes"][0]
     assert not runtime["deferred_mailbox"]
     assert int(runtime["ready_mailbox"][0]["queue_sequence"]) > int(old_queue)

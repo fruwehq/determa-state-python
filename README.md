@@ -4,10 +4,10 @@ Python implementation of [Determa State](https://github.com/fruwehq/determa-stat
 a language-agnostic statechart engine with a shared normative conformance suite.
 
 This implementation supports Determa State `format: 1` at specification
-commit `2e33036563cb966b07124197db672159b4b7e1f4`. Correctness is determined by
+commit `e22f9db295d632f3f46a9d1260c63b5af92efa7e`. Correctness is determined by
 the 114-case core suite, 108 persistence vectors, 12 persistence-profile steps,
-99 execution-checkpoint vectors, 106 version-2 vectors, and 101 closed-code registry
-entries at conformance commit `531468c59c7a2dc32f5cbe92cfabf89805d27f6a`.
+102 execution-checkpoint vectors, 113 version-2 vectors, and 164 generated version-2
+artifacts at conformance commit `8f6a4d9101fd6554e9a51da72ca48160368d4e83`.
 
 The package metadata remains `0.2.0`. The implementation includes the portable
 execution-checkpoint host, selected legacy artifact decoding, and authoritative portable

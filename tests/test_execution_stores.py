@@ -75,6 +75,44 @@ def test_shared_adapter_contract_round_trip(tmp_path: Path, index: int) -> None:
 
 
 @pytest.mark.parametrize("index", range(3))
+def test_adapters_commit_and_replay_keyed_v2_maintenance_receipts(
+    tmp_path: Path, index: int
+) -> None:
+    store = _factories(tmp_path)[index]()
+    store.setup_schema()
+    bundle = load_bundle(MACHINE)
+    host = ExecutionHost(store, _resolver())
+    host.create_v2(bundle, "counter", "root", "root-create", {})
+    checkpoint = host.read_checkpoint("root")
+    assert checkpoint is not None
+    aggregate = checkpoint.document["root_record"]["aggregate_state"]
+
+    committed = host.maintenance_migration_v2(
+        "root",
+        "adapter-empty-migration",
+        aggregate["validated_bundle_fingerprint"],
+        [],
+        expected_revision=checkpoint.document["revision"],
+        expected_checkpoint_digest=checkpoint.document[
+            "execution_checkpoint_digest"
+        ],
+    )
+    replay = host.maintenance_migration_v2(
+        "root",
+        "adapter-empty-migration",
+        aggregate["validated_bundle_fingerprint"],
+        [],
+        expected_revision=checkpoint.document["revision"],
+        expected_checkpoint_digest=checkpoint.document[
+            "execution_checkpoint_digest"
+        ],
+    )
+
+    assert replay == committed
+    assert host.read_checkpoint("root").document["revision"] == "1"
+
+
+@pytest.mark.parametrize("index", range(3))
 def test_store_transactions_reject_checkpoint_bytes_for_another_root(
     tmp_path: Path, index: int
 ) -> None:
