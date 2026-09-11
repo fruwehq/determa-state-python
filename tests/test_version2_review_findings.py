@@ -1041,6 +1041,156 @@ def test_aggregate_restore_validates_mailbox_envelope_semantics(case: str) -> No
         restore_aggregate_v2(aggregate, _resolver(bundle))
 
 
+@pytest.mark.parametrize("forgery", ["wrong_type", "missing_default"])
+def test_restore_aggregate_v2_rejects_resealed_noncanonical_payload(forgery: str) -> None:
+    bundle = load_bundle(
+        {
+            "format": 1,
+            "namespace": "tests.review83.payload_restore",
+            "events": {
+                "go": {
+                    "direction": "input",
+                    "payload": {
+                        "count": {"type": "int", "required": True},
+                        "label": {"type": "string", "default": "defaulted"},
+                    },
+                }
+            },
+            "machines": [
+                {"machine_id": "machine", "root": {"type": "simple", "on_events": {"go": {}}}}
+            ],
+        }
+    )
+    aggregate = _created(bundle)
+    delivery = _delivery(aggregate, "event")
+    delivery["envelope"]["payload"] = typed_value({"count": 1, "label": "defaulted"})
+    delivery["envelope_digest"] = _entry_digest(
+        aggregate["root_instance_id"], "input", delivery["envelope"]
+    )
+    admitted = admit_aggregate_v2(aggregate, [delivery], _resolver(bundle))
+    assert admitted["result"] == "accepted"
+    candidate = admitted["state"]
+    entry = candidate["runtimes"][0]["ready_mailbox"][0]
+    entry["envelope"]["payload"] = typed_value(
+        {"count": "1", "label": "defaulted"}
+        if forgery == "wrong_type"
+        else {"count": 1}
+    )
+    entry["envelope_digest"] = _entry_digest(
+        candidate["root_instance_id"], entry["delivery_mode"], entry["envelope"]
+    )
+    candidate = seal_aggregate_v2(candidate)
+
+    with pytest.raises(ArtifactError, match="invalid_aggregate_state"):
+        restore_aggregate_v2(candidate, _resolver(bundle))
+
+
+def test_admission_rejects_payload_that_would_materialize_a_default() -> None:
+    bundle = load_bundle(
+        {
+            "format": 1,
+            "namespace": "tests.review83.payload_admission",
+            "events": {
+                "go": {
+                    "direction": "input",
+                    "payload": {"label": {"type": "string", "default": "defaulted"}},
+                }
+            },
+            "machines": [
+                {"machine_id": "machine", "root": {"type": "simple", "on_events": {"go": {}}}}
+            ],
+        }
+    )
+    aggregate = _created(bundle)
+    delivery = _delivery(aggregate, "event")
+    result = admit_aggregate_v2(aggregate, [delivery], _resolver(bundle))
+
+    assert result["result"] == "rejected"
+    assert result["rejection"]["code"] == "invalid_payload"
+    assert result["state"] == aggregate
+
+
+def test_restore_rejects_resealed_author_event_with_system_source() -> None:
+    bundle = load_bundle(
+        {
+            "format": 1,
+            "namespace": "tests.review83.author_source",
+            "events": {"work": {"direction": "internal"}},
+            "machines": [
+                {
+                    "machine_id": "machine",
+                    "root": {
+                        "type": "simple",
+                        "entry": [{"send": {"event": "work"}}],
+                        "on_events": {"work": {}},
+                    },
+                }
+            ],
+        }
+    )
+    aggregate = _created(bundle)
+    entry = aggregate["runtimes"][0]["ready_mailbox"][0]
+    entry["envelope"]["source"] = {"system": "system:component_completion"}
+    entry["envelope_digest"] = _entry_digest(
+        aggregate["root_instance_id"], entry["delivery_mode"], entry["envelope"]
+    )
+    aggregate = seal_aggregate_v2(aggregate)
+
+    with pytest.raises(ArtifactError, match="invalid_aggregate_state"):
+        restore_aggregate_v2(aggregate, _resolver(bundle))
+
+
+def test_restore_rejects_resealed_reserved_event_with_wrong_system_source() -> None:
+    bundle = load_bundle(
+        {
+            "format": 1,
+            "namespace": "tests.review83.reserved_source",
+            "machines": [
+                {
+                    "machine_id": "machine",
+                    "root": {
+                        "type": "parallel",
+                        "components": [
+                            {
+                                "component_id": "worker",
+                                "root": {"type": "simple", "entry": [{"stop": {}}]},
+                            },
+                            {"component_id": "peer", "root": {"type": "simple"}},
+                        ],
+                    },
+                }
+            ],
+        }
+    )
+    aggregate = _created(bundle)
+    entry = next(
+        entry
+        for runtime in aggregate["runtimes"]
+        for entry in runtime["ready_mailbox"]
+        if entry["envelope"]["event"] == "determa.component_completed"
+    )
+    entry["envelope"]["source"] = {"system": "system:component_failure"}
+    entry["envelope_digest"] = _entry_digest(
+        aggregate["root_instance_id"], entry["delivery_mode"], entry["envelope"]
+    )
+    aggregate = seal_aggregate_v2(aggregate)
+
+    with pytest.raises(ArtifactError, match="invalid_aggregate_state"):
+        restore_aggregate_v2(aggregate, _resolver(bundle))
+
+
+def test_checkpoint_restore_rejects_resealed_false_creation_result_digest() -> None:
+    bundle = _bundle()
+    checkpoint = create_checkpoint_v2(bundle, "machine", "root", "create", {})
+    checkpoint["operation_receipts"][0]["resulting_aggregate_state_digest"] = (
+        "sha256:" + "0" * 64
+    )
+    checkpoint = seal_execution_checkpoint(checkpoint)
+
+    with pytest.raises(ArtifactError, match="invalid_execution_checkpoint"):
+        restore_execution_checkpoint_v2(checkpoint, _resolver(bundle))
+
+
 def test_v1_upgrade_gate_finds_nested_inline_component_deferral() -> None:
     bundle = load_bundle(
         {
@@ -1155,6 +1305,60 @@ def test_migration_rejects_payload_default_materialization() -> None:
         )
 
 
+def test_public_v2_migration_returns_exact_ordered_audit_records() -> None:
+    source = _bundle()
+    target_document = copy.deepcopy(source.raw)
+    target_document["events"]["extra"] = {"direction": "input"}
+    target = load_bundle(target_document)
+    descriptor = _compatible_v2_descriptor(source, target)
+    aggregate = _created(source)
+    resolver = MemoryArtifactResolver(
+        definitions={source.fingerprint: source, target.fingerprint: target},
+        migration_descriptors={descriptor["migration_descriptor_digest"]: descriptor},
+    )
+
+    result = migrate_aggregate_v2(
+        aggregate,
+        target.fingerprint,
+        [descriptor["migration_descriptor_digest"]],
+        resolver,
+        maintenance_mode=True,
+    )
+
+    assert set(result) == {"result", "aggregate_state", "dispositions", "audit_records"}
+    assert result["dispositions"] == []
+    assert result["audit_records"] == [
+        {
+            "migration_audit_record_schema_version": 1,
+            "root_instance_id": aggregate["root_instance_id"],
+            "root_runtime_id": aggregate["root_runtime_id"],
+            "migration_sequence": "1",
+            "source_validated_bundle_fingerprint": source.fingerprint,
+            "target_validated_bundle_fingerprint": target.fingerprint,
+            "migration_descriptor_digest": descriptor["migration_descriptor_digest"],
+            "source_aggregate_state_digest": aggregate["aggregate_state_digest"],
+            "target_aggregate_state_digest": result["aggregate_state"][
+                "aggregate_state_digest"
+            ],
+            "result_code": "migration_applied",
+        }
+    ]
+
+    no_operation = migrate_aggregate_v2(
+        aggregate,
+        source.fingerprint,
+        [],
+        resolver,
+        maintenance_mode=False,
+    )
+    assert no_operation == {
+        "result": "success",
+        "aggregate_state": aggregate,
+        "dispositions": [],
+        "audit_records": [],
+    }
+
+
 def test_multihop_migration_recalls_each_hop_and_host_appends_exact_audit() -> None:
     source = _bundle(deferred=True)
     middle_document = copy.deepcopy(source.raw)
@@ -1191,6 +1395,16 @@ def test_multihop_migration_recalls_each_hop_and_host_appends_exact_audit() -> N
         expected_revision=checkpoint["revision"],
         expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
     )
+    public_result = migrate_aggregate_v2(
+        checkpoint["root_record"]["aggregate_state"],
+        target.fingerprint,
+        [first["migration_descriptor_digest"], second["migration_descriptor_digest"]],
+        resolver,
+        maintenance_mode=True,
+    )
+    assert [
+        record["migration_descriptor_digest"] for record in public_result["audit_records"]
+    ] == [first["migration_descriptor_digest"], second["migration_descriptor_digest"]]
     old_queue = checkpoint["root_record"]["aggregate_state"]["runtimes"][0]["deferred_mailbox"][0][
         "queue_sequence"
     ]

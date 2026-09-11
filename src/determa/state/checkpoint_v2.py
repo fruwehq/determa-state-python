@@ -127,6 +127,13 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
     )
     if legacy_creation.get("creation_id") != root_creation_id:
         raise _invalid()
+    if (
+        aggregate is not None
+        and revision == 0
+        and legacy_creation.get("resulting_aggregate_state_digest")
+        != aggregate["aggregate_state_digest"]
+    ):
+        raise _invalid()
 
     pending_entries = _mailbox_entries(aggregate) if aggregate is not None else []
     pending_by_event = {entry["envelope"]["event_id"]: entry for entry in pending_entries}

@@ -20,8 +20,11 @@ from .definition import Bundle, BundleSource, load_bundle
 from .engine import (
     _Execution,
     _normalize_payload,
+    _normalize_value,
+    _pointer_get,
     _runtime_model,
     _validate_envelope,
+    _validate_reserved_payload,
     create,
     dispatch,
 )
@@ -241,32 +244,91 @@ def _validate_mailboxes(document: dict[str, Any]) -> None:
         raise ArtifactError(PersistenceFailureCode.INVALID_AGGREGATE_STATE)
 
 
-def _valid_envelope_source(document: Mapping[str, Any], entry: Mapping[str, Any]) -> bool:
+def _valid_envelope_source(
+    document: Mapping[str, Any],
+    entry: Mapping[str, Any],
+    declaration: Mapping[str, Any] | None,
+    payload: Mapping[str, Any],
+    *,
+    allow_legacy: bool,
+) -> bool:
     envelope = entry["envelope"]
     source = envelope["source"]
     mode = entry["delivery_mode"]
     if mode == "input":
         return bool(source == {"host": True} and envelope["cause_id"] == envelope["event_id"])
-    if "runtime" in source:
+    if "legacy_v1_internal" in source:
+        return allow_legacy
+    event = envelope["event"]
+    if declaration is not None or event == "env":
+        if "runtime" not in source:
+            return False
         return any(
             runtime["target_identity"] == source["runtime"] for runtime in document["runtimes"]
         )
-    if "system" in source:
-        return source["system"] in {
-            "system:component_completion",
-            "system:spawned_completion",
-            "system:component_failure",
-            "system:spawned_failure",
+    expected_system = {
+        "determa.component_completed": "system:component_completion",
+        "determa.component_failed": "system:component_failure",
+        "determa.spawned_instance_failed": "system:spawned_failure",
+    }.get(event)
+    if event == "done":
+        relationship = payload.get("relationship")
+        expected_system = {
+            "parallel": "system:component_completion",
+            "spawned_instance": "system:spawned_completion",
+        }.get(relationship if isinstance(relationship, str) else "")
+    return expected_system is not None and source == {"system": expected_system}
+
+
+def _mailbox_payload_is_normalized(
+    restored: RestoredAggregate,
+    runtime: Mapping[str, Any],
+    entry: Mapping[str, Any],
+    declaration: Mapping[str, Any] | None,
+    payload: Mapping[str, Any],
+) -> bool:
+    envelope = entry["envelope"]
+    event = envelope["event"]
+    if declaration is not None:
+        normalized = _normalize_payload(dict(declaration), dict(payload))
+        return normalized is not None and typed_value(normalized) == envelope["payload"]
+    if event == "env":
+        if set(payload) != {"changed"} or not isinstance(payload["changed"], Mapping):
+            return False
+        native_runtime = next(
+            (
+                item
+                for item in restored.state["runtimes"]
+                if item["runtime_id"] == runtime["runtime_id"]
+            ),
+            None,
+        )
+        if native_runtime is None:
+            return False
+        root = _pointer_get(restored.bundle.raw, native_runtime["root_pointer"])
+        external = {
+            name: variable
+            for name, variable in (root.get("variables") or {}).items()
+            if variable.get("external") is True
         }
-    return "legacy_v1_internal" in source
+        changed = payload["changed"]
+        if not changed or set(changed) - set(external):
+            return False
+        try:
+            normalized_changed = {
+                name: _normalize_value(value, str(external[name]["type"]))
+                for name, value in changed.items()
+            }
+        except (KeyError, TypeError, ValueError):
+            return False
+        return bool(typed_value({"changed": normalized_changed}) == envelope["payload"])
+    return _validate_reserved_payload(event, _native_envelope(entry)) is None
 
 
 def _validate_mailbox_semantics(document: Mapping[str, Any], restored: RestoredAggregate) -> None:
     for runtime in document["runtimes"]:
         for mailbox in ("ready_mailbox", "deferred_mailbox"):
             for entry in runtime[mailbox]:
-                if not _valid_envelope_source(document, entry):
-                    raise ArtifactError(PersistenceFailureCode.INVALID_AGGREGATE_STATE)
                 try:
                     mode = entry["delivery_mode"]
                     envelope = entry["envelope"]
@@ -277,6 +339,9 @@ def _validate_mailbox_semantics(document: Mapping[str, Any], restored: RestoredA
                     declarations.update((machine or {}).get("events") or {})
                     event = envelope["event"]
                     declaration = declarations.get(event)
+                    payload = decoded_typed_value(envelope["payload"])
+                    if not isinstance(payload, Mapping):
+                        raise ValueError
                     if mode == "input" and relation == "component":
                         raise ValueError
                     if event == "env":
@@ -297,6 +362,19 @@ def _validate_mailbox_semantics(document: Mapping[str, Any], restored: RestoredA
                         valid_event = valid_event and bool(declaration.get("correlates_to")) == (
                             correlation is not None
                         )
+                    valid_event = (
+                        valid_event
+                        and _valid_envelope_source(
+                            document,
+                            entry,
+                            declaration,
+                            payload,
+                            allow_legacy=True,
+                        )
+                        and _mailbox_payload_is_normalized(
+                            restored, runtime, entry, declaration, payload
+                        )
+                    )
                 except (ArtifactError, KeyError, TypeError, ValueError) as error:
                     raise ArtifactError(PersistenceFailureCode.INVALID_AGGREGATE_STATE) from error
                 if not valid_event:
@@ -523,6 +601,24 @@ def admit_aggregate_v2(
         )
         if rejection is not None:
             return _admission_rejection(_dispatch_code_to_admission(rejection), document)
+        machine_id = target_runtime["current_definition"]["machine"]["machine_id"]
+        machine = restored.bundle.machine(machine_id)
+        declarations = dict(restored.bundle.raw.get("events") or {})
+        declarations.update((machine or {}).get("events") or {})
+        declaration = declarations.get(envelope["event"])
+        payload = decoded_typed_value(envelope["payload"])
+        if not isinstance(payload, Mapping) or not _valid_envelope_source(
+            document,
+            delivery,
+            declaration,
+            payload,
+            allow_legacy=False,
+        ):
+            return _admission_rejection(AdmissionCode.INVALID_DELIVERY_SOURCE.value, document)
+        if not _mailbox_payload_is_normalized(
+            restored, target_runtime, delivery, declaration, payload
+        ):
+            return _admission_rejection(AdmissionCode.INVALID_PAYLOAD.value, document)
         acceptance = candidate["next_acceptance_sequence"]
         queue = candidate["next_queue_sequence"]
         entry = {
@@ -1079,6 +1175,7 @@ def migrate_aggregate_v2(
             "result": "success",
             "aggregate_state": copy.deepcopy(restored.aggregate_envelope),
             "dispositions": [],
+            "audit_records": [],
         }
     if len({item["migration_descriptor_digest"] for item in descriptors}) != len(descriptors):
         raise ArtifactError(PersistenceFailureCode.MIGRATION_ROUTE_MISMATCH)
@@ -1193,8 +1290,8 @@ def migrate_aggregate_v2(
         "result": "success",
         "aggregate_state": candidate,
         "dispositions": dispositions,
+        "audit_records": audits,
     }
     if _include_host_evidence:
-        result["_audit_records"] = audits
         result["_disposed_entries"] = disposed_entries
     return result

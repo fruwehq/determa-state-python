@@ -967,7 +967,7 @@ class ExecutionHost:
             candidate = _mutate(prior)
             candidate["root_record"]["aggregate_state"] = migrated
             candidate["migration_audit_records"].extend(
-                copy.deepcopy(migration["_audit_records"])
+                copy.deepcopy(migration["audit_records"])
             )
             for entry, disposition in zip(
                 migration["_disposed_entries"],
