@@ -232,6 +232,7 @@ def _assert_result(
         "fault",
         "caller_still_owns_input",
         "caller_still_owns_state",
+        "state_bytes_unchanged",
         "state",
         "config",
         "variables",
@@ -270,6 +271,9 @@ def _assert_result(
         assert prior_state_snapshot is not None
         assert prior_state == prior_state_snapshot
         assert result["state"] is prior_state
+    if expected.get("state_bytes_unchanged"):
+        assert prior_state_snapshot is not None
+        assert result["state"] == prior_state_snapshot
     if result["state"] is None:
         return
     state = result["state"]

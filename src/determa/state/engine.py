@@ -435,7 +435,7 @@ def dispatch(
     execution.cause_id = str(envelope["event_id"])
     before = copy.deepcopy(state)
     try:
-        handled = execution.process(runtime, normalized_envelope)
+        disposition = execution.process(runtime, normalized_envelope)
     except StepFault as fault:
         state.clear()
         state.update(before)
@@ -454,11 +454,11 @@ def dispatch(
         result["fault"] = copy.deepcopy(runtime["fault"])
         result["emissions"] = execution.emissions
         return result
-    if not handled:
+    if disposition != Disposition.HANDLED.value:
         result = _empty_result(
             status=prior_state["status"],
             state=prior_state,
-            disposition=Disposition.UNHANDLED.value,
+            disposition=disposition,
         )
         result["fault"] = copy.deepcopy(prior_state.get("fault"))
         return result
@@ -1103,6 +1103,7 @@ def _valid_fault(
     }
     system_locators = {
         FaultCode.CONTAINED_RUNTIME_FAULT.value: "system:unhandled_contained_failure",
+        FaultCode.DEFERRED_EVENT_CAPACITY_EXCEEDED.value: "system:deferred_event_capacity",
         FaultCode.CASCADE_FAULT.value: "system:cascade_cleanup",
         FaultCode.INVARIANT_FAULT.value: "system:invariant",
     }
@@ -1806,7 +1807,7 @@ class _Execution:
                     result[kind][name] = copy.deepcopy(declaration["init"])
         return result
 
-    def process(self, runtime: dict[str, Any], envelope: dict[str, Any]) -> bool:
+    def process(self, runtime: dict[str, Any], envelope: dict[str, Any]) -> str:
         machine = self.model_for(runtime)
         active = machine.states[runtime["active"][-1]] if runtime["active"] else machine.root
         selected: tuple[StateNode, dict[str, Any], str] | None = None
@@ -1839,6 +1840,8 @@ class _Execution:
                         break
                 if selected is not None:
                     break
+            if envelope["event"] in (current.raw.get("deferred_events") or []):
+                return Disposition.DEFERRED.value
             current = current.parent
         if selected is None:
             if envelope["event"] in {
@@ -1849,7 +1852,7 @@ class _Execution:
                     FaultCode.CONTAINED_RUNTIME_FAULT,
                     "system:unhandled_contained_failure",
                 )
-            return False
+            return Disposition.UNHANDLED.value
         source, transition, pointer = selected
         try:
             target, history = self.resolve_compound_transition(
@@ -1861,7 +1864,7 @@ class _Execution:
                 event_visible=True,
             )
             if target is None:
-                return True
+                return Disposition.HANDLED.value
             self.apply_transition(
                 runtime,
                 machine,
@@ -1872,7 +1875,7 @@ class _Execution:
             )
         except _StopRuntime:
             self.complete_runtime(runtime, machine)
-        return True
+        return Disposition.HANDLED.value
 
     def resolve_compound_transition(
         self,

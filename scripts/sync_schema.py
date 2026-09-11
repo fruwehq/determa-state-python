@@ -22,11 +22,16 @@ DEST = ROOT / "src" / "determa" / "state" / "data"
 SCHEMAS = (
     "machine.schema.json",
     "aggregate-state.schema.json",
+    "aggregate-state-v2.schema.json",
     "migration-descriptor.schema.json",
+    "migration-descriptor-v2.schema.json",
     "aggregate-state-package.schema.json",
+    "aggregate-state-package-v2.schema.json",
     "execution-checkpoint.schema.json",
+    "execution-checkpoint-v2.schema.json",
+    "core-step-result-v2.schema.json",
 )
-SPEC_COMMIT = "7782671b56165a59caa61a65c29fefc63105ebf8"
+SPEC_COMMIT = "2e33036563cb966b07124197db672159b4b7e1f4"
 
 
 def _fetch(name: str) -> str:
@@ -49,7 +54,7 @@ def main() -> int:
         text = _fetch(name)
         json.loads(text)
         destination = DEST / name
-        if destination.read_text(encoding="utf-8") == text:
+        if destination.exists() and destination.read_text(encoding="utf-8") == text:
             print(f"{destination.relative_to(ROOT)} already up to date")
             continue
         destination.write_text(text, encoding="utf-8")

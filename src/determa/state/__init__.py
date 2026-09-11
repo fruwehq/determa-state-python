@@ -14,6 +14,14 @@ from .checkpoint import (
     validate_execution_checkpoint_member,
     validate_execution_checkpoint_semantics,
 )
+from .checkpoint_v2 import (
+    RestoredExecutionCheckpointV2,
+    admit_checkpoint_v2,
+    prune_checkpoint_v2,
+    restore_execution_checkpoint_v2,
+    step_checkpoint_v2,
+    upgrade_checkpoint_v1_to_v2,
+)
 from .codes import (
     PORTABLE_CODE_SETS,
     CheckpointArtifactFailureCode,
@@ -56,6 +64,16 @@ from .migration import (
     MigrationResult,
     migrate_aggregate,
     migrate_and_dispatch,
+)
+from .queueing import (
+    admit_aggregate_v2,
+    create_aggregate_v2,
+    downgrade_aggregate_v2_to_v1,
+    migrate_aggregate_v2,
+    restore_aggregate_v2,
+    seal_aggregate_v2,
+    step_aggregate_v2,
+    upgrade_aggregate_v1_to_v2,
 )
 from .stores import (
     COMPACT_EFFECT_IDENTITY_RETENTION,
@@ -102,6 +120,8 @@ from .wire import (
 __all__ = [
     "ArtifactError",
     "ArtifactResolver",
+    "admit_aggregate_v2",
+    "admit_checkpoint_v2",
     "Bundle",
     "BundleSource",
     "CelError",
@@ -115,7 +135,9 @@ __all__ = [
     "DefinitionResolver",
     "Delivery",
     "CreationRejectionCode",
+    "create_aggregate_v2",
     "DispatchRejectionCode",
+    "downgrade_aggregate_v2_to_v1",
     "DispositionCode",
     "ErrorRecord",
     "EPHEMERAL",
@@ -137,6 +159,7 @@ __all__ = [
     "MigrationFailure",
     "MigrationLimits",
     "MigrationResult",
+    "migrate_aggregate_v2",
     "PERMANENT_OUTBOX_TERMINAL_RETENTION",
     "PERMANENT_RECEIPT_RETENTION",
     "PostgreSQLExecutionStore",
@@ -148,6 +171,7 @@ __all__ = [
     "RestoredAggregate",
     "RestoredAggregatePackage",
     "RestoredExecutionCheckpoint",
+    "RestoredExecutionCheckpointV2",
     "SHARED_APPLICATION_TRANSACTION",
     "STANDARD_CAPABILITIES",
     "SchemaError",
@@ -174,18 +198,26 @@ __all__ = [
     "outbox_intent_digest",
     "portable_envelope",
     "postgresql_execution_store_factory",
+    "prune_checkpoint_v2",
     "register_bundled_execution_stores",
     "restore_aggregate",
+    "restore_aggregate_v2",
     "restore_aggregate_package",
     "restore_execution_checkpoint",
+    "restore_execution_checkpoint_v2",
+    "seal_aggregate_v2",
     "seal_execution_checkpoint",
     "serialize_aggregate",
     "serialize_execution_checkpoint",
+    "step_aggregate_v2",
+    "step_checkpoint_v2",
     "sqlite_execution_store_factory",
     "validate",
     "validate_execution_checkpoint_member",
     "validate_execution_checkpoint_semantics",
     "validate_host_profile",
+    "upgrade_aggregate_v1_to_v2",
+    "upgrade_checkpoint_v1_to_v2",
 ]
 
 logging.getLogger("determa.state").addHandler(logging.NullHandler())

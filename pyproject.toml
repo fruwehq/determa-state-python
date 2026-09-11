@@ -64,9 +64,14 @@ packages = ["src/determa"]
 [tool.hatch.build.targets.wheel.force-include]
 "src/determa/state/data/machine.schema.json" = "determa/state/data/machine.schema.json"
 "src/determa/state/data/aggregate-state.schema.json" = "determa/state/data/aggregate-state.schema.json"
+"src/determa/state/data/aggregate-state-v2.schema.json" = "determa/state/data/aggregate-state-v2.schema.json"
 "src/determa/state/data/migration-descriptor.schema.json" = "determa/state/data/migration-descriptor.schema.json"
+"src/determa/state/data/migration-descriptor-v2.schema.json" = "determa/state/data/migration-descriptor-v2.schema.json"
 "src/determa/state/data/aggregate-state-package.schema.json" = "determa/state/data/aggregate-state-package.schema.json"
+"src/determa/state/data/aggregate-state-package-v2.schema.json" = "determa/state/data/aggregate-state-package-v2.schema.json"
 "src/determa/state/data/execution-checkpoint.schema.json" = "determa/state/data/execution-checkpoint.schema.json"
+"src/determa/state/data/execution-checkpoint-v2.schema.json" = "determa/state/data/execution-checkpoint-v2.schema.json"
+"src/determa/state/data/core-step-result-v2.schema.json" = "determa/state/data/core-step-result-v2.schema.json"
 
 [tool.ruff]
 line-length = 100

@@ -72,7 +72,9 @@ def execution_checkpoint_vectors() -> list[ExecutionCheckpointVector]:
     return [
         ExecutionCheckpointVector(case, vector)
         for case in execution_checkpoint_cases()
-        for vector in case.test["execution_checkpoint_profile"]["vectors"]
+        for vector in case.test.get("execution_checkpoint_profile", {}).get(
+            "vectors", []
+        )
     ]
 
 
@@ -90,7 +92,7 @@ def _pointer(document: Any, pointer: str) -> Any:
 def _resolver(case: ExecutionCheckpointCase) -> MemoryArtifactResolver:
     definitions = {}
     descriptors = {}
-    for path in case.path.glob("*.yaml"):
+    for path in case.path.parent.glob("**/*.yaml"):
         try:
             bundle = load_bundle(path.read_text(encoding="utf-8"))
         except Exception:

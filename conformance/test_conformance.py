@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 
 import pytest
+import yaml
 from jsonschema import Draft202012Validator
 
 from determa.state import PORTABLE_CODE_SETS, load_bundle
@@ -30,6 +31,15 @@ from .persistence_profiles import (
     persistence_profile_cases,
     run_persistence_profile,
 )
+from .version2 import (
+    run_version2_vector,
+    validate_version2_artifact,
+    version2_vectors,
+)
+
+
+def _load_case(case: CoreCase) -> dict:
+    return yaml.safe_load(case.test_file.read_text(encoding="utf-8")) or {}
 
 
 def _spec_schema() -> dict | None:
@@ -50,8 +60,9 @@ def _spec_root() -> Path | None:
 
 def test_suite_present() -> None:
     assert CORE_DIR.exists(), "pinned conformance suite is unavailable"
-    assert len(core_cases()) == 111
-    assert len(execution_checkpoint_vectors()) == 91
+    assert len(core_cases()) == 114
+    assert len(execution_checkpoint_vectors()) == 99
+    assert len(version2_vectors()) == 103
 
 
 def test_portable_code_sets_match_authoritative_registry() -> None:
@@ -162,6 +173,11 @@ def test_bundled_schema_matches_pinned_spec() -> None:
         ("migration-descriptor.schema.json", "migration_descriptor"),
         ("aggregate-state-package.schema.json", "aggregate_state_package"),
         ("execution-checkpoint.schema.json", "execution_checkpoint"),
+        ("aggregate-state-v2.schema.json", "aggregate_state_v2"),
+        ("migration-descriptor-v2.schema.json", "migration_descriptor_v2"),
+        ("aggregate-state-package-v2.schema.json", "aggregate_state_package_v2"),
+        ("execution-checkpoint-v2.schema.json", "execution_checkpoint_v2"),
+        ("core-step-result-v2.schema.json", "core_step_result_v2"),
     ],
 )
 def test_bundled_artifact_schemas_match_pinned_spec(name: str, kind: str) -> None:
@@ -178,6 +194,11 @@ def test_bundled_artifact_schemas_match_pinned_spec(name: str, kind: str) -> Non
         "migration_descriptor",
         "aggregate_state_package",
         "execution_checkpoint",
+        "aggregate_state_v2",
+        "migration_descriptor_v2",
+        "aggregate_state_package_v2",
+        "execution_checkpoint_v2",
+        "core_step_result_v2",
     ],
 )
 def test_bundled_artifact_schema_is_valid_draft_2020_12(kind: str) -> None:
@@ -224,6 +245,11 @@ def test_execution_checkpoint_profile(item) -> None:
     run_execution_checkpoint_vector(item)
 
 
+@pytest.mark.parametrize("item", version2_vectors(), ids=lambda item: item.name)
+def test_version2_vector(item) -> None:
+    run_version2_vector(item)
+
+
 @pytest.mark.parametrize(
     ("case", "artifact"),
     [
@@ -242,3 +268,37 @@ def test_execution_checkpoint_profile(item) -> None:
 )
 def test_execution_checkpoint_artifact(case, artifact) -> None:
     validate_execution_checkpoint_artifact(case, artifact)
+
+
+@pytest.mark.parametrize(
+    ("case", "artifact"),
+    [
+        (case, artifact)
+        for case in core_cases()
+        for artifact in (_load_case(case).get("artifacts", {}).get("documents", []))
+        if artifact["kind"]
+        in {
+            "aggregate_state_v2",
+            "migration_descriptor_v2",
+            "aggregate_state_package_v2",
+            "execution_checkpoint_v2",
+            "core_step_result_v2",
+        }
+    ]
+    + [
+        (case.path, artifact)
+        for case in execution_checkpoint_cases()
+        for artifact in case.test.get("artifacts", {}).get("documents", [])
+        if artifact["kind"]
+        in {
+            "aggregate_state_v2",
+            "migration_descriptor_v2",
+            "aggregate_state_package_v2",
+            "execution_checkpoint_v2",
+            "core_step_result_v2",
+        }
+    ],
+)
+def test_version2_artifact(case, artifact) -> None:
+    path = case.path if isinstance(case, CoreCase) else case
+    validate_version2_artifact(path, artifact)

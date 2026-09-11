@@ -265,6 +265,16 @@ def _validate_state_structure(
     graph: dict[str, set[str]],
 ) -> None:
     scope, scope_declarations = _scope(machine, state)
+    if "deferred_event_capacity" in state.raw and state is not machine.root:
+        raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
+    for event_name in state.raw.get("deferred_events") or []:
+        declaration = events.get(event_name)
+        if (
+            declaration is None
+            or declaration["direction"] == "output"
+            or event_name in _RESERVED_EVENTS
+        ):
+            raise ValidationError(LoadCode.SEMANTIC_VALIDATION)
     if state is machine.root:
         for declaration in (bundle.raw.get("events") or {}).values():
             _validate_payload_literals(declaration)

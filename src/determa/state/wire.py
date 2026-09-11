@@ -132,12 +132,19 @@ class MemoryArtifactResolver:
     def put_migration_descriptor(
         self, digest: str, descriptor: ArtifactSource, *, trusted: bool = True
     ) -> None:
-        document, _ = load_json_artifact(descriptor, "migration_descriptor")
+        candidate, _ = strict_json(descriptor)
+        kind = (
+            "migration_descriptor_v2"
+            if isinstance(candidate, dict)
+            and candidate.get("migration_descriptor_schema_version") == 2
+            else "migration_descriptor"
+        )
+        document, _ = load_json_artifact(candidate, kind)
         if migration_descriptor_digest(document) != digest:
             raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)
         existing = self._migration_descriptors.get(digest)
         if existing is not None:
-            current, _ = load_json_artifact(existing, "migration_descriptor")
+            current, _ = load_json_artifact(existing, kind)
             if canonical_bytes(current) != canonical_bytes(document):
                 raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)
         else:
@@ -328,9 +335,14 @@ def decimal(value: Any, *, positive: bool = False) -> int:
 def artifact_schema(kind: str) -> dict[str, Any]:
     filename = {
         "aggregate_state": "aggregate-state.schema.json",
+        "aggregate_state_v2": "aggregate-state-v2.schema.json",
         "migration_descriptor": "migration-descriptor.schema.json",
+        "migration_descriptor_v2": "migration-descriptor-v2.schema.json",
         "aggregate_state_package": "aggregate-state-package.schema.json",
+        "aggregate_state_package_v2": "aggregate-state-package-v2.schema.json",
         "execution_checkpoint": "execution-checkpoint.schema.json",
+        "execution_checkpoint_v2": "execution-checkpoint-v2.schema.json",
+        "core_step_result_v2": "core-step-result-v2.schema.json",
     }[kind]
     return cast(
         dict[str, Any], json.loads((_DATA / filename).read_text(encoding="utf-8"))
@@ -344,9 +356,14 @@ def _schema_registry() -> Any:
     registry = Registry()
     for kind in (
         "aggregate_state",
+        "aggregate_state_v2",
         "migration_descriptor",
+        "migration_descriptor_v2",
         "aggregate_state_package",
+        "aggregate_state_package_v2",
         "execution_checkpoint",
+        "execution_checkpoint_v2",
+        "core_step_result_v2",
     ):
         document = artifact_schema(kind)
         registry = registry.with_resource(
@@ -367,11 +384,27 @@ def _format_code(document: Any, kind: str) -> str | None:
             PersistenceCode.UNSUPPORTED_AGGREGATE_STATE_FORMAT,
             PersistenceCode.UNSUPPORTED_AGGREGATE_STATE_SCHEMA_VERSION,
         ),
+        "aggregate_state_v2": (
+            "aggregate_state_format",
+            "determa.aggregate_state",
+            "aggregate_state_schema_version",
+            2,
+            PersistenceCode.UNSUPPORTED_AGGREGATE_STATE_FORMAT,
+            PersistenceCode.UNSUPPORTED_AGGREGATE_STATE_SCHEMA_VERSION,
+        ),
         "migration_descriptor": (
             "migration_descriptor_format",
             "determa.aggregate_migration",
             "migration_descriptor_schema_version",
             1,
+            PersistenceCode.UNSUPPORTED_MIGRATION_DESCRIPTOR_FORMAT,
+            PersistenceCode.UNSUPPORTED_MIGRATION_DESCRIPTOR_SCHEMA_VERSION,
+        ),
+        "migration_descriptor_v2": (
+            "migration_descriptor_format",
+            "determa.aggregate_migration",
+            "migration_descriptor_schema_version",
+            2,
             PersistenceCode.UNSUPPORTED_MIGRATION_DESCRIPTOR_FORMAT,
             PersistenceCode.UNSUPPORTED_MIGRATION_DESCRIPTOR_SCHEMA_VERSION,
         ),
@@ -383,6 +416,14 @@ def _format_code(document: Any, kind: str) -> str | None:
             PersistenceCode.UNSUPPORTED_AGGREGATE_STATE_PACKAGE_FORMAT,
             PersistenceCode.UNSUPPORTED_AGGREGATE_STATE_PACKAGE_SCHEMA_VERSION,
         ),
+        "aggregate_state_package_v2": (
+            "aggregate_state_package_format",
+            "determa.aggregate_state_package",
+            "aggregate_state_package_schema_version",
+            2,
+            PersistenceCode.UNSUPPORTED_AGGREGATE_STATE_PACKAGE_FORMAT,
+            PersistenceCode.UNSUPPORTED_AGGREGATE_STATE_PACKAGE_SCHEMA_VERSION,
+        ),
         "execution_checkpoint": (
             "execution_checkpoint_format",
             "determa.execution_checkpoint",
@@ -390,6 +431,22 @@ def _format_code(document: Any, kind: str) -> str | None:
             1,
             CheckpointCode.UNSUPPORTED_EXECUTION_CHECKPOINT_FORMAT,
             CheckpointCode.UNSUPPORTED_EXECUTION_CHECKPOINT_SCHEMA_VERSION,
+        ),
+        "execution_checkpoint_v2": (
+            "execution_checkpoint_format",
+            "determa.execution_checkpoint",
+            "execution_checkpoint_schema_version",
+            2,
+            CheckpointCode.UNSUPPORTED_EXECUTION_CHECKPOINT_FORMAT,
+            CheckpointCode.UNSUPPORTED_EXECUTION_CHECKPOINT_SCHEMA_VERSION,
+        ),
+        "core_step_result_v2": (
+            "core_step_result_format",
+            "determa.core_step_result",
+            "core_step_result_schema_version",
+            2,
+            PersistenceCode.INVALID_AGGREGATE_STATE,
+            PersistenceCode.INVALID_AGGREGATE_STATE,
         ),
     }
     format_member, expected_format, version_member, expected_version, format_code, version_code = (
@@ -411,9 +468,14 @@ def load_json_artifact(
     except ArtifactError as exc:
         code = {
             "aggregate_state": PersistenceCode.INVALID_AGGREGATE_STATE,
+            "aggregate_state_v2": PersistenceCode.INVALID_AGGREGATE_STATE,
             "migration_descriptor": PersistenceCode.INVALID_MIGRATION_DESCRIPTOR,
+            "migration_descriptor_v2": PersistenceCode.INVALID_MIGRATION_DESCRIPTOR,
             "aggregate_state_package": PersistenceCode.INVALID_AGGREGATE_STATE_PACKAGE,
+            "aggregate_state_package_v2": PersistenceCode.INVALID_AGGREGATE_STATE_PACKAGE,
             "execution_checkpoint": CheckpointCode.INVALID_EXECUTION_CHECKPOINT,
+            "execution_checkpoint_v2": CheckpointCode.INVALID_EXECUTION_CHECKPOINT,
+            "core_step_result_v2": PersistenceCode.INVALID_AGGREGATE_STATE,
         }[kind]
         raise ArtifactError(code) from exc
     unsupported = _format_code(document, kind)
@@ -427,24 +489,41 @@ def load_json_artifact(
     if not isinstance(document, dict) or next(validator.iter_errors(document), None) is not None:
         code = {
             "aggregate_state": PersistenceCode.INVALID_AGGREGATE_STATE,
+            "aggregate_state_v2": PersistenceCode.INVALID_AGGREGATE_STATE,
             "migration_descriptor": PersistenceCode.INVALID_MIGRATION_DESCRIPTOR,
+            "migration_descriptor_v2": PersistenceCode.INVALID_MIGRATION_DESCRIPTOR,
             "aggregate_state_package": PersistenceCode.INVALID_AGGREGATE_STATE_PACKAGE,
+            "aggregate_state_package_v2": PersistenceCode.INVALID_AGGREGATE_STATE_PACKAGE,
             "execution_checkpoint": CheckpointCode.INVALID_EXECUTION_CHECKPOINT,
+            "execution_checkpoint_v2": CheckpointCode.INVALID_EXECUTION_CHECKPOINT,
+            "core_step_result_v2": PersistenceCode.INVALID_AGGREGATE_STATE,
         }[kind]
         raise ArtifactError(code)
     return document, raw
 
 
 def aggregate_state_digest(document: Mapping[str, Any]) -> str:
-    body = dict(document)
+    body = copy.deepcopy(dict(document))
     body.pop("aggregate_state_digest", None)
-    return hash_value(["determa-aggregate-state-digest-1", body])
+    version = body.get("aggregate_state_schema_version")
+    domain = (
+        "determa-aggregate-state-digest-2"
+        if version == 2
+        else "determa-aggregate-state-digest-1"
+    )
+    return hash_value([domain, body])
 
 
 def migration_descriptor_digest(document: Mapping[str, Any]) -> str:
-    body = dict(document)
+    body = copy.deepcopy(dict(document))
     body.pop("migration_descriptor_digest", None)
-    return hash_value(["determa-migration-descriptor-1", body])
+    version = body.get("migration_descriptor_schema_version")
+    domain = (
+        "determa-migration-descriptor-2"
+        if version == 2
+        else "determa-migration-descriptor-1"
+    )
+    return hash_value([domain, body])
 
 
 def normalized_definition_attachment(bundle: Bundle) -> dict[str, Any]:
