@@ -1,4 +1,4 @@
-"""Deterministic portable aggregate migration and atomic dispatch composition."""
+"""Deterministic portable aggregate migration."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from typing import Any, cast
 from . import cel
 from .codes import PersistenceFailureCode as PersistenceCode
 from .definition import Bundle, _escape_pointer
-from .engine import Delivery, dispatch
 from .errors import ArtifactError, CelError
 from .model import BundleModel, MachineModel, StateNode
 from .wire import (
@@ -82,33 +81,8 @@ class MigrationResult:
         return self.failure is None
 
 
-@dataclass(frozen=True)
-class MigrationDispatchResult:
-    """One atomic migration plus optional ordinary dispatch result."""
-
-    aggregate_envelope: dict[str, Any] | None
-    aggregate_bytes: bytes | None
-    audit_records: tuple[dict[str, Any], ...]
-    status: str | None
-    disposition: str | None
-    emissions: tuple[dict[str, Any], ...]
-    fault: dict[str, Any] | None
-    rejection: dict[str, Any] | None
-    failure: MigrationFailure | None
-
-    @property
-    def succeeded(self) -> bool:
-        return self.failure is None
-
-
 def _failure(code: str) -> MigrationResult:
     return MigrationResult(None, None, (), MigrationFailure(str(code)))
-
-
-def _dispatch_failure(code: str) -> MigrationDispatchResult:
-    return MigrationDispatchResult(
-        None, None, (), None, None, (), None, None, MigrationFailure(code)
-    )
 
 
 def _resource_metrics(value: Any, depth: int = 0) -> tuple[int, int, int, int]:
@@ -439,7 +413,7 @@ def _resolve_descriptor(
         raise ArtifactError(PersistenceCode.MIGRATION_ROUTE_MISMATCH)
     if not resolver.migration_descriptor_is_trusted(digest):
         raise ArtifactError(PersistenceCode.MIGRATION_DESCRIPTOR_UNTRUSTED)
-    document, _raw = load_json_artifact(source, "migration_descriptor")
+    document, _raw = load_json_artifact(source, "migration_descriptor_v2")
     encoded = canonical_bytes(document)
     if migration_descriptor_digest(document) != digest:
         raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)
@@ -974,7 +948,7 @@ def migrate_aggregate(
             )
             audits.append(
                 {
-                    "migration_audit_record_schema_version": 1,
+                    "migration_audit_record_schema_version": 2,
                     "root_instance_id": candidate["root_instance_id"],
                     "root_runtime_id": candidate["root_runtime_id"],
                     "migration_sequence": candidate["migration_sequence"],
@@ -1001,50 +975,3 @@ def migrate_aggregate(
     except (CelError, KeyError, TypeError, ValueError) as exc:
         del exc
         return _failure(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)
-
-
-def migrate_and_dispatch(
-    aggregate: ArtifactSource,
-    target_validated_bundle_fingerprint: str,
-    migration_route: Sequence[str],
-    artifact_resolver: ArtifactResolver,
-    delivery: Delivery,
-    *,
-    maintenance_mode: bool,
-    resource_limits: MigrationLimits | None = None,
-) -> MigrationDispatchResult:
-    """Migrate and dispatch as one commit-ready pure result boundary."""
-    migrated = migrate_aggregate(
-        aggregate,
-        target_validated_bundle_fingerprint,
-        migration_route,
-        artifact_resolver,
-        maintenance_mode=maintenance_mode,
-        resource_limits=resource_limits,
-    )
-    if migrated.failure is not None:
-        return _dispatch_failure(migrated.failure.code)
-    assert migrated.aggregate_bytes is not None
-    try:
-        restored = restore_aggregate(migrated.aggregate_bytes, artifact_resolver)
-        core = dispatch(restored.bundle, restored.state, delivery)
-        state = core["state"]
-        if state is None:
-            raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE)
-        from .wire import aggregate_envelope
-
-        envelope = aggregate_envelope(restored.bundle, state)
-        encoded = canonical_bytes(envelope)
-        return MigrationDispatchResult(
-            envelope,
-            encoded,
-            migrated.audit_records,
-            core["status"],
-            core["disposition"],
-            tuple(copy.deepcopy(core["emissions"])),
-            copy.deepcopy(core["fault"]),
-            copy.deepcopy(core["rejection"]),
-            None,
-        )
-    except ArtifactError as exc:
-        return _dispatch_failure(exc.code)

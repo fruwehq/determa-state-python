@@ -6,11 +6,9 @@ import copy
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 from .checkpoint import (
-    RestoredExecutionCheckpoint,
-    restore_execution_checkpoint,
     seal_execution_checkpoint,
     serialize_execution_checkpoint,
     validate_execution_checkpoint_member,
@@ -28,10 +26,8 @@ from .codes import (
     PersistenceFailureCode as PersistenceCode,
 )
 from .definition import Bundle, BundleSource, load_bundle
-from .engine import create as core_create
-from .engine import dispatch as core_dispatch
 from .errors import DetermaError
-from .migration import MigrationLimits, migrate_aggregate
+from .migration import MigrationLimits
 from .stores import (
     COMPACT_EFFECT_IDENTITY_RETENTION,
     DURABLE_CONCURRENT,
@@ -46,31 +42,16 @@ from .stores import (
 )
 from .wire import (
     ArtifactResolver,
-    aggregate_envelope,
     decoded_typed_value,
     hash_value,
-    strict_json,
     typed_value,
 )
 
 if TYPE_CHECKING:
-    from .checkpoint_v2 import RestoredExecutionCheckpointV2
+    from .checkpoint_v2 import RestoredExecutionCheckpoint
 
 FaultInjector = Callable[[str], None]
 _MAX_DECIMAL_DIGITS = 4096
-
-
-def _bundle_requires_v2(bundle: Bundle) -> bool:
-    def has_deferral(value: Any) -> bool:
-        if isinstance(value, Mapping):
-            return "deferred_events" in value or any(
-                has_deferral(child) for child in value.values()
-            )
-        if isinstance(value, list):
-            return any(has_deferral(child) for child in value)
-        return False
-
-    return has_deferral(bundle.raw["machines"])
 
 
 class ExecutionHostError(DetermaError):
@@ -130,8 +111,8 @@ def creation_request_digest(
     machine_version = "0" if machine is None else str(machine["version"])
     return hash_value(
         [
-            "determa-creation-request-digest-1",
-            "1",
+            "determa-creation-request-digest-2",
+            "2",
             validated.fingerprint,
             validated.namespace,
             machine_id,
@@ -149,8 +130,8 @@ def delivery_request_digest(
     """Compute one canonical pending/receipt delivery identity."""
     return hash_value(
         [
-            "determa-inbox-envelope-digest-1",
-            "1",
+            "determa-inbox-envelope-digest-2",
+            "2",
             root_instance_id,
             delivery_mode,
             dict(envelope),
@@ -191,8 +172,8 @@ def maintenance_migration_request_digest(
     """Compute one canonical keyed maintenance-migration identity."""
     return hash_value(
         [
-            "determa-maintenance-migration-request-digest-1",
-            "1",
+            "determa-maintenance-migration-request-digest-2",
+            "2",
             root_instance_id,
             operation_id,
             source_aggregate_state_digest,
@@ -207,8 +188,8 @@ def outbox_intent_digest(root_instance_id: str, intent: Mapping[str, Any]) -> st
     """Compute the compact evidence digest for one complete outbox intent."""
     return hash_value(
         [
-            "determa-outbox-intent-digest-1",
-            "1",
+            "determa-outbox-intent-digest-2",
+            "2",
             root_instance_id,
             dict(intent),
         ]
@@ -288,167 +269,6 @@ class StagedExecutionResult:
 
     operation: str
     state: str = "staged"
-
-
-def _project_fault(
-    result: Mapping[str, Any], aggregate: Mapping[str, Any] | None
-) -> dict[str, Any] | None:
-    fault = result["fault"]
-    if fault is None or aggregate is None:
-        return None
-    for runtime in aggregate["runtimes"]:
-        candidate = runtime["fault"]
-        if candidate is not None and candidate["runtime_id"] == fault["runtime_id"]:
-            return cast(dict[str, Any], copy.deepcopy(candidate))
-    raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
-
-
-def _project_emission(emission: Mapping[str, Any]) -> dict[str, Any]:
-    if emission["target"] == "external":
-        return {
-            "kind": "external",
-            "effect_id": emission["effect_id"],
-            "sequence": str(emission["sequence"]),
-            "event": emission["event"],
-            "payload": typed_value(emission["payload"]),
-            "correlation_id": emission["correlation_id"],
-        }
-    projected = {
-        "kind": "internal",
-        "event": emission["event"],
-        "event_id": emission["event_id"],
-        "target": copy.deepcopy(emission["target"]),
-        "payload": typed_value(emission["payload"]),
-    }
-    if "correlation_id" in emission:
-        projected["correlation_id"] = emission["correlation_id"]
-    return projected
-
-
-def _project_core_result(bundle: Bundle, result: Mapping[str, Any]) -> dict[str, Any]:
-    aggregate = (
-        aggregate_envelope(bundle, result["state"])
-        if result["state"] is not None
-        else None
-    )
-    return {
-        "status": result["status"],
-        "disposition": result["disposition"],
-        "aggregate_state": aggregate,
-        "emissions": [_project_emission(item) for item in result["emissions"]],
-        "fault": _project_fault(result, aggregate),
-        "rejection": copy.deepcopy(result["rejection"]),
-    }
-
-
-def _append_emissions(
-    checkpoint: dict[str, Any],
-    receipt: dict[str, Any],
-    projected_result: Mapping[str, Any],
-) -> None:
-    for index, emission in enumerate(projected_result["emissions"]):
-        if emission["kind"] == "internal":
-            sequence = checkpoint["next_delivery_sequence"]
-            checkpoint["next_delivery_sequence"] = _increment_checkpoint_number(
-                sequence
-            )
-            origin = {
-                "kind": "internal_emission",
-                "producing_receipt_sequence": receipt["receipt_sequence"],
-                "emission_index": str(index),
-            }
-            envelope = {
-                name: copy.deepcopy(emission[name])
-                for name in ("event", "event_id", "target", "payload")
-            }
-            if "correlation_id" in emission:
-                envelope["correlation_id"] = emission["correlation_id"]
-            checkpoint["pending_deliveries"].append(
-                {
-                    "delivery_sequence": sequence,
-                    "accepted_revision": checkpoint["revision"],
-                    "delivery_mode": "internal",
-                    "origin": origin,
-                    "envelope": envelope,
-                    "envelope_digest": delivery_request_digest(
-                        checkpoint["root_instance_id"], "internal", envelope
-                    ),
-                }
-            )
-            receipt["emission_references"].append(
-                {
-                    "kind": "internal_delivery",
-                    "emission_index": str(index),
-                    "event_id": emission["event_id"],
-                    "delivery_sequence": sequence,
-                }
-            )
-        else:
-            checkpoint["pending_outbox_intents"].append(
-                {
-                    "intent": {
-                        "effect_id": emission["effect_id"],
-                        "sequence": emission["sequence"],
-                        "event": emission["event"],
-                        "payload": copy.deepcopy(emission["payload"]),
-                        "correlation_id": emission["correlation_id"],
-                    },
-                    "state_revision": checkpoint["revision"],
-                    "delivery_state": {"status": "not_attempted"},
-                }
-            )
-            receipt["emission_references"].append(
-                {
-                    "kind": "external_outbox",
-                    "emission_index": str(index),
-                    "effect_id": emission["effect_id"],
-                }
-            )
-
-
-def _new_checkpoint(
-    aggregate: dict[str, Any],
-    request_digest: str,
-    projected_result: Mapping[str, Any],
-) -> dict[str, Any]:
-    receipt = {
-        "operation_kind": "creation",
-        "receipt_sequence": "0",
-        "creation_id": aggregate["creation_id"],
-        "request_digest": request_digest,
-        "committed_revision": "0",
-        "resulting_aggregate_state_digest": aggregate["aggregate_state_digest"],
-        "status": projected_result["status"],
-        "fault": copy.deepcopy(projected_result["fault"]),
-        "emission_references": [],
-    }
-    checkpoint = {
-        "execution_checkpoint_format": "determa.execution_checkpoint",
-        "execution_checkpoint_schema_version": 1,
-        "root_instance_id": aggregate["root_instance_id"],
-        "revision": "0",
-        "root_record": {
-            "status": "retained",
-            "aggregate_state": copy.deepcopy(aggregate),
-        },
-        "replay_retention": {
-            "mode": "permanent",
-            "permanent_replay_eligible": True,
-            "pruned_through_receipt_sequence": None,
-            "policy_identifier": None,
-        },
-        "next_delivery_sequence": "0",
-        "pending_deliveries": [],
-        "next_operation_receipt_sequence": "1",
-        "operation_receipts": [receipt],
-        "pending_outbox_intents": [],
-        "next_outbox_terminal_sequence": "0",
-        "terminal_outbox_records": [],
-        "outbox_effect_tombstones": [],
-        "migration_audit_records": [],
-    }
-    _append_emissions(checkpoint, receipt, projected_result)
-    return seal_execution_checkpoint(checkpoint)
 
 
 def _mutate(checkpoint: Mapping[str, Any]) -> dict[str, Any]:
@@ -547,18 +367,9 @@ class ExecutionHost:
         source: bytes,
         root_instance_id: str,
     ) -> Any:
-        document, _ = strict_json(source)
-        if (
-            isinstance(document, Mapping)
-            and document.get("execution_checkpoint_schema_version") == 2
-        ):
-            from .checkpoint_v2 import restore_execution_checkpoint_v2
+        from .checkpoint_v2 import restore_execution_checkpoint_v2
 
-            restored: Any = restore_execution_checkpoint_v2(
-                source, self.artifact_resolver
-            )
-        else:
-            restored = restore_execution_checkpoint(source, self.artifact_resolver)
+        restored = restore_execution_checkpoint_v2(source, self.artifact_resolver)
         if restored.document["root_instance_id"] != root_instance_id:
             raise ExecutionHostError("transaction_root_mismatch")
         if (
@@ -655,57 +466,10 @@ class ExecutionHost:
     def read_checkpoint(
         self,
         root_instance_id: str,
-    ) -> RestoredExecutionCheckpoint | RestoredExecutionCheckpointV2 | None:
+    ) -> RestoredExecutionCheckpoint | None:
         with self._transaction(root_instance_id) as transaction:
             source = transaction.load()
             return None if source is None else self._restore(source, root_instance_id)
-
-    def create(
-        self,
-        bundle: Bundle | BundleSource,
-        machine_id: str,
-        root_instance_id: str,
-        creation_id: str,
-        bindings: Mapping[str, Mapping[str, Any]] | None = None,
-    ) -> dict[str, Any]:
-        validated = bundle if isinstance(bundle, Bundle) else load_bundle(bundle)
-        normalized_bindings = {
-            name: copy.deepcopy(dict(value)) for name, value in (bindings or {}).items()
-        }
-        request_digest = creation_request_digest(
-            validated,
-            machine_id,
-            root_instance_id,
-            creation_id,
-            normalized_bindings,
-        )
-        with self._transaction(root_instance_id) as transaction:
-            source = transaction.load()
-            if source is not None:
-                checkpoint = self._restore(source, root_instance_id).document
-                receipt = checkpoint["operation_receipts"][0]
-                if (
-                    receipt["creation_id"] == creation_id
-                    and receipt["request_digest"] == request_digest
-                ):
-                    return {"result": "committed", "receipt": copy.deepcopy(receipt)}
-                raise ExecutionHostError(HostCode.CREATION_ID_CONFLICT)
-            result = core_create(
-                validated,
-                machine_id,
-                root_instance_id,
-                creation_id,
-                normalized_bindings,
-            )
-            projected = _project_core_result(validated, result)
-            aggregate = projected["aggregate_state"]
-            if aggregate is None:
-                raise ExecutionHostError(HostCode.CREATION_REJECTED)
-            candidate = _new_checkpoint(aggregate, request_digest, projected)
-            self._stage_insert(transaction, candidate)
-            receipt = copy.deepcopy(candidate["operation_receipts"][0])
-        self._after_commit()
-        return {"result": "committed", "receipt": receipt}
 
     def create_v2(
         self,
@@ -727,10 +491,9 @@ class ExecutionHost:
                 request_digest = creation_request_digest(
                     bundle, machine_id, root_instance_id, creation_id, normalized
                 )
-                receipt_value = receipt.get("legacy_receipt", receipt)
                 if (
-                    receipt_value["creation_id"] == creation_id
-                    and receipt_value["request_digest"] == request_digest
+                    receipt["creation_id"] == creation_id
+                    and receipt["request_digest"] == request_digest
                 ):
                     return {"result": "committed", "receipt": copy.deepcopy(receipt)}
                 raise ExecutionHostError(HostCode.CREATION_ID_CONFLICT)
@@ -829,27 +592,6 @@ class ExecutionHost:
         ):
             self._after_commit()
         return result
-
-    def upgrade_checkpoint_v2(
-        self,
-        root_instance_id: str,
-        *,
-        expected_revision: str,
-        expected_checkpoint_digest: str,
-    ) -> dict[str, Any]:
-        """Atomically upgrade one retained v1 checkpoint to v2."""
-        from .checkpoint_v2 import upgrade_checkpoint_v1_to_v2
-
-        with self._transaction(root_instance_id) as transaction:
-            source = transaction.load()
-            if source is None:
-                raise ExecutionHostError(PreAcceptanceCode.WRONG_ROOT)
-            prior = self._restore(source, root_instance_id).document
-            self._check_expected(prior, expected_revision, expected_checkpoint_digest)
-            candidate = upgrade_checkpoint_v1_to_v2(prior, self.artifact_resolver)
-            self._stage_replace(transaction, prior, candidate)
-        self._after_commit()
-        return candidate
 
     def prune_v2(
         self,
@@ -1014,6 +756,7 @@ class ExecutionHost:
                 "request_digest": request_digest,
                 "committed_revision": candidate["revision"],
                 "source_aggregate_state_digest": source_aggregate_state_digest,
+                "target_validated_bundle_fingerprint": target_validated_bundle_fingerprint,
                 "resulting_aggregate_state_digest": migrated[
                     "aggregate_state_digest"
                 ],
@@ -1119,459 +862,6 @@ class ExecutionHost:
             self._stage_replace(transaction, prior, candidate)
         self._after_commit()
         return candidate
-
-    def _delivery_candidate(
-        self, candidate: Any
-    ) -> tuple[str | None, str | None, Any, dict[str, Any] | None, str | None]:
-        if not isinstance(candidate, Mapping):
-            return None, None, None, None, None
-        allowed = {
-            "root_instance_id",
-            "delivery_mode",
-            "origin",
-            "envelope",
-            "envelope_digest",
-        }
-        required = {"root_instance_id", "delivery_mode", "origin", "envelope"}
-        if not required.issubset(candidate) or not set(candidate).issubset(allowed):
-            return None, None, None, None, None
-        root_instance_id = candidate["root_instance_id"]
-        mode = candidate["delivery_mode"]
-        origin = candidate["origin"]
-        envelope = candidate["envelope"]
-        supplied_digest = candidate.get("envelope_digest")
-        if (
-            not isinstance(root_instance_id, str)
-            or not root_instance_id
-            or not isinstance(mode, str)
-            or not isinstance(envelope, dict)
-            or not validate_execution_checkpoint_member("envelope", envelope)
-            or (supplied_digest is not None and not isinstance(supplied_digest, str))
-        ):
-            return None, None, None, None, None
-        return (
-            root_instance_id,
-            mode,
-            copy.deepcopy(origin),
-            copy.deepcopy(envelope),
-            supplied_digest,
-        )
-
-    def _not_accepted(self, code: PreAcceptanceCode) -> dict[str, Any]:
-        return {"result": "not_accepted", "failure": {"code": code.value}}
-
-    def _delivery_replay(
-        self,
-        checkpoint: Mapping[str, Any],
-        event_id: str,
-        digest: str,
-    ) -> dict[str, Any] | None:
-        for pending in checkpoint["pending_deliveries"]:
-            if pending["envelope"]["event_id"] == event_id:
-                if pending["envelope_digest"] != digest:
-                    return self._not_accepted(PreAcceptanceCode.EVENT_ID_CONFLICT)
-                return {
-                    "result": "pending",
-                    "event_id": event_id,
-                    "delivery_sequence": pending["delivery_sequence"],
-                    "accepted_revision": pending["accepted_revision"],
-                }
-        for receipt in checkpoint["operation_receipts"]:
-            if (
-                receipt["operation_kind"] == "delivery"
-                and receipt["event_id"] == event_id
-            ):
-                if receipt["request_digest"] != digest:
-                    return self._not_accepted(PreAcceptanceCode.EVENT_ID_CONFLICT)
-                return {"result": "committed", "receipt": copy.deepcopy(receipt)}
-        return None
-
-    def _prepare_acceptance(
-        self,
-        checkpoint: Mapping[str, Any],
-        candidate: Any,
-        bundle: Bundle | None = None,
-    ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
-        parsed = self._delivery_candidate(candidate)
-        root_instance_id, mode, origin, envelope, supplied_digest = parsed
-        if root_instance_id is None or mode is None or envelope is None:
-            return None, self._not_accepted(PreAcceptanceCode.MALFORMED_DELIVERY)
-        if root_instance_id != checkpoint["root_instance_id"]:
-            return None, self._not_accepted(PreAcceptanceCode.WRONG_ROOT)
-
-        digest = delivery_request_digest(root_instance_id, mode, envelope)
-        replay = self._delivery_replay(checkpoint, envelope["event_id"], digest)
-        if replay is not None:
-            return None, replay
-        if checkpoint["root_record"]["status"] == "tombstone":
-            return None, self._not_accepted(PreAcceptanceCode.TOMBSTONED_ROOT)
-        if bundle is not None and _bundle_requires_v2(bundle):
-            return None, self._not_accepted(
-                PreAcceptanceCode.CHECKPOINT_UPGRADE_REQUIRED
-            )
-
-        valid_mode = mode in {"input", "internal"}
-        valid_origin = validate_execution_checkpoint_member("deliveryOrigin", origin)
-        valid_pair = (mode == "input" and origin == {"kind": "host_input"}) or (
-            mode == "internal"
-            and isinstance(origin, Mapping)
-            and origin.get("kind") == "internal_emission"
-        )
-        if not valid_mode:
-            return None, self._not_accepted(PreAcceptanceCode.INVALID_DELIVERY_MODE)
-        if not valid_origin or not valid_pair:
-            return None, self._not_accepted(PreAcceptanceCode.INVALID_DELIVERY_ORIGIN)
-        if supplied_digest is not None and supplied_digest != digest:
-            return None, self._not_accepted(PreAcceptanceCode.DELIVERY_DIGEST_MISMATCH)
-        if (
-            _target_root_instance_id(envelope["target"])
-            != checkpoint["root_instance_id"]
-        ):
-            return None, self._not_accepted(PreAcceptanceCode.WRONG_ROOT)
-        return {
-            "root_instance_id": root_instance_id,
-            "delivery_mode": mode,
-            "origin": origin,
-            "envelope": envelope,
-            "envelope_digest": digest,
-        }, None
-
-    def accept_delivery(
-        self,
-        root_instance_id: str,
-        candidate: Any,
-        *,
-        expected_revision: str,
-        expected_checkpoint_digest: str,
-        selected_bundle: Bundle | BundleSource | None = None,
-    ) -> dict[str, Any]:
-        with self._transaction(root_instance_id) as transaction:
-            source = transaction.load()
-            if source is None:
-                return self._not_accepted(PreAcceptanceCode.WRONG_ROOT)
-            restored = self._restore(source, root_instance_id)
-            checkpoint = restored.document
-            prepared, result = self._prepare_acceptance(
-                checkpoint,
-                candidate,
-                (
-                    selected_bundle
-                    if isinstance(selected_bundle, Bundle)
-                    else load_bundle(selected_bundle)
-                    if selected_bundle is not None
-                    else restored.aggregate.bundle
-                    if restored.aggregate is not None
-                    else None
-                ),
-            )
-            if result is not None:
-                return result
-            assert prepared is not None
-            self._check_expected(
-                checkpoint, expected_revision, expected_checkpoint_digest
-            )
-            next_checkpoint = _mutate(checkpoint)
-            sequence = next_checkpoint["next_delivery_sequence"]
-            next_checkpoint["next_delivery_sequence"] = _increment_checkpoint_number(
-                sequence
-            )
-            pending = {
-                "delivery_sequence": sequence,
-                "accepted_revision": next_checkpoint["revision"],
-                "delivery_mode": prepared["delivery_mode"],
-                "origin": prepared["origin"],
-                "envelope": prepared["envelope"],
-                "envelope_digest": prepared["envelope_digest"],
-            }
-            next_checkpoint["pending_deliveries"].append(pending)
-            next_checkpoint = seal_execution_checkpoint(next_checkpoint)
-            self._stage_replace(transaction, checkpoint, next_checkpoint)
-            response = {
-                "result": "pending",
-                "event_id": pending["envelope"]["event_id"],
-                "delivery_sequence": sequence,
-                "accepted_revision": pending["accepted_revision"],
-            }
-        self._after_commit()
-        return response
-
-    def _commit_delivery(
-        self,
-        checkpoint: Mapping[str, Any],
-        restored: RestoredExecutionCheckpoint,
-        request: dict[str, Any],
-        projected: Mapping[str, Any],
-        *,
-        foreground: bool,
-        pending: Mapping[str, Any] | None = None,
-    ) -> tuple[dict[str, Any], dict[str, Any]]:
-        candidate = _mutate(checkpoint)
-        if foreground:
-            delivery_sequence = candidate["next_delivery_sequence"]
-            candidate["next_delivery_sequence"] = _increment_checkpoint_number(
-                delivery_sequence
-            )
-            accepted_revision = candidate["revision"]
-        else:
-            assert pending is not None
-            candidate["pending_deliveries"] = [
-                item
-                for item in candidate["pending_deliveries"]
-                if item["delivery_sequence"] != pending["delivery_sequence"]
-            ]
-            delivery_sequence = pending["delivery_sequence"]
-            accepted_revision = pending["accepted_revision"]
-            request = {
-                "delivery_mode": pending["delivery_mode"],
-                "origin": copy.deepcopy(pending["origin"]),
-                "envelope": copy.deepcopy(pending["envelope"]),
-                "envelope_digest": pending["envelope_digest"],
-            }
-        receipt_sequence = candidate["next_operation_receipt_sequence"]
-        candidate["next_operation_receipt_sequence"] = _increment_checkpoint_number(
-            receipt_sequence
-        )
-        aggregate = copy.deepcopy(projected["aggregate_state"])
-        if aggregate is None or restored.aggregate is None:
-            raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
-        candidate["root_record"]["aggregate_state"] = aggregate
-        receipt = {
-            "operation_kind": "delivery",
-            "receipt_sequence": receipt_sequence,
-            "event_id": request["envelope"]["event_id"],
-            "request_digest": request["envelope_digest"],
-            "accepted_delivery_sequence": delivery_sequence,
-            "accepted_revision": accepted_revision,
-            "delivery_mode": request["delivery_mode"],
-            "origin": copy.deepcopy(request["origin"]),
-            "committed_revision": candidate["revision"],
-            "resulting_aggregate_state_digest": aggregate["aggregate_state_digest"],
-            "outcome": {
-                "status": projected["status"],
-                "disposition": projected["disposition"],
-                "fault": copy.deepcopy(projected["fault"]),
-                "rejection": copy.deepcopy(projected["rejection"]),
-            },
-            "emission_references": [],
-        }
-        candidate["operation_receipts"].append(receipt)
-        _append_emissions(candidate, receipt, projected)
-        return seal_execution_checkpoint(candidate), receipt
-
-    def process_pending_delivery(
-        self,
-        root_instance_id: str,
-        candidate: Any,
-        *,
-        expected_revision: str,
-        expected_checkpoint_digest: str,
-    ) -> dict[str, Any]:
-        with self._transaction(root_instance_id) as transaction:
-            source = transaction.load()
-            if source is None:
-                raise ExecutionHostError(PreAcceptanceCode.WRONG_ROOT)
-            restored = self._restore(source, root_instance_id)
-            checkpoint = restored.document
-            parsed = self._delivery_candidate(candidate)
-            candidate_root, mode, origin, envelope, supplied_digest = parsed
-            if (
-                candidate_root != root_instance_id
-                or mode not in {"input", "internal"}
-                or origin is None
-                or envelope is None
-            ):
-                raise ExecutionHostError(PreAcceptanceCode.MALFORMED_DELIVERY)
-            digest = delivery_request_digest(root_instance_id, mode, envelope)
-            if supplied_digest is not None and supplied_digest != digest:
-                raise ExecutionHostError(PreAcceptanceCode.DELIVERY_DIGEST_MISMATCH)
-            replay = self._delivery_replay(checkpoint, envelope["event_id"], digest)
-            if replay is not None and replay["result"] == "committed":
-                return replay
-            if replay is not None and replay["result"] == "not_accepted":
-                raise ExecutionHostError(replay["failure"]["code"])
-            pending = next(
-                (
-                    item
-                    for item in checkpoint["pending_deliveries"]
-                    if item["envelope"]["event_id"] == envelope["event_id"]
-                ),
-                None,
-            )
-            if pending is None or pending["envelope_digest"] != digest:
-                raise ExecutionHostError(HostCode.EVENT_ID_CONFLICT)
-            self._check_expected(
-                checkpoint, expected_revision, expected_checkpoint_digest
-            )
-            if restored.aggregate is None:
-                raise ExecutionHostError(PreAcceptanceCode.TOMBSTONED_ROOT)
-            result = core_dispatch(
-                restored.aggregate.bundle,
-                restored.aggregate.state,
-                _delivery_from_wire(pending["delivery_mode"], pending["envelope"]),
-            )
-            projected = _project_core_result(restored.aggregate.bundle, result)
-            next_checkpoint, receipt = self._commit_delivery(
-                checkpoint,
-                restored,
-                {},
-                projected,
-                foreground=False,
-                pending=pending,
-            )
-            self._stage_replace(transaction, checkpoint, next_checkpoint)
-            response = {"result": "committed", "receipt": copy.deepcopy(receipt)}
-        self._after_commit()
-        return response
-
-    def foreground_process_delivery(
-        self,
-        root_instance_id: str,
-        candidate: Any,
-        *,
-        expected_revision: str,
-        expected_checkpoint_digest: str,
-    ) -> dict[str, Any]:
-        with self._transaction(root_instance_id) as transaction:
-            source = transaction.load()
-            if source is None:
-                raise ExecutionHostError(PreAcceptanceCode.WRONG_ROOT)
-            restored = self._restore(source, root_instance_id)
-            checkpoint = restored.document
-            prepared, replay = self._prepare_acceptance(
-                checkpoint,
-                candidate,
-                restored.aggregate.bundle if restored.aggregate is not None else None,
-            )
-            if replay is not None:
-                return replay
-            assert prepared is not None
-            self._check_expected(
-                checkpoint, expected_revision, expected_checkpoint_digest
-            )
-            if restored.aggregate is None:
-                raise ExecutionHostError(PreAcceptanceCode.TOMBSTONED_ROOT)
-            result = core_dispatch(
-                restored.aggregate.bundle,
-                restored.aggregate.state,
-                _delivery_from_wire(prepared["delivery_mode"], prepared["envelope"]),
-            )
-            projected = _project_core_result(restored.aggregate.bundle, result)
-            next_checkpoint, receipt = self._commit_delivery(
-                checkpoint,
-                restored,
-                prepared,
-                projected,
-                foreground=True,
-            )
-            self._stage_replace(transaction, checkpoint, next_checkpoint)
-            response = {"result": "committed", "receipt": copy.deepcopy(receipt)}
-        self._after_commit()
-        return response
-
-    def maintenance_migration(
-        self,
-        root_instance_id: str,
-        operation_id: str,
-        target_validated_bundle_fingerprint: str,
-        migration_descriptor_digest_route: Sequence[str],
-        *,
-        source_aggregate_state_digest: str,
-        expected_revision: str,
-        expected_checkpoint_digest: str,
-        maintenance_mode: bool = True,
-        limits: MigrationLimits | None = None,
-    ) -> dict[str, Any]:
-        if not operation_id or not validate_execution_checkpoint_member(
-            "sha256", source_aggregate_state_digest
-        ):
-            raise ExecutionHostError(PersistenceCode.INVALID_MIGRATION_REQUEST)
-        request_digest = maintenance_migration_request_digest(
-            root_instance_id,
-            operation_id,
-            source_aggregate_state_digest,
-            target_validated_bundle_fingerprint,
-            migration_descriptor_digest_route,
-            maintenance_mode,
-        )
-        with self._transaction(root_instance_id) as transaction:
-            source = transaction.load()
-            if source is None:
-                raise ExecutionHostError(PreAcceptanceCode.WRONG_ROOT)
-            restored = self._restore(source, root_instance_id)
-            checkpoint = restored.document
-            for receipt in checkpoint["operation_receipts"]:
-                if (
-                    receipt["operation_kind"] == "maintenance_migration"
-                    and receipt["operation_id"] == operation_id
-                ):
-                    if receipt["request_digest"] == request_digest:
-                        return {
-                            "result": "committed",
-                            "receipt": copy.deepcopy(receipt),
-                        }
-                    raise ExecutionHostError(HostCode.OPERATION_ID_CONFLICT)
-            self._check_expected(
-                checkpoint, expected_revision, expected_checkpoint_digest
-            )
-            if restored.aggregate is None:
-                raise ExecutionHostError(PreAcceptanceCode.TOMBSTONED_ROOT)
-            current_source_digest = restored.aggregate.aggregate_envelope[
-                "aggregate_state_digest"
-            ]
-            if source_aggregate_state_digest != current_source_digest:
-                raise ExecutionHostError(PersistenceCode.INVALID_MIGRATION_REQUEST)
-            result = migrate_aggregate(
-                restored.aggregate.aggregate_envelope,
-                target_validated_bundle_fingerprint,
-                migration_descriptor_digest_route,
-                self.artifact_resolver,
-                maintenance_mode=maintenance_mode,
-                resource_limits=limits,
-            )
-            if result.failure is not None or result.aggregate_envelope is None:
-                code = (
-                    "migration_failed"
-                    if result.failure is None
-                    else result.failure.code
-                )
-                raise ExecutionHostError(code)
-            candidate = _mutate(checkpoint)
-            receipt_sequence = candidate["next_operation_receipt_sequence"]
-            candidate["next_operation_receipt_sequence"] = _increment_checkpoint_number(
-                receipt_sequence
-            )
-            migration_sequences = [
-                item["migration_sequence"] for item in result.audit_records
-            ]
-            receipt = {
-                "operation_kind": "maintenance_migration",
-                "receipt_sequence": receipt_sequence,
-                "operation_id": operation_id,
-                "request_digest": request_digest,
-                "committed_revision": candidate["revision"],
-                "source_aggregate_state_digest": source_aggregate_state_digest,
-                "resulting_aggregate_state_digest": result.aggregate_envelope[
-                    "aggregate_state_digest"
-                ],
-                "migration_sequences": migration_sequences,
-                "result_code": (
-                    "migration_applied"
-                    if migration_sequences
-                    else "migration_no_operation"
-                ),
-            }
-            candidate["root_record"]["aggregate_state"] = copy.deepcopy(
-                result.aggregate_envelope
-            )
-            candidate["operation_receipts"].append(receipt)
-            candidate["migration_audit_records"].extend(
-                copy.deepcopy(result.audit_records)
-            )
-            candidate = seal_execution_checkpoint(candidate)
-            self._stage_replace(transaction, checkpoint, candidate)
-            response = {"result": "committed", "receipt": copy.deepcopy(receipt)}
-        self._after_commit()
-        return response
 
     def update_pending_outbox(
         self,
@@ -1907,78 +1197,6 @@ class ExecutionHost:
         self._after_commit()
         return response
 
-    def tombstone_root(
-        self,
-        root_instance_id: str,
-        operation_id: str,
-        *,
-        expected_revision: str,
-        expected_checkpoint_digest: str,
-    ) -> dict[str, Any]:
-        if not operation_id:
-            raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
-        with self._transaction(root_instance_id) as transaction:
-            source = transaction.load()
-            if source is None:
-                raise ExecutionHostError(PreAcceptanceCode.WRONG_ROOT)
-            restored = self._restore(source, root_instance_id)
-            checkpoint = restored.document
-            root_record = checkpoint["root_record"]
-            if root_record["status"] == "tombstone":
-                if root_record["tombstone_operation_id"] == operation_id:
-                    return {
-                        "result": "tombstoned",
-                        "tombstone": copy.deepcopy(root_record),
-                    }
-                raise ExecutionHostError(HostCode.OPERATION_ID_CONFLICT)
-            self._check_expected(
-                checkpoint, expected_revision, expected_checkpoint_digest
-            )
-            if restored.aggregate is None:
-                raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
-            root_runtime = restored.aggregate.state["runtimes"][
-                restored.aggregate.state["root_runtime_id"]
-            ]
-            if (
-                root_runtime["status"] not in {"completed", "faulted"}
-                or checkpoint["pending_deliveries"]
-                or checkpoint["pending_outbox_intents"]
-            ):
-                raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
-            aggregate = root_record["aggregate_state"]
-            candidate = _mutate(checkpoint)
-            tombstone = {
-                "status": "tombstone",
-                "root_runtime_id": aggregate["root_runtime_id"],
-                "creation_id": aggregate["creation_id"],
-                "terminal_status": root_runtime["status"],
-                "final_aggregate_state_digest": aggregate["aggregate_state_digest"],
-                "tombstone_operation_id": operation_id,
-            }
-            candidate["root_record"] = tombstone
-            candidate = seal_execution_checkpoint(candidate)
-            self._stage_replace(transaction, checkpoint, candidate)
-            response = {
-                "result": "tombstoned",
-                "tombstone": copy.deepcopy(tombstone),
-            }
-        self._after_commit()
-        return response
-
-    def delete_checkpoint(
-        self,
-        root_instance_id: str,
-        *,
-        expected_revision: str,
-        expected_checkpoint_digest: str,
-    ) -> dict[str, Any]:
-        del root_instance_id, expected_revision, expected_checkpoint_digest
-        return {
-            "result": "unsupported",
-            "failure": {"code": HostCode.PHYSICAL_DELETION_UNSUPPORTED.value},
-        }
-
-
 class SharedExecutionTransaction:
     """Root-bound staging surface for one host-owned shared transaction."""
 
@@ -2017,7 +1235,7 @@ class SharedExecutionTransaction:
     def _deactivate(self) -> None:
         self._active = False
 
-    def create(
+    def create_v2(
         self,
         bundle: Bundle | BundleSource,
         machine_id: str,
@@ -2025,13 +1243,64 @@ class SharedExecutionTransaction:
         bindings: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> StagedExecutionResult:
         return self._stage(
-            "create",
-            lambda: self._host.create(
+            "create_v2",
+            lambda: self._host.create_v2(
                 bundle,
                 machine_id,
                 self.root_instance_id,
                 creation_id,
                 bindings,
+            ),
+        )
+
+    def admit_v2(
+        self,
+        deliveries: Sequence[Mapping[str, Any]],
+        *,
+        expected_revision: str,
+        expected_checkpoint_digest: str,
+    ) -> StagedExecutionResult:
+        return self._stage(
+            "admit_v2",
+            lambda: self._host.admit_v2(
+                self.root_instance_id,
+                deliveries,
+                expected_revision=expected_revision,
+                expected_checkpoint_digest=expected_checkpoint_digest,
+            ),
+        )
+
+    def process_ready_v2(
+        self,
+        target_runtime_id: str,
+        *,
+        expected_revision: str,
+        expected_checkpoint_digest: str,
+    ) -> StagedExecutionResult:
+        return self._stage(
+            "process_ready_v2",
+            lambda: self._host.process_ready_v2(
+                self.root_instance_id,
+                target_runtime_id,
+                expected_revision=expected_revision,
+                expected_checkpoint_digest=expected_checkpoint_digest,
+            ),
+        )
+
+    def prune_v2(
+        self,
+        cutoff_receipt_sequence: str,
+        *,
+        expected_revision: str,
+        expected_checkpoint_digest: str,
+    ) -> StagedExecutionResult:
+        return self._stage(
+            "prune_v2",
+            lambda: self._host.prune_v2(
+                self.root_instance_id,
+                cutoff_receipt_sequence,
+                expected_revision=expected_revision,
+                expected_checkpoint_digest=expected_checkpoint_digest,
             ),
         )
 
@@ -2060,81 +1329,20 @@ class SharedExecutionTransaction:
             ),
         )
 
-    def accept_delivery(
-        self,
-        candidate: Any,
-        *,
-        expected_revision: str,
-        expected_checkpoint_digest: str,
-    ) -> StagedExecutionResult:
-        return self._stage(
-            "accept_delivery",
-            lambda: self._host.accept_delivery(
-                self.root_instance_id,
-                candidate,
-                expected_revision=expected_revision,
-                expected_checkpoint_digest=expected_checkpoint_digest,
-            ),
-        )
-
-    def process_pending_delivery(
-        self,
-        candidate: Any,
-        *,
-        expected_revision: str,
-        expected_checkpoint_digest: str,
-    ) -> StagedExecutionResult:
-        return self._stage(
-            "process_pending_delivery",
-            lambda: self._host.process_pending_delivery(
-                self.root_instance_id,
-                candidate,
-                expected_revision=expected_revision,
-                expected_checkpoint_digest=expected_checkpoint_digest,
-            ),
-        )
-
-    def foreground_process_delivery(
-        self,
-        candidate: Any,
-        *,
-        expected_revision: str,
-        expected_checkpoint_digest: str,
-    ) -> StagedExecutionResult:
-        return self._stage(
-            "foreground_process_delivery",
-            lambda: self._host.foreground_process_delivery(
-                self.root_instance_id,
-                candidate,
-                expected_revision=expected_revision,
-                expected_checkpoint_digest=expected_checkpoint_digest,
-            ),
-        )
-
-    def maintenance_migration(
+    def tombstone_root_v2(
         self,
         operation_id: str,
-        target_validated_bundle_fingerprint: str,
-        migration_descriptor_digest_route: Sequence[str],
         *,
-        source_aggregate_state_digest: str,
         expected_revision: str,
         expected_checkpoint_digest: str,
-        maintenance_mode: bool = True,
-        limits: MigrationLimits | None = None,
     ) -> StagedExecutionResult:
         return self._stage(
-            "maintenance_migration",
-            lambda: self._host.maintenance_migration(
+            "tombstone_root_v2",
+            lambda: self._host.tombstone_root_v2(
                 self.root_instance_id,
                 operation_id,
-                target_validated_bundle_fingerprint,
-                migration_descriptor_digest_route,
-                source_aggregate_state_digest=source_aggregate_state_digest,
                 expected_revision=expected_revision,
                 expected_checkpoint_digest=expected_checkpoint_digest,
-                maintenance_mode=maintenance_mode,
-                limits=limits,
             ),
         )
 
@@ -2226,24 +1434,6 @@ class SharedExecutionTransaction:
                 expected_checkpoint_digest=expected_checkpoint_digest,
             ),
         )
-
-    def tombstone_root(
-        self,
-        operation_id: str,
-        *,
-        expected_revision: str,
-        expected_checkpoint_digest: str,
-    ) -> StagedExecutionResult:
-        return self._stage(
-            "tombstone_root",
-            lambda: self._host.tombstone_root(
-                self.root_instance_id,
-                operation_id,
-                expected_revision=expected_revision,
-                expected_checkpoint_digest=expected_checkpoint_digest,
-            ),
-        )
-
 
 def _target_root_instance_id(target: Mapping[str, Any]) -> str:
     member = next(iter(target.values()))

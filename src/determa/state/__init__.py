@@ -6,22 +6,18 @@ import logging
 
 from .__about__ import __version__
 from .checkpoint import (
-    RestoredExecutionCheckpoint,
     execution_checkpoint_digest,
-    restore_execution_checkpoint,
     seal_execution_checkpoint,
     serialize_execution_checkpoint,
     validate_execution_checkpoint_member,
-    validate_execution_checkpoint_semantics,
 )
 from .checkpoint_v2 import (
-    RestoredExecutionCheckpointV2,
+    RestoredExecutionCheckpoint,
     admit_checkpoint_v2,
     create_checkpoint_v2,
     prune_checkpoint_v2,
     restore_execution_checkpoint_v2,
     step_checkpoint_v2,
-    upgrade_checkpoint_v1_to_v2,
 )
 from .codes import (
     PORTABLE_CODE_SETS,
@@ -59,22 +55,15 @@ from .host import (
     validate_host_profile,
 )
 from .migration import (
-    MigrationDispatchResult,
-    MigrationFailure,
     MigrationLimits,
-    MigrationResult,
-    migrate_aggregate,
-    migrate_and_dispatch,
 )
 from .queueing import (
     admit_aggregate_v2,
     create_aggregate_v2,
-    downgrade_aggregate_v2_to_v1,
     migrate_aggregate_v2,
     restore_aggregate_v2,
     seal_aggregate_v2,
     step_aggregate_v2,
-    upgrade_aggregate_v1_to_v2,
 )
 from .stores import (
     COMPACT_EFFECT_IDENTITY_RETENTION,
@@ -139,7 +128,6 @@ __all__ = [
     "create_aggregate_v2",
     "create_checkpoint_v2",
     "DispatchRejectionCode",
-    "downgrade_aggregate_v2_to_v1",
     "DispositionCode",
     "ErrorRecord",
     "EPHEMERAL",
@@ -157,10 +145,7 @@ __all__ = [
     "MemoryExecutionStore",
     "MachineLoadFailureCode",
     "MigrationDescriptorResolver",
-    "MigrationDispatchResult",
-    "MigrationFailure",
     "MigrationLimits",
-    "MigrationResult",
     "migrate_aggregate_v2",
     "PERMANENT_OUTBOX_TERMINAL_RETENTION",
     "PERMANENT_RECEIPT_RETENTION",
@@ -173,7 +158,6 @@ __all__ = [
     "RestoredAggregate",
     "RestoredAggregatePackage",
     "RestoredExecutionCheckpoint",
-    "RestoredExecutionCheckpointV2",
     "SHARED_APPLICATION_TRANSACTION",
     "STANDARD_CAPABILITIES",
     "SchemaError",
@@ -193,8 +177,6 @@ __all__ = [
     "execution_checkpoint_digest",
     "file_execution_store_factory",
     "load_bundle",
-    "migrate_aggregate",
-    "migrate_and_dispatch",
     "memory_execution_store_factory",
     "maintenance_migration_request_digest",
     "outbox_intent_digest",
@@ -205,7 +187,6 @@ __all__ = [
     "restore_aggregate",
     "restore_aggregate_v2",
     "restore_aggregate_package",
-    "restore_execution_checkpoint",
     "restore_execution_checkpoint_v2",
     "seal_aggregate_v2",
     "seal_execution_checkpoint",
@@ -216,10 +197,7 @@ __all__ = [
     "sqlite_execution_store_factory",
     "validate",
     "validate_execution_checkpoint_member",
-    "validate_execution_checkpoint_semantics",
     "validate_host_profile",
-    "upgrade_aggregate_v1_to_v2",
-    "upgrade_checkpoint_v1_to_v2",
 ]
 
 logging.getLogger("determa.state").addHandler(logging.NullHandler())

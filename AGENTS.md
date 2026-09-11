@@ -11,19 +11,19 @@ package so it can coexist with the umbrella `determa` launcher.
 The implementation is conformant only when it passes the language-neutral suite.
 The implementation uses these immutable inputs:
 
-- specification: `e22f9db295d632f3f46a9d1260c63b5af92efa7e`;
-- conformance: `8f6a4d9101fd6554e9a51da72ca48160368d4e83` (114 core cases,
-  108 persistence vectors, 12 persistence-profile steps, 102 execution-checkpoint
-  vectors, 113 version-2 vectors, and 164 generated version-2 artifacts).
+- specification: `3f2dc4217971d5c6598436b19e415c53ec095dfe`;
+- conformance: `e72f72396fae44cbee323bf988d86966235dbd16` (98 format-1
+  core cases, 162 version-2 vectors, and 373 generated version-2 artifacts).
 
 The package metadata remains `0.2.0`.
 
 ## Boundaries
 
 The pure public API remains `load_bundle`, `create`, and `dispatch`, plus validation
-and error types exported by `determa.state`. The optional synchronous `ExecutionHost`
-and execution-store APIs wrap that core without changing its exact `format: 1`
-grammar. Do not restore abandoned draft field names or compatibility aliases.
+and error types exported by `determa.state`. Portable artifacts and checkpoints support
+schema version 2 only. The optional synchronous `ExecutionHost` and execution-store
+APIs wrap that core without changing its exact `format: 1` machine grammar. Do not
+restore abandoned draft field names, artifact version 1 paths, or compatibility aliases.
 
 The core is a pure foreground transform over one root ownership aggregate. It has no
 hidden queues, timers, stores, or standardized execution CLI. Portable aggregate

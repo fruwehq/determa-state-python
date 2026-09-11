@@ -137,18 +137,12 @@ class MemoryArtifactResolver:
         self, digest: str, descriptor: ArtifactSource, *, trusted: bool = True
     ) -> None:
         candidate, _ = strict_json(descriptor)
-        kind = (
-            "migration_descriptor_v2"
-            if isinstance(candidate, dict)
-            and candidate.get("migration_descriptor_schema_version") == 2
-            else "migration_descriptor"
-        )
-        document, _ = load_json_artifact(candidate, kind)
+        document, _ = load_json_artifact(candidate, "migration_descriptor_v2")
         if migration_descriptor_digest(document) != digest:
             raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)
         existing = self._migration_descriptors.get(digest)
         if existing is not None:
-            current, _ = load_json_artifact(existing, kind)
+            current, _ = load_json_artifact(existing, "migration_descriptor_v2")
             if canonical_bytes(current) != canonical_bytes(document):
                 raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)
         else:
@@ -171,7 +165,7 @@ def _object_without_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     result: dict[str, Any] = {}
     for key, value in pairs:
         if key in result:
-            raise ArtifactError("duplicate_json_name")
+            raise ArtifactError(LoadCode.DUPLICATE_KEY)
         result[key] = value
     return result
 
@@ -338,13 +332,9 @@ def decimal(value: Any, *, positive: bool = False) -> int:
 @cache
 def artifact_schema(kind: str) -> dict[str, Any]:
     filename = {
-        "aggregate_state": "aggregate-state.schema.json",
         "aggregate_state_v2": "aggregate-state-v2.schema.json",
-        "migration_descriptor": "migration-descriptor.schema.json",
         "migration_descriptor_v2": "migration-descriptor-v2.schema.json",
-        "aggregate_state_package": "aggregate-state-package.schema.json",
         "aggregate_state_package_v2": "aggregate-state-package-v2.schema.json",
-        "execution_checkpoint": "execution-checkpoint.schema.json",
         "execution_checkpoint_v2": "execution-checkpoint-v2.schema.json",
         "core_step_result_v2": "core-step-result-v2.schema.json",
     }[kind]
@@ -357,13 +347,9 @@ def _schema_registry() -> Any:
 
     registry = Registry()
     for kind in (
-        "aggregate_state",
         "aggregate_state_v2",
-        "migration_descriptor",
         "migration_descriptor_v2",
-        "aggregate_state_package",
         "aggregate_state_package_v2",
-        "execution_checkpoint",
         "execution_checkpoint_v2",
         "core_step_result_v2",
     ):
@@ -376,14 +362,6 @@ def _format_code(document: Any, kind: str) -> str | None:
     if not isinstance(document, dict):
         return None
     definitions = {
-        "aggregate_state": (
-            "aggregate_state_format",
-            "determa.aggregate_state",
-            "aggregate_state_schema_version",
-            1,
-            PersistenceCode.UNSUPPORTED_AGGREGATE_STATE_FORMAT,
-            PersistenceCode.UNSUPPORTED_AGGREGATE_STATE_SCHEMA_VERSION,
-        ),
         "aggregate_state_v2": (
             "aggregate_state_format",
             "determa.aggregate_state",
@@ -391,14 +369,6 @@ def _format_code(document: Any, kind: str) -> str | None:
             2,
             PersistenceCode.UNSUPPORTED_AGGREGATE_STATE_FORMAT,
             PersistenceCode.UNSUPPORTED_AGGREGATE_STATE_SCHEMA_VERSION,
-        ),
-        "migration_descriptor": (
-            "migration_descriptor_format",
-            "determa.aggregate_migration",
-            "migration_descriptor_schema_version",
-            1,
-            PersistenceCode.UNSUPPORTED_MIGRATION_DESCRIPTOR_FORMAT,
-            PersistenceCode.UNSUPPORTED_MIGRATION_DESCRIPTOR_SCHEMA_VERSION,
         ),
         "migration_descriptor_v2": (
             "migration_descriptor_format",
@@ -408,14 +378,6 @@ def _format_code(document: Any, kind: str) -> str | None:
             PersistenceCode.UNSUPPORTED_MIGRATION_DESCRIPTOR_FORMAT,
             PersistenceCode.UNSUPPORTED_MIGRATION_DESCRIPTOR_SCHEMA_VERSION,
         ),
-        "aggregate_state_package": (
-            "aggregate_state_package_format",
-            "determa.aggregate_state_package",
-            "aggregate_state_package_schema_version",
-            1,
-            PersistenceCode.UNSUPPORTED_AGGREGATE_STATE_PACKAGE_FORMAT,
-            PersistenceCode.UNSUPPORTED_AGGREGATE_STATE_PACKAGE_SCHEMA_VERSION,
-        ),
         "aggregate_state_package_v2": (
             "aggregate_state_package_format",
             "determa.aggregate_state_package",
@@ -423,14 +385,6 @@ def _format_code(document: Any, kind: str) -> str | None:
             2,
             PersistenceCode.UNSUPPORTED_AGGREGATE_STATE_PACKAGE_FORMAT,
             PersistenceCode.UNSUPPORTED_AGGREGATE_STATE_PACKAGE_SCHEMA_VERSION,
-        ),
-        "execution_checkpoint": (
-            "execution_checkpoint_format",
-            "determa.execution_checkpoint",
-            "execution_checkpoint_schema_version",
-            1,
-            CheckpointCode.UNSUPPORTED_EXECUTION_CHECKPOINT_FORMAT,
-            CheckpointCode.UNSUPPORTED_EXECUTION_CHECKPOINT_SCHEMA_VERSION,
         ),
         "execution_checkpoint_v2": (
             "execution_checkpoint_format",
@@ -469,14 +423,12 @@ def load_json_artifact(source: ArtifactSource, kind: str) -> tuple[dict[str, Any
     try:
         document, raw = strict_json(source)
     except ArtifactError as exc:
+        if exc.code in {LoadCode.DUPLICATE_KEY, LoadCode.INVALID_UNICODE}:
+            raise
         code = {
-            "aggregate_state": PersistenceCode.INVALID_AGGREGATE_STATE,
             "aggregate_state_v2": PersistenceCode.INVALID_AGGREGATE_STATE,
-            "migration_descriptor": PersistenceCode.INVALID_MIGRATION_DESCRIPTOR,
             "migration_descriptor_v2": PersistenceCode.INVALID_MIGRATION_DESCRIPTOR,
-            "aggregate_state_package": PersistenceCode.INVALID_AGGREGATE_STATE_PACKAGE,
             "aggregate_state_package_v2": PersistenceCode.INVALID_AGGREGATE_STATE_PACKAGE,
-            "execution_checkpoint": CheckpointCode.INVALID_EXECUTION_CHECKPOINT,
             "execution_checkpoint_v2": CheckpointCode.INVALID_EXECUTION_CHECKPOINT,
             "core_step_result_v2": "invalid_core_step_result",
         }[kind]
@@ -489,13 +441,9 @@ def load_json_artifact(source: ArtifactSource, kind: str) -> tuple[dict[str, Any
     validator = jsonschema.Draft202012Validator(artifact_schema(kind), registry=_schema_registry())
     if not isinstance(document, dict) or next(validator.iter_errors(document), None) is not None:
         code = {
-            "aggregate_state": PersistenceCode.INVALID_AGGREGATE_STATE,
             "aggregate_state_v2": PersistenceCode.INVALID_AGGREGATE_STATE,
-            "migration_descriptor": PersistenceCode.INVALID_MIGRATION_DESCRIPTOR,
             "migration_descriptor_v2": PersistenceCode.INVALID_MIGRATION_DESCRIPTOR,
-            "aggregate_state_package": PersistenceCode.INVALID_AGGREGATE_STATE_PACKAGE,
             "aggregate_state_package_v2": PersistenceCode.INVALID_AGGREGATE_STATE_PACKAGE,
-            "execution_checkpoint": CheckpointCode.INVALID_EXECUTION_CHECKPOINT,
             "execution_checkpoint_v2": CheckpointCode.INVALID_EXECUTION_CHECKPOINT,
             "core_step_result_v2": "invalid_core_step_result",
         }[kind]
@@ -506,19 +454,13 @@ def load_json_artifact(source: ArtifactSource, kind: str) -> tuple[dict[str, Any
 def aggregate_state_digest(document: Mapping[str, Any]) -> str:
     body = copy.deepcopy(dict(document))
     body.pop("aggregate_state_digest", None)
-    version = body.get("aggregate_state_schema_version")
-    domain = (
-        "determa-aggregate-state-digest-2" if version == 2 else "determa-aggregate-state-digest-1"
-    )
-    return hash_value([domain, body])
+    return hash_value(["determa-aggregate-state-digest-2", body])
 
 
 def migration_descriptor_digest(document: Mapping[str, Any]) -> str:
     body = copy.deepcopy(dict(document))
     body.pop("migration_descriptor_digest", None)
-    version = body.get("migration_descriptor_schema_version")
-    domain = "determa-migration-descriptor-2" if version == 2 else "determa-migration-descriptor-1"
-    return hash_value([domain, body])
+    return hash_value(["determa-migration-descriptor-2", body])
 
 
 def normalized_definition_attachment(bundle: Bundle) -> dict[str, Any]:
@@ -801,7 +743,7 @@ def aggregate_envelope(bundle: Bundle | BundleSource, state: dict[str, Any]) -> 
     )
     document: dict[str, Any] = {
         "aggregate_state_format": "determa.aggregate_state",
-        "aggregate_state_schema_version": 1,
+        "aggregate_state_schema_version": 2,
         "machine_format": 1,
         "validated_bundle_fingerprint": validated.fingerprint,
         "namespace": validated.namespace,
@@ -811,11 +753,17 @@ def aggregate_envelope(bundle: Bundle | BundleSource, state: dict[str, Any]) -> 
         "creation_id": state["creation_id"],
         "root_runtime_id": state["root_runtime_id"],
         "migration_sequence": str(state.get("migration_sequence", 0)),
+        "next_acceptance_sequence": "0",
+        "next_queue_sequence": "0",
         "next_logical_step_sequence": str(state["next_logical_step_sequence"]),
         "next_output_sequence": str(state["next_output_sequence"]),
         "runtimes": sorted(
             (
-                _runtime_wire(validated, models, state, runtime)
+                {
+                    **_runtime_wire(validated, models, state, runtime),
+                    "ready_mailbox": [],
+                    "deferred_mailbox": [],
+                }
                 for runtime in state["runtimes"].values()
             ),
             key=(
@@ -1161,7 +1109,7 @@ def restore_aggregate(
     source: ArtifactSource, definition_resolver: DefinitionResolver
 ) -> RestoredAggregate:
     """Verify and restore one portable aggregate without changing the source."""
-    document, raw = load_json_artifact(source, "aggregate_state")
+    document, raw = load_json_artifact(source, "aggregate_state_v2")
     if aggregate_state_digest(document) != document["aggregate_state_digest"]:
         raise ArtifactError(PersistenceCode.AGGREGATE_STATE_DIGEST_MISMATCH)
     fingerprint = document["validated_bundle_fingerprint"]
@@ -1225,16 +1173,7 @@ def restore_aggregate_package(
     source: ArtifactSource, artifact_resolver: ArtifactResolver
 ) -> RestoredAggregatePackage:
     """Verify a transport package and seed one mutable resolver atomically."""
-    candidate, _raw = strict_json(source)
-    aggregate_version = (
-        candidate.get("aggregate_state", {}).get("aggregate_state_schema_version")
-        if isinstance(candidate, dict) and isinstance(candidate.get("aggregate_state"), dict)
-        else None
-    )
-    version = 2 if aggregate_version == 2 else 1
-    package_kind = "aggregate_state_package_v2" if version == 2 else "aggregate_state_package"
-    descriptor_kind = "migration_descriptor_v2" if version == 2 else "migration_descriptor"
-    document, _raw = load_json_artifact(candidate, package_kind)
+    document, _raw = load_json_artifact(source, "aggregate_state_package_v2")
     definitions: dict[str, Bundle] = {}
     descriptors: dict[str, dict[str, Any]] = {}
     try:
@@ -1266,7 +1205,9 @@ def restore_aggregate_package(
         for digest, descriptor in descriptors.items():
             existing_descriptor = artifact_resolver.resolve_migration_descriptor(digest)
             if existing_descriptor is not None:
-                current_descriptor, _ = load_json_artifact(existing_descriptor, descriptor_kind)
+                current_descriptor, _ = load_json_artifact(
+                    existing_descriptor, "migration_descriptor_v2"
+                )
                 if canonical_bytes(current_descriptor) != canonical_bytes(descriptor):
                     raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)
     except (ArtifactError, KeyError, TypeError, ValidationError) as exc:
@@ -1288,12 +1229,9 @@ def restore_aggregate_package(
         raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE_PACKAGE)
     overlay = _PackageResolver(artifact_resolver, definitions, descriptors)
     try:
-        if version == 2:
-            from .queueing import restore_aggregate_v2
+        from .queueing import restore_aggregate_v2
 
-            aggregate = restore_aggregate_v2(document["aggregate_state"], overlay)
-        else:
-            aggregate = restore_aggregate(document["aggregate_state"], overlay)
+        aggregate = restore_aggregate_v2(document["aggregate_state"], overlay)
         store_definition = cast(Callable[[str, Bundle], None], put_definition)
         store_descriptor = cast(Callable[[str, Mapping[str, Any]], None], put_descriptor)
         for fingerprint, bundle in definitions.items():

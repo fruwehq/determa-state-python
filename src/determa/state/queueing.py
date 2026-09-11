@@ -86,61 +86,6 @@ def _utf8(value: str) -> bytes:
     return value.encode("utf-8", errors="strict")
 
 
-def _project_v1(document: Mapping[str, Any]) -> dict[str, Any]:
-    result = copy.deepcopy(dict(document))
-    result["aggregate_state_schema_version"] = 1
-    result.pop("next_acceptance_sequence", None)
-    result.pop("next_queue_sequence", None)
-    for runtime in result["runtimes"]:
-        runtime.pop("ready_mailbox", None)
-        runtime.pop("deferred_mailbox", None)
-    result.pop("aggregate_state_digest", None)
-    result["aggregate_state_digest"] = aggregate_state_digest(result)
-    return result
-
-
-def _upgrade_document(document: Mapping[str, Any]) -> dict[str, Any]:
-    result = copy.deepcopy(dict(document))
-    result["aggregate_state_schema_version"] = 2
-    result["next_acceptance_sequence"] = "0"
-    result["next_queue_sequence"] = "0"
-    for runtime in result["runtimes"]:
-        runtime["ready_mailbox"] = []
-        runtime["deferred_mailbox"] = []
-    return seal_aggregate_v2(result)
-
-
-def upgrade_aggregate_v1_to_v2(
-    source: ArtifactSource, definition_resolver: DefinitionResolver
-) -> dict[str, Any]:
-    """Explicitly convert a valid version-1 aggregate to empty version-2 mailboxes."""
-    del definition_resolver
-    document, _ = load_json_artifact(source, "aggregate_state")
-    if aggregate_state_digest(document) != document["aggregate_state_digest"]:
-        raise ArtifactError(PersistenceFailureCode.AGGREGATE_STATE_DIGEST_MISMATCH)
-    return _upgrade_document(document)
-
-
-def downgrade_aggregate_v2_to_v1(
-    source: ArtifactSource, definition_resolver: DefinitionResolver
-) -> dict[str, Any]:
-    """Explicitly convert a version-2 aggregate only when no queued work exists."""
-    del definition_resolver
-    document, _ = load_json_artifact(source, "aggregate_state_v2")
-    if aggregate_state_digest(document) != document["aggregate_state_digest"]:
-        raise ArtifactError(PersistenceFailureCode.AGGREGATE_STATE_DIGEST_MISMATCH)
-    _validate_mailboxes(document)
-    if document["next_acceptance_sequence"] != "0" or document["next_queue_sequence"] != "0":
-        raise ArtifactError(PersistenceFailureCode.MIGRATION_TOTALITY_FAILURE)
-    if any(
-        runtime[mailbox]
-        for runtime in document["runtimes"]
-        for mailbox in ("ready_mailbox", "deferred_mailbox")
-    ):
-        raise ArtifactError(PersistenceFailureCode.MIGRATION_TOTALITY_FAILURE)
-    return {"result": "success", "aggregate_state": _project_v1(document)}
-
-
 def create_aggregate_v2(
     bundle: Bundle | BundleSource,
     machine_id: str,
@@ -160,7 +105,7 @@ def create_aggregate_v2(
     )
     if result["state"] is None:
         return {**result, "lifecycle_dispositions": []}
-    encoded = _upgrade_document(aggregate_envelope(validated, result["state"]))
+    encoded = aggregate_envelope(validated, result["state"])
     root_runtime = next(
         runtime
         for runtime in encoded["runtimes"]
@@ -249,16 +194,12 @@ def _valid_envelope_source(
     entry: Mapping[str, Any],
     declaration: Mapping[str, Any] | None,
     payload: Mapping[str, Any],
-    *,
-    allow_legacy: bool,
 ) -> bool:
     envelope = entry["envelope"]
     source = envelope["source"]
     mode = entry["delivery_mode"]
     if mode == "input":
         return bool(source == {"host": True} and envelope["cause_id"] == envelope["event_id"])
-    if "legacy_v1_internal" in source:
-        return allow_legacy
     event = envelope["event"]
     if declaration is not None or event == "env":
         if "runtime" not in source:
@@ -369,7 +310,6 @@ def _validate_mailbox_semantics(document: Mapping[str, Any], restored: RestoredA
                             entry,
                             declaration,
                             payload,
-                            allow_legacy=True,
                         )
                         and _mailbox_payload_is_normalized(
                             restored, runtime, entry, declaration, payload
@@ -393,7 +333,7 @@ def restore_aggregate_v2(
     ):
         raise ArtifactError(PersistenceFailureCode.INVALID_AGGREGATE_STATE)
     _validate_mailboxes(document)
-    restored = restore_aggregate(_project_v1(document), definition_resolver)
+    restored = restore_aggregate(document, definition_resolver)
     _validate_mailbox_semantics(document, restored)
     return RestoredAggregate(
         bundle=restored.bundle,
@@ -612,7 +552,6 @@ def admit_aggregate_v2(
             delivery,
             declaration,
             payload,
-            allow_legacy=False,
         ):
             return _admission_rejection(AdmissionCode.INVALID_DELIVERY_SOURCE.value, document)
         if not _mailbox_payload_is_normalized(
@@ -784,7 +723,7 @@ def _encode_after_dispatch(
     before: Mapping[str, Any],
     mailboxes: Mapping[str, tuple[list[Any], list[Any]]],
 ) -> dict[str, Any]:
-    result = _upgrade_document(aggregate_envelope(bundle, state))
+    result = aggregate_envelope(bundle, state)
     result["next_acceptance_sequence"] = before["next_acceptance_sequence"]
     result["next_queue_sequence"] = before["next_queue_sequence"]
     for runtime in result["runtimes"]:
@@ -1056,28 +995,6 @@ def resolver_for_bundle(bundle: Bundle | BundleSource) -> MemoryArtifactResolver
     return MemoryArtifactResolver(definitions={validated.fingerprint: validated})
 
 
-class _V1MigrationResolver:
-    def __init__(
-        self,
-        parent: DefinitionResolver,
-        descriptors: Mapping[str, Mapping[str, Any]],
-    ) -> None:
-        self.parent = parent
-        self.descriptors = descriptors
-
-    def resolve_definition(self, fingerprint: str) -> Bundle | BundleSource | None:
-        return self.parent.resolve_definition(fingerprint)
-
-    def definition_is_trusted(self, fingerprint: str) -> bool:
-        return self.parent.definition_is_trusted(fingerprint)
-
-    def resolve_migration_descriptor(self, digest: str) -> ArtifactSource | None:
-        return self.descriptors.get(digest)
-
-    def migration_descriptor_is_trusted(self, digest: str) -> bool:
-        return digest in self.descriptors
-
-
 def _queue_rule(
     descriptor: Mapping[str, Any], runtime: Mapping[str, Any], entry: Mapping[str, Any]
 ) -> Mapping[str, Any] | None:
@@ -1153,7 +1070,6 @@ def migrate_aggregate_v2(
     if len(migration_route) > limits.maximum_chain_length:
         raise ArtifactError(PersistenceFailureCode.MIGRATION_RESOURCE_LIMIT_EXCEEDED)
     descriptors: list[dict[str, Any]] = []
-    base_descriptors: dict[str, Mapping[str, Any]] = {}
     for digest in migration_route:
         source = artifact_resolver.resolve_migration_descriptor(digest)
         if source is None or not artifact_resolver.migration_descriptor_is_trusted(digest):
@@ -1161,9 +1077,6 @@ def migrate_aggregate_v2(
         descriptor, _ = load_json_artifact(source, "migration_descriptor_v2")
         if migration_descriptor_digest(descriptor) != digest:
             raise ArtifactError(PersistenceFailureCode.INVALID_MIGRATION_DESCRIPTOR)
-        base = descriptor["base_descriptor"]
-        base_digest = base["migration_descriptor_digest"]
-        base_descriptors[base_digest] = base
         descriptors.append(descriptor)
     if not descriptors:
         if (
@@ -1182,8 +1095,8 @@ def migrate_aggregate_v2(
         return empty_result
     if len({item["migration_descriptor_digest"] for item in descriptors}) != len(descriptors):
         raise ArtifactError(PersistenceFailureCode.MIGRATION_ROUTE_MISMATCH)
-    fingerprints = [descriptors[0]["base_descriptor"]["source_validated_bundle_fingerprint"]] + [
-        descriptor["base_descriptor"]["target_validated_bundle_fingerprint"]
+    fingerprints = [descriptors[0]["source_validated_bundle_fingerprint"]] + [
+        descriptor["target_validated_bundle_fingerprint"]
         for descriptor in descriptors
     ]
     if (
@@ -1191,14 +1104,13 @@ def migrate_aggregate_v2(
         or fingerprints[-1] != target_validated_bundle_fingerprint
         or len(set(fingerprints)) != len(fingerprints)
         or any(
-            left["base_descriptor"]["target_validated_bundle_fingerprint"]
-            != right["base_descriptor"]["source_validated_bundle_fingerprint"]
+            left["target_validated_bundle_fingerprint"]
+            != right["source_validated_bundle_fingerprint"]
             for left, right in zip(descriptors, descriptors[1:], strict=False)
         )
     ):
         raise ArtifactError(PersistenceFailureCode.MIGRATION_ROUTE_MISMATCH)
 
-    resolver = cast(Any, _V1MigrationResolver(artifact_resolver, base_descriptors))
     candidate = copy.deepcopy(restored.aggregate_envelope)
     dispositions: list[dict[str, Any]] = []
     disposed_entries: list[dict[str, Any]] = []
@@ -1206,24 +1118,21 @@ def migrate_aggregate_v2(
     for descriptor in descriptors:
         before_digest = candidate["aggregate_state_digest"]
         source_runtimes = candidate["runtimes"]
-        base = descriptor["base_descriptor"]
         migration = migrate_aggregate(
-            _project_v1(candidate),
-            base["target_validated_bundle_fingerprint"],
-            [base["migration_descriptor_digest"]],
-            resolver,
+            candidate,
+            descriptor["target_validated_bundle_fingerprint"],
+            [descriptor["migration_descriptor_digest"]],
+            artifact_resolver,
             maintenance_mode=maintenance_mode,
             resource_limits=limits,
         )
         if not migration.succeeded or migration.aggregate_envelope is None:
             assert migration.failure is not None
             raise ArtifactError(migration.failure.code)
-        hop = _upgrade_document(migration.aggregate_envelope)
-        hop["next_acceptance_sequence"] = candidate["next_acceptance_sequence"]
-        hop["next_queue_sequence"] = candidate["next_queue_sequence"]
+        hop = copy.deepcopy(migration.aggregate_envelope)
         target_runtimes = {runtime["runtime_id"]: runtime for runtime in hop["runtimes"]}
         target_bundle_source = artifact_resolver.resolve_definition(
-            base["target_validated_bundle_fingerprint"]
+            descriptor["target_validated_bundle_fingerprint"]
         )
         if target_bundle_source is None:
             raise ArtifactError(PersistenceFailureCode.TARGET_DEFINITION_UNAVAILABLE)
@@ -1232,7 +1141,10 @@ def migrate_aggregate_v2(
             if isinstance(target_bundle_source, Bundle)
             else load_bundle(target_bundle_source)
         )
-        target_state = restore_aggregate(_project_v1(hop), artifact_resolver).state
+        target_state = restore_aggregate(hop, artifact_resolver).state
+        for runtime in hop["runtimes"]:
+            runtime["ready_mailbox"] = []
+            runtime["deferred_mailbox"] = []
         for source_runtime in source_runtimes:
             runtime = target_runtimes.get(source_runtime["runtime_id"])
             for mailbox_name in ("ready_mailbox", "deferred_mailbox"):
@@ -1277,12 +1189,16 @@ def migrate_aggregate_v2(
         restore_aggregate_v2(candidate, artifact_resolver)
         audits.append(
             {
-                "migration_audit_record_schema_version": 1,
+                "migration_audit_record_schema_version": 2,
                 "root_instance_id": candidate["root_instance_id"],
                 "root_runtime_id": candidate["root_runtime_id"],
                 "migration_sequence": candidate["migration_sequence"],
-                "source_validated_bundle_fingerprint": base["source_validated_bundle_fingerprint"],
-                "target_validated_bundle_fingerprint": base["target_validated_bundle_fingerprint"],
+                "source_validated_bundle_fingerprint": descriptor[
+                    "source_validated_bundle_fingerprint"
+                ],
+                "target_validated_bundle_fingerprint": descriptor[
+                    "target_validated_bundle_fingerprint"
+                ],
                 "migration_descriptor_digest": descriptor["migration_descriptor_digest"],
                 "source_aggregate_state_digest": before_digest,
                 "target_aggregate_state_digest": candidate["aggregate_state_digest"],

@@ -21,17 +21,13 @@ ROOT = Path(__file__).resolve().parent.parent
 DEST = ROOT / "src" / "determa" / "state" / "data"
 SCHEMAS = (
     "machine.schema.json",
-    "aggregate-state.schema.json",
     "aggregate-state-v2.schema.json",
-    "migration-descriptor.schema.json",
     "migration-descriptor-v2.schema.json",
-    "aggregate-state-package.schema.json",
     "aggregate-state-package-v2.schema.json",
-    "execution-checkpoint.schema.json",
     "execution-checkpoint-v2.schema.json",
     "core-step-result-v2.schema.json",
 )
-SPEC_COMMIT = "e22f9db295d632f3f46a9d1260c63b5af92efa7e"
+SPEC_COMMIT = "3f2dc4217971d5c6598436b19e415c53ec095dfe"
 
 
 def _fetch(name: str) -> str:
