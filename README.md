@@ -6,8 +6,8 @@ a language-agnostic statechart engine with a shared normative conformance suite.
 This implementation supports Determa State `format: 1` at specification
 commit `2e33036563cb966b07124197db672159b4b7e1f4`. Correctness is determined by
 the 114-case core suite, 108 persistence vectors, 12 persistence-profile steps,
-99 execution-checkpoint vectors, 104 version-2 vectors, and 101 closed-code registry
-entries at conformance commit `e0e710dbd205bdd7eb3028d1b2941ce6445718a4`.
+99 execution-checkpoint vectors, 106 version-2 vectors, and 101 closed-code registry
+entries at conformance commit `531468c59c7a2dc32f5cbe92cfabf89805d27f6a`.
 
 The package metadata remains `0.2.0`. The implementation includes the portable
 execution-checkpoint host, selected legacy artifact decoding, and authoritative portable
