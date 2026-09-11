@@ -25,19 +25,16 @@ class CheckpointHostFailureCode(StrEnum):
     INJECTED_PRE_COMMIT_FAILURE = "injected_pre_commit_failure"
     INVALID_EXECUTION_CHECKPOINT = "invalid_execution_checkpoint"
     OPERATION_ID_CONFLICT = "operation_id_conflict"
-    PHYSICAL_DELETION_UNSUPPORTED = "physical_deletion_unsupported"
     RESPONSE_LOST_AFTER_COMMIT = "response_lost_after_commit"
 
 
 class CheckpointPreAcceptanceFailureCode(StrEnum):
-    CHECKPOINT_UPGRADE_REQUIRED = "checkpoint_upgrade_required"
     DELIVERY_DIGEST_MISMATCH = "delivery_digest_mismatch"
     DUPLICATE_EVENT_ID_IN_BATCH = "duplicate_event_id_in_batch"
     EVENT_ID_CONFLICT = "event_id_conflict"
     INACTIVE_COMPONENT_TARGET = "inactive_component_target"
     INVALID_CORRELATION = "invalid_correlation"
     INVALID_DELIVERY_MODE = "invalid_delivery_mode"
-    INVALID_DELIVERY_ORIGIN = "invalid_delivery_origin"
     INVALID_DELIVERY_SOURCE = "invalid_delivery_source"
     INVALID_EVENT = "invalid_event"
     INVALID_INSTANCE_TARGET = "invalid_instance_target"

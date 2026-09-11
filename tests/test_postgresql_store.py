@@ -18,10 +18,9 @@ from determa.state import (
     PostgreSQLExecutionStore,
     StagedExecutionResult,
     load_bundle,
-    portable_envelope,
 )
 
-from .test_checkpoint_host import MACHINE, _host
+from .test_execution_stores import MACHINE, _resolver
 
 _STRONG_RETENTION_CAPABILITIES = {
     ROOT_IDENTITY_RETENTION,
@@ -48,36 +47,21 @@ def test_postgresql_cas_and_shared_native_transaction() -> None:
     psycopg = pytest.importorskip("psycopg")
     store = _store()
     store.setup_schema()
-    local_host, _ = _host()
-    resolver = local_host.artifact_resolver
+    resolver = _resolver()
     host = ExecutionHost(store, resolver)
-    host.create(load_bundle(MACHINE), "counter", "root", "create", {})
+    host.create_v2(load_bundle(MACHINE), "counter", "root", "create", {})
     checkpoint = host.read_checkpoint("root")
     assert checkpoint is not None
     document = checkpoint.document
     aggregate = document["root_record"]["aggregate_state"]
 
-    def process(event_id: str) -> str:
-        candidate = {
-            "root_instance_id": "root",
-            "delivery_mode": "input",
-            "origin": {"kind": "host_input"},
-            "envelope": portable_envelope(
-                "increment",
-                event_id,
-                {
-                    "root": {
-                        "root_instance_id": "root",
-                        "root_runtime_id": aggregate["root_runtime_id"],
-                    }
-                },
-                {"amount": 1},
-            ),
-        }
+    def process(operation_id: str) -> str:
         try:
-            ExecutionHost(store, resolver).foreground_process_delivery(
+            ExecutionHost(store, resolver).maintenance_migration_v2(
                 "root",
-                candidate,
+                operation_id,
+                aggregate["validated_bundle_fingerprint"],
+                [],
                 expected_revision=document["revision"],
                 expected_checkpoint_digest=document[
                     "execution_checkpoint_digest"
@@ -88,7 +72,7 @@ def test_postgresql_cas_and_shared_native_transaction() -> None:
         return "committed"
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        outcomes = sorted(executor.map(process, ["event-a", "event-b"]))
+        outcomes = sorted(executor.map(process, ["operation-a", "operation-b"]))
     assert outcomes == ["checkpoint_revision_conflict", "committed"]
 
     application_table = f"determa_application_test_{uuid.uuid4().hex}"
@@ -102,10 +86,10 @@ def test_postgresql_cas_and_shared_native_transaction() -> None:
             f"INSERT INTO {application_table} (root_instance_id) VALUES (%s)",
             ("shared-root",),
         )
-        staged = execution.create(
+        staged = execution.create_v2(
             load_bundle(MACHINE), "counter", "create", {}
         )
-        assert staged == StagedExecutionResult("create")
+        assert staged == StagedExecutionResult("create_v2")
 
     committed = host.run_shared_transaction("shared-root", commit_callback)
     assert committed["result"] == "committed"
@@ -118,12 +102,47 @@ def test_postgresql_cas_and_shared_native_transaction() -> None:
             value = value.decode("ascii")
         assert value == "shared-root"
 
+    host.create_v2(
+        load_bundle(MACHINE),
+        "counter",
+        "migration-root",
+        "migration-root-create",
+        {},
+    )
+    migration_checkpoint = host.read_checkpoint("migration-root")
+    assert migration_checkpoint is not None
+    migration_aggregate = migration_checkpoint.document["root_record"][
+        "aggregate_state"
+    ]
+
+    def migrate_callback(connection, execution) -> None:
+        connection.execute(
+            f"INSERT INTO {application_table} (root_instance_id) VALUES (%s)",
+            ("migration-root",),
+        )
+        staged = execution.maintenance_migration_v2(
+            "postgresql-empty-migration",
+            migration_aggregate["validated_bundle_fingerprint"],
+            [],
+            expected_revision=migration_checkpoint.document["revision"],
+            expected_checkpoint_digest=migration_checkpoint.document[
+                "execution_checkpoint_digest"
+            ],
+        )
+        assert staged == StagedExecutionResult("maintenance_migration_v2")
+
+    migration_result = host.run_shared_transaction(
+        "migration-root", migrate_callback
+    )
+    assert migration_result["receipt"]["result_code"] == "migration_no_operation"
+    assert host.read_checkpoint("migration-root").document["revision"] == "1"
+
     def rollback_callback(connection, execution) -> None:
         connection.execute(
             f"INSERT INTO {application_table} (root_instance_id) VALUES (%s)",
             ("rolled-back-root",),
         )
-        execution.create(load_bundle(MACHINE), "counter", "create", {})
+        execution.create_v2(load_bundle(MACHINE), "counter", "create", {})
         raise RuntimeError("application rollback")
 
     with pytest.raises(RuntimeError, match="application rollback"):
@@ -196,18 +215,17 @@ def test_postgresql_configured_permanent_strict_profile() -> None:
         PERMANENT_RECEIPT_RETENTION,
         PERMANENT_OUTBOX_TERMINAL_RETENTION,
     }.issubset(store.capabilities)
-    local_host, _ = _host()
     ExecutionHost(
         store,
-        local_host.artifact_resolver,
+        _resolver(),
         profile="exactly_once_committed_processing",
     )
     ExecutionHost(
         store,
-        local_host.artifact_resolver,
+        _resolver(),
         profile="strict_durable_outbox",
         host_features={
-            "atomic_checkpoint_processing",
+            "atomic_accept_process",
             "outbox_worker",
             "total_outbox_lifecycle",
             "retain_unresolved_outbox",
@@ -223,13 +241,13 @@ def test_postgresql_configured_permanent_strict_profile() -> None:
     assert COMPACT_EFFECT_IDENTITY_RETENTION in compact_store.capabilities
     ExecutionHost(
         compact_store,
-        local_host.artifact_resolver,
+        _resolver(),
         profile="compact_durable_outbox",
         host_features={
-            "atomic_checkpoint_processing",
+            "atomic_accept_process",
             "outbox_worker",
             "total_outbox_lifecycle",
-            "retain_referenced_effect_tombstones",
+            "retain_receipt_references",
         },
     )
 
@@ -244,13 +262,12 @@ def test_postgresql_persists_policy_and_forbids_native_deletion(
         outbox_retention="strict",
     )
     store.setup_schema()
-    local_host, _ = _host()
     host = ExecutionHost(
         store,
-        local_host.artifact_resolver,
+        _resolver(),
         profile="exactly_once_committed_processing",
     )
-    host.create(load_bundle(MACHINE), "counter", "bank-root", "create", {})
+    host.create_v2(load_bundle(MACHINE), "counter", "bank-root", "create", {})
 
     with psycopg.connect(store.conninfo) as connection:
         with pytest.raises(psycopg.Error, match="execution_store_immutable"):
@@ -260,7 +277,7 @@ def test_postgresql_persists_policy_and_forbids_native_deletion(
             )
     assert host.read_checkpoint("bank-root") is not None
     with pytest.raises(ExecutionHostError) as recreate:
-        host.create(
+        host.create_v2(
             load_bundle(MACHINE), "counter", "bank-root", "replacement", {}
         )
     assert recreate.value.code == "creation_id_conflict"

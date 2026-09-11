@@ -9,37 +9,35 @@ from typing import Any
 
 from .checkpoint import (
     execution_checkpoint_digest,
-    restore_execution_checkpoint,
     seal_execution_checkpoint,
-    validate_execution_checkpoint_member,
 )
 from .codes import CheckpointArtifactFailureCode, CheckpointHostFailureCode
 from .errors import ArtifactError
-from .host import creation_request_digest, delivery_request_digest
+from .host import (
+    creation_request_digest,
+    maintenance_migration_request_digest,
+)
 from .queueing import (
     _entry_digest,
-    _runtime_id_for_target,
     _valid_envelope_shape,
+    _validate_new_deliveries,
     admit_aggregate_v2,
     create_aggregate_v2,
     restore_aggregate_v2,
-    seal_aggregate_v2,
     step_aggregate_v2,
-    upgrade_aggregate_v1_to_v2,
 )
 from .wire import (
     ArtifactSource,
     DefinitionResolver,
     canonical_bytes,
     decimal,
-    hash_value,
     load_json_artifact,
 )
 
 
 @dataclass(frozen=True)
-class RestoredExecutionCheckpointV2:
-    """One verified queue-bearing checkpoint."""
+class RestoredExecutionCheckpoint:
+    """One verified execution checkpoint."""
 
     document: dict[str, Any]
     canonical_bytes: bytes
@@ -108,6 +106,8 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
         raise _invalid()
     cutoff_value = document["replay_retention"]["pruned_through_receipt_sequence"]
     cutoff = decimal(cutoff_value) if cutoff_value is not None else None
+    if cutoff is not None and cutoff >= next_receipt:
+        raise _invalid()
     first_retained = 1 if cutoff is None else cutoff + 1
     if len(sequences) != 1 + max(0, next_receipt - first_retained):
         raise _invalid()
@@ -122,16 +122,15 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
     if aggregate is not None and (aggregate["root_instance_id"] != document["root_instance_id"]):
         raise _invalid()
     creation = receipts[0]
-    legacy_creation = creation.get("legacy_receipt", creation)
     root_creation_id = (
         aggregate["creation_id"] if aggregate is not None else root.get("creation_id")
     )
-    if legacy_creation.get("creation_id") != root_creation_id:
+    if creation.get("creation_id") != root_creation_id:
         raise _invalid()
     if (
         aggregate is not None
         and revision == 0
-        and legacy_creation.get("resulting_aggregate_state_digest")
+        and creation.get("resulting_aggregate_state_digest")
         != aggregate["aggregate_state_digest"]
     ):
         raise _invalid()
@@ -146,13 +145,7 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
     referenced_terminal: dict[str, dict[str, Any]] = {}
     pending_producers: dict[str, dict[str, Any]] = {}
     terminal_producers: dict[str, dict[str, Any]] = {}
-    legacy_wrappers: list[dict[str, Any]] = []
-    legacy_producer_references: dict[
-        str, list[tuple[dict[str, Any], dict[str, Any]]]
-    ] = {}
-    legacy_terminal_events: dict[str, dict[str, Any]] = {}
     referenced_effects: set[str] = set()
-    committed_order: list[tuple[int, int]] = []
     for receipt in receipts:
         kind = receipt["operation_kind"]
         if kind == "acceptance":
@@ -169,31 +162,9 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
             if event_id in terminals:
                 raise _invalid()
             terminals[event_id] = receipt
-            committed_order.append(
-                (
-                    decimal(receipt["committed_revision"]),
-                    decimal(receipt["receipt_sequence"]),
-                )
-            )
         elif kind == "creation" and decimal(receipt["committed_revision"]) > revision:
             raise _invalid()
-        elif kind == "legacy_v1_operation":
-            legacy_receipt = receipt["legacy_receipt"]
-            if decimal(legacy_receipt["committed_revision"]) > revision:
-                raise _invalid()
-        if kind in {"legacy_v1_creation", "legacy_v1_operation"}:
-            legacy_wrappers.append(receipt)
-            legacy_receipt = receipt["legacy_receipt"]
-            if legacy_receipt["receipt_sequence"] != receipt["receipt_sequence"]:
-                raise _invalid()
-            for reference in legacy_receipt.get("emission_references", []):
-                if reference["kind"] == "internal_delivery":
-                    legacy_producer_references.setdefault(reference["event_id"], []).append(
-                        (receipt, reference)
-                    )
         references = receipt.get("emission_references")
-        if references is None and kind.startswith("legacy_v1_"):
-            references = receipt["legacy_receipt"].get("emission_references", [])
         for reference in references or []:
             reference_kind = reference["kind"]
             if reference_kind == "internal_mailbox":
@@ -213,116 +184,6 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
                 if effect_id in referenced_effects:
                     raise _invalid()
                 referenced_effects.add(effect_id)
-    if legacy_wrappers and receipts[: len(legacy_wrappers)] != legacy_wrappers:
-        raise _invalid()
-    if committed_order != sorted(committed_order) or len(committed_order) != len(
-        set(committed_order)
-    ):
-        raise _invalid()
-
-    def validate_internal_legacy_producer(
-        event_id: str,
-        acceptance_sequence: str,
-        accepted_revision: str,
-        origin: Mapping[str, Any],
-    ) -> None:
-        producers = legacy_producer_references.get(event_id, [])
-        if (
-            len(producers) != 1
-            or producers[0][0]["receipt_sequence"]
-            != origin["producing_receipt_sequence"]
-            or producers[0][1]["emission_index"] != origin["emission_index"]
-            or producers[0][1]["delivery_sequence"] != acceptance_sequence
-            or producers[0][0]["legacy_receipt"]["committed_revision"]
-            != accepted_revision
-        ):
-            raise _invalid()
-
-    legacy_terminal_acceptance_sequences: set[str] = set()
-    for wrapper in legacy_wrappers:
-        legacy_receipt = wrapper["legacy_receipt"]
-        if legacy_receipt["operation_kind"] != "delivery":
-            continue
-        event_id = legacy_receipt["event_id"]
-        acceptance_sequence = legacy_receipt["accepted_delivery_sequence"]
-        if (
-            event_id in legacy_terminal_events
-            or acceptance_sequence in legacy_terminal_acceptance_sequences
-        ):
-            raise _invalid()
-        legacy_terminal_events[event_id] = legacy_receipt
-        legacy_terminal_acceptance_sequences.add(acceptance_sequence)
-        if legacy_receipt["delivery_mode"] == "internal":
-            origin = legacy_receipt["origin"]
-            if not (
-                origin.get("kind") == "internal_emission"
-                and set(origin)
-                == {"kind", "producing_receipt_sequence", "emission_index"}
-            ):
-                raise _invalid()
-            validate_internal_legacy_producer(
-                event_id,
-                acceptance_sequence,
-                legacy_receipt["accepted_revision"],
-                origin,
-            )
-
-    def validate_legacy_evidence(
-        acceptance: Mapping[str, Any], entry: Mapping[str, Any] | None
-    ) -> None:
-        evidence = acceptance.get("legacy_v1_delivery")
-        if evidence is None:
-            return
-        origin = evidence["origin"]
-        mode = acceptance["delivery_mode"]
-        if (
-            evidence["delivery_sequence"] != acceptance["acceptance_sequence"]
-            or evidence["envelope_digest"] == "sha256:" + ("0" * 64)
-            or evidence["envelope_digest"] == acceptance["request_digest"]
-        ):
-            raise _invalid()
-        if mode == "input":
-            if origin != {"kind": "host_input"}:
-                raise _invalid()
-        elif not (
-            origin.get("kind") == "internal_emission"
-            and set(origin) == {"kind", "producing_receipt_sequence", "emission_index"}
-        ):
-            raise _invalid()
-        if entry is not None:
-            source = entry["envelope"]["source"]
-            legacy_envelope = copy.deepcopy(entry["envelope"])
-            legacy_envelope.pop("cause_id")
-            legacy_envelope.pop("source")
-            expected_legacy_digest = hash_value(
-                [
-                    "determa-inbox-envelope-digest-1",
-                    "1",
-                    document["root_instance_id"],
-                    entry["delivery_mode"],
-                    legacy_envelope,
-                ]
-            )
-            source_matches = (source == {"host": True} and mode == "input") or (
-                mode == "internal"
-                and source
-                == {
-                    "legacy_v1_internal": {
-                        "producing_receipt_sequence": origin["producing_receipt_sequence"],
-                        "emission_index": origin["emission_index"],
-                    }
-                }
-            )
-            if evidence["envelope_digest"] != expected_legacy_digest or not source_matches:
-                raise _invalid()
-        if mode == "internal":
-            validate_internal_legacy_producer(
-                acceptance["event_id"],
-                acceptance["acceptance_sequence"],
-                acceptance["accepted_revision"],
-                origin,
-            )
-
     for event_id, entry in pending_by_event.items():
         acceptance = acceptances.get(event_id)
         producer = referenced_pending.get(event_id)
@@ -341,14 +202,9 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
         ):
             raise _invalid()
         source = entry["envelope"]["source"]
-        if "legacy_v1_internal" in source:
-            if acceptance is None or acceptance.get("legacy_v1_delivery") is None:
-                raise _invalid()
-            validate_legacy_evidence(acceptance, entry)
-        elif source == {"host": True}:
+        if source == {"host": True}:
             if acceptance is None:
                 raise _invalid()
-            validate_legacy_evidence(acceptance, entry)
         elif acceptance is not None:
             raise _invalid()
     if set(pending_by_event) & set(terminals):
@@ -377,9 +233,6 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
             > decimal(terminal["committed_revision"])
         ):
             raise _invalid()
-        if acceptance is not None:
-            validate_legacy_evidence(acceptance, None)
-
     tombstones = document["event_identity_tombstones"]
     tombstone_events = [item["event_id"] for item in tombstones]
     tombstone_sequences = [decimal(item["terminal_receipt_sequence"]) for item in tombstones]
@@ -395,13 +248,6 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
     ):
         raise _invalid()
     tombstones_by_event = {item["event_id"]: item for item in tombstones}
-    if (
-        set(legacy_terminal_events) & set(pending_by_event)
-        or set(legacy_terminal_events) & set(terminals)
-        or set(legacy_terminal_events) & set(tombstones_by_event)
-        or set(legacy_terminal_events) & set(acceptances)
-    ):
-        raise _invalid()
     if any(
         event_id not in pending_by_event and event_id not in terminals for event_id in acceptances
     ):
@@ -411,30 +257,6 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
         for producer in [*pending_producers.values(), *terminal_producers.values()]
     ):
         raise _invalid()
-    for event_id, references in legacy_producer_references.items():
-        if len(references) != 1:
-            raise _invalid()
-        located_entry = pending_by_event.get(event_id)
-        located_terminal = terminals.get(event_id)
-        located_tombstone = tombstones_by_event.get(event_id)
-        located_legacy_terminal = legacy_terminal_events.get(event_id)
-        locations = [
-            item
-            for item in (
-                located_entry,
-                located_terminal,
-                located_tombstone,
-                located_legacy_terminal,
-            )
-            if item is not None
-        ]
-        if len(locations) != 1:
-            raise _invalid()
-        allocation = locations[0].get(
-            "acceptance_sequence", locations[0].get("accepted_delivery_sequence")
-        )
-        if references[0][1]["delivery_sequence"] != allocation:
-            raise _invalid()
     for event_id, reference in referenced_terminal.items():
         terminal_evidence = terminals.get(event_id)
         tombstone = tombstones_by_event.get(event_id)
@@ -449,15 +271,29 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
         if evidence_sequence is None or reference["terminal_receipt_sequence"] != evidence_sequence:
             raise _invalid()
 
+    receipt_chronology: list[tuple[int, int]] = []
+    greatest_prior_revision = -1
+    for receipt, receipt_sequence in zip(receipts, sequences, strict=True):
+        if "committed_revision" in receipt:
+            effective_revision = receipt["committed_revision"]
+        else:
+            effective_revision = receipt["accepted_revision"]
+        effective_revision_value = decimal(effective_revision)
+        if (
+            receipt["operation_kind"] == "maintenance_migration"
+            and effective_revision_value <= greatest_prior_revision
+        ):
+            raise _invalid()
+        receipt_chronology.append((effective_revision_value, receipt_sequence))
+        greatest_prior_revision = max(greatest_prior_revision, effective_revision_value)
+    if receipt_chronology != sorted(receipt_chronology):
+        raise _invalid()
+
     allocation_acceptances = (
         [decimal(entry["acceptance_sequence"]) for entry in pending_entries]
         + [decimal(item["acceptance_sequence"]) for item in acceptances.values()]
         + [decimal(item["acceptance_sequence"]) for item in terminals.values()]
         + [decimal(item["acceptance_sequence"]) for item in tombstones]
-        + [
-            decimal(item["accepted_delivery_sequence"])
-            for item in legacy_terminal_events.values()
-        ]
     )
     allocation_queues = [decimal(entry["queue_sequence"]) for entry in pending_entries] + [
         decimal(item["final_queue_sequence"]) for item in terminals.values()
@@ -474,11 +310,6 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
         sequence = decimal(item["acceptance_sequence"])
         envelope = item.get("envelope", {})
         event_id = item.get("event_id", envelope.get("event_id"))
-        prior_owner = acceptance_owners.setdefault(sequence, event_id)
-        if prior_owner != event_id:
-            raise _invalid()
-    for event_id, item in legacy_terminal_events.items():
-        sequence = decimal(item["accepted_delivery_sequence"])
         prior_owner = acceptance_owners.setdefault(sequence, event_id)
         if prior_owner != event_id:
             raise _invalid()
@@ -553,10 +384,98 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
     ):
         raise _invalid()
 
+    audit_by_sequence = {item["migration_sequence"]: item for item in audits}
+    root_runtime_id = (
+        aggregate["root_runtime_id"] if aggregate is not None else root["root_runtime_id"]
+    )
+    if any(item["root_runtime_id"] != root_runtime_id for item in audits):
+        raise _invalid()
+    if aggregate is not None and audit_sequences and max(audit_sequences) > decimal(
+        aggregate["migration_sequence"]
+    ):
+        raise _invalid()
+
+    operation_ids: set[str] = set()
+    referenced_audit_sequences: list[str] = []
+    for receipt in receipts:
+        if receipt["operation_kind"] != "maintenance_migration":
+            continue
+        operation_id = receipt["operation_id"]
+        committed_revision = decimal(receipt["committed_revision"])
+        if (
+            operation_id in operation_ids
+            or committed_revision == 0
+            or committed_revision > revision
+        ):
+            raise _invalid()
+        operation_ids.add(operation_id)
+        sequences_for_receipt = receipt["migration_sequences"]
+        selected = [audit_by_sequence.get(sequence) for sequence in sequences_for_receipt]
+        if any(item is None for item in selected):
+            raise _invalid()
+        linked = [item for item in selected if item is not None]
+        referenced_audit_sequences.extend(sequences_for_receipt)
+        if receipt["result_code"] == "migration_no_operation":
+            if (
+                sequences_for_receipt
+                or receipt["source_aggregate_state_digest"]
+                != receipt["resulting_aggregate_state_digest"]
+            ):
+                raise _invalid()
+            descriptor_route: list[str] = []
+        else:
+            if (
+                not linked
+                or [item["migration_sequence"] for item in linked]
+                != sequences_for_receipt
+                or any(
+                    decimal(right["migration_sequence"])
+                    != decimal(left["migration_sequence"]) + 1
+                    for left, right in zip(linked, linked[1:], strict=False)
+                )
+                or linked[0]["source_aggregate_state_digest"]
+                != receipt["source_aggregate_state_digest"]
+                or linked[-1]["target_aggregate_state_digest"]
+                != receipt["resulting_aggregate_state_digest"]
+                or any(
+                    left["target_aggregate_state_digest"]
+                    != right["source_aggregate_state_digest"]
+                    or left["target_validated_bundle_fingerprint"]
+                    != right["source_validated_bundle_fingerprint"]
+                    for left, right in zip(linked, linked[1:], strict=False)
+                )
+            ):
+                raise _invalid()
+            descriptor_route = [item["migration_descriptor_digest"] for item in linked]
+            if (
+                linked[-1]["target_validated_bundle_fingerprint"]
+                != receipt["target_validated_bundle_fingerprint"]
+            ):
+                raise _invalid()
+        possible_request_digests = {
+            maintenance_migration_request_digest(
+                document["root_instance_id"],
+                operation_id,
+                receipt["source_aggregate_state_digest"],
+                receipt["target_validated_bundle_fingerprint"],
+                descriptor_route,
+                maintenance_mode,
+            )
+            for maintenance_mode in (False, True)
+        }
+        if receipt["request_digest"] not in possible_request_digests:
+            raise _invalid()
+    if len(referenced_audit_sequences) != len(set(referenced_audit_sequences)):
+        raise _invalid()
+    referenced_audits = set(referenced_audit_sequences)
+    available_audits = set(audit_by_sequence)
+    if not referenced_audits.issubset(available_audits):
+        raise _invalid()
+
 
 def restore_execution_checkpoint_v2(
     source: ArtifactSource, definition_resolver: DefinitionResolver
-) -> RestoredExecutionCheckpointV2:
+) -> RestoredExecutionCheckpoint:
     """Restore one structurally and relationally valid version-2 checkpoint."""
     document, raw = load_json_artifact(source, "execution_checkpoint_v2")
     if execution_checkpoint_digest(document) != document["execution_checkpoint_digest"]:
@@ -580,107 +499,11 @@ def restore_execution_checkpoint_v2(
         ):
             raise
         raise _invalid() from error
-    return RestoredExecutionCheckpointV2(
+    return RestoredExecutionCheckpoint(
         document=copy.deepcopy(document),
         canonical_bytes=canonical_bytes(document),
         source_bytes=raw,
     )
-
-
-def upgrade_checkpoint_v1_to_v2(
-    source: ArtifactSource, definition_resolver: DefinitionResolver
-) -> dict[str, Any]:
-    """Explicitly convert a complete version-1 checkpoint and pending history."""
-    restored = restore_execution_checkpoint(source, definition_resolver)
-    document = restored.document
-    if document["root_record"]["status"] != "retained":
-        raise _invalid()
-    aggregate = upgrade_aggregate_v1_to_v2(
-        document["root_record"]["aggregate_state"], definition_resolver
-    )
-    receipts: list[dict[str, Any]] = []
-    for receipt in document["operation_receipts"]:
-        receipts.append(
-            {
-                "operation_kind": (
-                    "legacy_v1_creation"
-                    if receipt["operation_kind"] == "creation"
-                    else "legacy_v1_operation"
-                ),
-                "receipt_sequence": receipt["receipt_sequence"],
-                "legacy_receipt": copy.deepcopy(receipt),
-            }
-        )
-    next_receipt = int(document["next_operation_receipt_sequence"])
-    next_queue = 0
-    aggregate["next_acceptance_sequence"] = document["next_delivery_sequence"]
-    runtime_by_id = {runtime["runtime_id"]: runtime for runtime in aggregate["runtimes"]}
-    for pending in sorted(
-        document["pending_deliveries"], key=lambda item: int(item["delivery_sequence"])
-    ):
-        origin = pending["origin"]
-        envelope = copy.deepcopy(pending["envelope"])
-        envelope["cause_id"] = envelope["event_id"]
-        envelope["source"] = (
-            {"host": True}
-            if origin["kind"] == "host_input"
-            else {
-                "legacy_v1_internal": {
-                    "producing_receipt_sequence": origin["producing_receipt_sequence"],
-                    "emission_index": origin["emission_index"],
-                }
-            }
-        )
-        digest = _entry_digest(document["root_instance_id"], pending["delivery_mode"], envelope)
-        entry = {
-            "acceptance_sequence": pending["delivery_sequence"],
-            "queue_sequence": str(next_queue),
-            "delivery_mode": pending["delivery_mode"],
-            "envelope": envelope,
-            "envelope_digest": digest,
-            "deferral_count": "0",
-        }
-        runtime_id = _runtime_id_for_target(envelope["target"])
-        if runtime_id not in runtime_by_id:
-            raise _invalid()
-        runtime_by_id[runtime_id]["ready_mailbox"].append(entry)
-        acceptance = {
-            "operation_kind": "acceptance",
-            "receipt_sequence": str(next_receipt),
-            "event_id": envelope["event_id"],
-            "request_digest": digest,
-            "acceptance_sequence": pending["delivery_sequence"],
-            "accepted_revision": pending["accepted_revision"],
-            "delivery_mode": pending["delivery_mode"],
-        }
-        if pending["delivery_mode"] == "internal":
-            acceptance["legacy_v1_delivery"] = {
-                "delivery_sequence": pending["delivery_sequence"],
-                "envelope_digest": pending["envelope_digest"],
-                "origin": copy.deepcopy(origin),
-            }
-        receipts.append(acceptance)
-        next_receipt += 1
-        next_queue += 1
-    aggregate["next_queue_sequence"] = str(next_queue)
-    aggregate = seal_aggregate_v2(aggregate)
-    result = {
-        "execution_checkpoint_format": "determa.execution_checkpoint",
-        "execution_checkpoint_schema_version": 2,
-        "root_instance_id": document["root_instance_id"],
-        "revision": str(int(document["revision"]) + 1),
-        "root_record": {"status": "retained", "aggregate_state": aggregate},
-        "replay_retention": copy.deepcopy(document["replay_retention"]),
-        "next_operation_receipt_sequence": str(next_receipt),
-        "operation_receipts": receipts,
-        "event_identity_tombstones": [],
-        "pending_outbox_intents": copy.deepcopy(document["pending_outbox_intents"]),
-        "next_outbox_terminal_sequence": document["next_outbox_terminal_sequence"],
-        "terminal_outbox_records": copy.deepcopy(document["terminal_outbox_records"]),
-        "outbox_effect_tombstones": copy.deepcopy(document["outbox_effect_tombstones"]),
-        "migration_audit_records": copy.deepcopy(document["migration_audit_records"]),
-    }
-    return seal_execution_checkpoint(result)
 
 
 def _append_external_intent(
@@ -689,9 +512,16 @@ def _append_external_intent(
     emission: Mapping[str, Any],
     emission_index: int,
 ) -> None:
+    intent = {
+        "effect_id": emission["effect_id"],
+        "sequence": emission["sequence"],
+        "event": emission["event"],
+        "payload": copy.deepcopy(emission["payload"]),
+        "correlation_id": emission["correlation_id"],
+    }
     checkpoint["pending_outbox_intents"].append(
         {
-            "intent": copy.deepcopy(dict(emission)),
+            "intent": intent,
             "state_revision": checkpoint["revision"],
             "delivery_state": {"status": "not_attempted"},
         }
@@ -713,7 +543,14 @@ def create_checkpoint_v2(
     bindings: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """Create a fresh queue-bearing checkpoint from the public v2 core result."""
-    result = create_aggregate_v2(bundle, machine_id, root_instance_id, creation_id, bindings)
+    result = create_aggregate_v2(
+        bundle,
+        machine_id,
+        root_instance_id,
+        creation_id,
+        bindings,
+        _include_host_evidence=True,
+    )
     aggregate = result["state"]
     if aggregate is None:
         raise ArtifactError(CheckpointHostFailureCode.CREATION_REJECTED)
@@ -755,7 +592,10 @@ def create_checkpoint_v2(
     checkpoint["next_operation_receipt_sequence"] = str(1 + len(lifecycle_sequences))
     for index, emission in enumerate(result["emissions"]):
         if "kind" not in emission:
-            _append_external_intent(checkpoint, receipt["emission_references"], emission, index)
+            emission_index = int(emission.get("_determa_v2_emission_index", index))
+            _append_external_intent(
+                checkpoint, receipt["emission_references"], emission, emission_index
+            )
         elif emission["kind"] == "internal_mailbox":
             receipt["emission_references"].append(copy.deepcopy(emission))
         else:
@@ -825,7 +665,7 @@ def _pending_replay(
 
 
 def _retained_replay(
-    document: Mapping[str, Any], event_id: str, digests: Mapping[str, str]
+    document: Mapping[str, Any], event_id: str, request_digest: str
 ) -> dict[str, Any] | None:
     terminal = next(
         (
@@ -844,7 +684,7 @@ def _retained_replay(
         None,
     )
     if terminal is not None:
-        if terminal["request_digest"] != digests["determa-inbox-envelope-digest-2"]:
+        if terminal["request_digest"] != request_digest:
             raise ArtifactError(CheckpointHostFailureCode.EVENT_ID_CONFLICT)
         return {
             "result": "replay",
@@ -858,44 +698,14 @@ def _retained_replay(
         None,
     )
     if tombstone is not None:
-        if tombstone["request_digest"] != digests[tombstone["request_digest_domain"]]:
+        if tombstone["request_digest"] != request_digest:
             raise ArtifactError(CheckpointHostFailureCode.EVENT_ID_CONFLICT)
         result = {
             "result": "replay",
             "terminal_receipt_sequence": tombstone["terminal_receipt_sequence"],
             "terminal_disposition": tombstone["terminal_disposition"],
         }
-        if tombstone["request_digest_domain"] == "determa-inbox-envelope-digest-1":
-            result.update(
-                {
-                    "event_id": event_id,
-                    "acceptance_sequence": tombstone["acceptance_sequence"],
-                    "request_digest_domain": tombstone["request_digest_domain"],
-                }
-            )
         return result
-    return None
-
-
-def _legacy_replay(
-    document: Mapping[str, Any], event_id: str, request_digest: str
-) -> dict[str, Any] | None:
-    for receipt in document["operation_receipts"]:
-        if receipt["operation_kind"] != "legacy_v1_operation":
-            continue
-        legacy = receipt["legacy_receipt"]
-        if legacy.get("operation_kind") != "delivery" or legacy.get("event_id") != event_id:
-            continue
-        if legacy["request_digest"] != request_digest:
-            raise ArtifactError(CheckpointHostFailureCode.EVENT_ID_CONFLICT)
-        return {
-            "result": "replay",
-            "event_id": event_id,
-            "acceptance_sequence": legacy["accepted_delivery_sequence"],
-            "terminal_receipt_sequence": receipt["receipt_sequence"],
-            "terminal_disposition": legacy["outcome"]["disposition"],
-            "request_digest_domain": "determa-inbox-envelope-digest-1",
-        }
     return None
 
 
@@ -937,19 +747,10 @@ def admit_checkpoint_v2(
     canonical_digests: list[str] = []
     event_ids: list[str] = []
     target_roots: list[Any] = []
-    legacy_domains: list[bool] = []
     for delivery in deliveries:
-        legacy_domain = (
-            isinstance(delivery, Mapping)
-            and delivery.get("request_digest_domain") == "determa-inbox-envelope-digest-1"
-        )
         expected_members = {"delivery_mode", "envelope", "envelope_digest"}
-        if legacy_domain:
-            expected_members.add("request_digest_domain")
         envelope_is_valid = (
-            validate_execution_checkpoint_member("envelope", delivery.get("envelope"))
-            if legacy_domain and isinstance(delivery, Mapping)
-            else _valid_envelope_shape(delivery.get("envelope"))
+            _valid_envelope_shape(delivery.get("envelope"))
             if isinstance(delivery, Mapping)
             else False
         )
@@ -974,12 +775,7 @@ def admit_checkpoint_v2(
             raise ArtifactError("malformed_delivery")
         event_ids.append(event_id)
         target_roots.append(identity.get("root_instance_id"))
-        legacy_domains.append(legacy_domain)
-        digest = (
-            delivery_request_digest(document["root_instance_id"], str(mode), envelope)
-            if legacy_domain
-            else _entry_digest(document["root_instance_id"], str(mode), envelope)
-        )
+        digest = _entry_digest(document["root_instance_id"], str(mode), envelope)
         canonical_digests.append(digest)
 
     if any(root != document["root_instance_id"] for root in target_roots):
@@ -988,30 +784,12 @@ def admit_checkpoint_v2(
         raise ArtifactError("duplicate_event_id_in_batch")
 
     replay_evidence: list[dict[str, Any] | None] = []
-    for delivery, digest, legacy_domain in zip(
-        deliveries, canonical_digests, legacy_domains, strict=True
-    ):
+    for delivery, digest in zip(deliveries, canonical_digests, strict=True):
         envelope = delivery["envelope"]
-        mode = delivery["delivery_mode"]
         event_id = envelope["event_id"]
-        v1_envelope = {
-            key: copy.deepcopy(value)
-            for key, value in envelope.items()
-            if key not in {"cause_id", "source"}
-        }
-        replay_digests = {
-            "determa-inbox-envelope-digest-2": "" if legacy_domain else digest,
-            "determa-inbox-envelope-digest-1": delivery_request_digest(
-                document["root_instance_id"], str(mode), v1_envelope
-            ),
-        }
         replay = _pending_replay(document, event_id, digest)
         if replay is None:
-            replay = _retained_replay(document, event_id, replay_digests)
-        if replay is None:
-            replay = _legacy_replay(
-                document, event_id, replay_digests["determa-inbox-envelope-digest-1"]
-            )
+            replay = _retained_replay(document, event_id, digest)
         replay_evidence.append(replay)
 
     if all(evidence is not None for evidence in replay_evidence):
@@ -1026,8 +804,6 @@ def admit_checkpoint_v2(
         if len(replay_members) == 1:
             return dict(replay_members[0]["evidence"])
         return {"result": "batch", "checkpoint": document, "members": replay_members}
-    if any(delivery.get("request_digest_domain") is not None for delivery in deliveries):
-        raise ArtifactError("malformed_delivery")
     if terminal_code is not None:
         raise ArtifactError(terminal_code)
     _check_cas(document, expected_revision, expected_checkpoint_digest)
@@ -1038,6 +814,10 @@ def admit_checkpoint_v2(
         for delivery, evidence in zip(deliveries, replay_evidence, strict=True)
         if evidence is None
     ]
+    restored_aggregate = restore_aggregate_v2(aggregate, definition_resolver)
+    validation_code = _validate_new_deliveries(restored_aggregate, new_deliveries)
+    if validation_code is not None:
+        raise ArtifactError(validation_code)
     admission = admit_aggregate_v2(aggregate, new_deliveries, definition_resolver)
     if admission["result"] == "rejected":
         raise ArtifactError(admission["rejection"]["code"])
@@ -1100,7 +880,33 @@ def step_checkpoint_v2(
     selected = (
         copy.deepcopy(runtime["ready_mailbox"][0]) if runtime and runtime["ready_mailbox"] else None
     )
-    result = step_aggregate_v2(aggregate, target_runtime_id, definition_resolver)
+    if runtime is not None and selected is None:
+        root_status = next(
+            item["status"]
+            for item in aggregate["runtimes"]
+            if item["runtime_id"] == aggregate["root_runtime_id"]
+        )
+        return {
+            "result": "not_committed",
+            "step_result": {
+                "core_step_result_format": "determa.core_step_result",
+                "core_step_result_schema_version": 2,
+                "status": root_status,
+                "disposition": "not_runnable",
+                "state": copy.deepcopy(aggregate),
+                "emissions": [],
+                "lifecycle_dispositions": [],
+                "fault": None,
+                "rejection": None,
+            },
+            "checkpoint": document,
+        }
+    result = step_aggregate_v2(
+        aggregate,
+        target_runtime_id,
+        definition_resolver,
+        _include_host_evidence=True,
+    )
     if selected is None or result["disposition"] in {"not_runnable", "rejected"}:
         return {
             "result": "not_committed",
@@ -1133,7 +939,12 @@ def step_checkpoint_v2(
     references: list[dict[str, Any]] = []
     for emission_index, emission in enumerate(result["emissions"]):
         if "kind" not in emission:
-            _append_external_intent(candidate, references, emission, emission_index)
+            action_emission_index = int(
+                emission.get("_determa_v2_emission_index", emission_index)
+            )
+            _append_external_intent(
+                candidate, references, emission, action_emission_index
+            )
             continue
         if emission["kind"] != "internal_disposed":
             references.append(copy.deepcopy(emission))
@@ -1199,13 +1010,28 @@ def prune_checkpoint_v2(
     cutoff_receipt_sequence: str,
     definition_resolver: DefinitionResolver,
     *,
+    target_mode: str | None = None,
+    policy_identifier: str | None = None,
     expected_revision: str,
     expected_checkpoint_digest: str,
 ) -> dict[str, Any]:
     """Advance bounded replay retention through one dependency-closed cutoff."""
     restored = restore_execution_checkpoint_v2(source, definition_resolver)
     document = restored.document
-    if document["replay_retention"]["mode"] == "permanent":
+    current_mode = document["replay_retention"]["mode"]
+    selected_mode = current_mode if target_mode is None else target_mode
+    if selected_mode not in {"permanent", "bounded"}:
+        raise _invalid()
+    if current_mode == "bounded" and selected_mode != "bounded":
+        raise _invalid()
+    if selected_mode == "permanent":
+        raise _invalid()
+    selected_policy = (
+        document["replay_retention"]["policy_identifier"]
+        if policy_identifier is None
+        else policy_identifier
+    )
+    if not isinstance(selected_policy, str) or not selected_policy:
         raise _invalid()
     prior_value = document["replay_retention"]["pruned_through_receipt_sequence"]
     prior = decimal(prior_value) if prior_value is not None else -1
@@ -1273,21 +1099,16 @@ def prune_checkpoint_v2(
             acceptance = acceptance_by_event.get(receipt["event_id"])
             if acceptance and acceptance["receipt_sequence"] in removed_sequences:
                 raise _invalid()
-        legacy = receipt.get("legacy_receipt", {})
-        origin = legacy.get("origin", {})
-        if (
-            origin.get("kind") == "internal_emission"
-            and origin.get("producing_receipt_sequence") in removed_sequences
-        ):
-            raise _invalid()
-        converted_origin = receipt.get("legacy_v1_delivery", {}).get("origin", {})
-        if (
-            converted_origin.get("kind") == "internal_emission"
-            and converted_origin.get("producing_receipt_sequence") in removed_sequences
-        ):
-            raise _invalid()
 
     candidate = copy.deepcopy(document)
+    candidate["replay_retention"] = {
+        "mode": "bounded",
+        "permanent_replay_eligible": False,
+        "pruned_through_receipt_sequence": candidate["replay_retention"][
+            "pruned_through_receipt_sequence"
+        ],
+        "policy_identifier": selected_policy,
+    }
     tombstones = list(candidate["event_identity_tombstones"])
     for receipt in removed:
         if receipt["operation_kind"] == "event_terminal":
@@ -1301,22 +1122,18 @@ def prune_checkpoint_v2(
                     "terminal_disposition": receipt["outcome"]["disposition"],
                 }
             )
-        elif (
-            receipt["operation_kind"] == "legacy_v1_operation"
-            and receipt["legacy_receipt"].get("operation_kind") == "delivery"
-        ):
-            legacy = receipt["legacy_receipt"]
-            tombstones.append(
-                {
-                    "event_id": legacy["event_id"],
-                    "request_digest": legacy["request_digest"],
-                    "request_digest_domain": "determa-inbox-envelope-digest-1",
-                    "acceptance_sequence": legacy["accepted_delivery_sequence"],
-                    "terminal_receipt_sequence": receipt["receipt_sequence"],
-                    "terminal_disposition": legacy["outcome"]["disposition"],
-                }
-            )
     candidate["operation_receipts"] = retained
+    referenced_migrations = {
+        sequence
+        for receipt in retained
+        if receipt["operation_kind"] == "maintenance_migration"
+        for sequence in receipt["migration_sequences"]
+    }
+    candidate["migration_audit_records"] = [
+        audit
+        for audit in candidate["migration_audit_records"]
+        if audit["migration_sequence"] in referenced_migrations
+    ]
     candidate["event_identity_tombstones"] = sorted(
         tombstones, key=lambda item: int(item["terminal_receipt_sequence"])
     )
