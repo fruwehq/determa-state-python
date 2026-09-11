@@ -1171,12 +1171,15 @@ def migrate_aggregate_v2(
             != target_validated_bundle_fingerprint
         ):
             raise ArtifactError(PersistenceFailureCode.MIGRATION_ROUTE_MISSING)
-        return {
+        empty_result = {
             "result": "success",
             "aggregate_state": copy.deepcopy(restored.aggregate_envelope),
             "dispositions": [],
             "audit_records": [],
         }
+        if _include_host_evidence:
+            empty_result["_disposed_entries"] = []
+        return empty_result
     if len({item["migration_descriptor_digest"] for item in descriptors}) != len(descriptors):
         raise ArtifactError(PersistenceFailureCode.MIGRATION_ROUTE_MISMATCH)
     fingerprints = [descriptors[0]["base_descriptor"]["source_validated_bundle_fingerprint"]] + [

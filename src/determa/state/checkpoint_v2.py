@@ -32,6 +32,7 @@ from .wire import (
     DefinitionResolver,
     canonical_bytes,
     decimal,
+    hash_value,
     load_json_artifact,
 )
 
@@ -145,6 +146,11 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
     referenced_terminal: dict[str, dict[str, Any]] = {}
     pending_producers: dict[str, dict[str, Any]] = {}
     terminal_producers: dict[str, dict[str, Any]] = {}
+    legacy_wrappers: list[dict[str, Any]] = []
+    legacy_producer_references: dict[
+        str, list[tuple[dict[str, Any], dict[str, Any]]]
+    ] = {}
+    legacy_terminal_events: dict[str, dict[str, Any]] = {}
     referenced_effects: set[str] = set()
     committed_order: list[tuple[int, int]] = []
     for receipt in receipts:
@@ -172,8 +178,19 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
         elif kind == "creation" and decimal(receipt["committed_revision"]) > revision:
             raise _invalid()
         elif kind == "legacy_v1_operation":
-            if decimal(receipt["legacy_receipt"]["committed_revision"]) > revision:
+            legacy_receipt = receipt["legacy_receipt"]
+            if decimal(legacy_receipt["committed_revision"]) > revision:
                 raise _invalid()
+        if kind in {"legacy_v1_creation", "legacy_v1_operation"}:
+            legacy_wrappers.append(receipt)
+            legacy_receipt = receipt["legacy_receipt"]
+            if legacy_receipt["receipt_sequence"] != receipt["receipt_sequence"]:
+                raise _invalid()
+            for reference in legacy_receipt.get("emission_references", []):
+                if reference["kind"] == "internal_delivery":
+                    legacy_producer_references.setdefault(reference["event_id"], []).append(
+                        (receipt, reference)
+                    )
         references = receipt.get("emission_references")
         if references is None and kind.startswith("legacy_v1_"):
             references = receipt["legacy_receipt"].get("emission_references", [])
@@ -196,10 +213,115 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
                 if effect_id in referenced_effects:
                     raise _invalid()
                 referenced_effects.add(effect_id)
+    if legacy_wrappers and receipts[: len(legacy_wrappers)] != legacy_wrappers:
+        raise _invalid()
     if committed_order != sorted(committed_order) or len(committed_order) != len(
         set(committed_order)
     ):
         raise _invalid()
+
+    def validate_internal_legacy_producer(
+        event_id: str,
+        acceptance_sequence: str,
+        accepted_revision: str,
+        origin: Mapping[str, Any],
+    ) -> None:
+        producers = legacy_producer_references.get(event_id, [])
+        if (
+            len(producers) != 1
+            or producers[0][0]["receipt_sequence"]
+            != origin["producing_receipt_sequence"]
+            or producers[0][1]["emission_index"] != origin["emission_index"]
+            or producers[0][1]["delivery_sequence"] != acceptance_sequence
+            or producers[0][0]["legacy_receipt"]["committed_revision"]
+            != accepted_revision
+        ):
+            raise _invalid()
+
+    legacy_terminal_acceptance_sequences: set[str] = set()
+    for wrapper in legacy_wrappers:
+        legacy_receipt = wrapper["legacy_receipt"]
+        if legacy_receipt["operation_kind"] != "delivery":
+            continue
+        event_id = legacy_receipt["event_id"]
+        acceptance_sequence = legacy_receipt["accepted_delivery_sequence"]
+        if (
+            event_id in legacy_terminal_events
+            or acceptance_sequence in legacy_terminal_acceptance_sequences
+        ):
+            raise _invalid()
+        legacy_terminal_events[event_id] = legacy_receipt
+        legacy_terminal_acceptance_sequences.add(acceptance_sequence)
+        if legacy_receipt["delivery_mode"] == "internal":
+            origin = legacy_receipt["origin"]
+            if not (
+                origin.get("kind") == "internal_emission"
+                and set(origin)
+                == {"kind", "producing_receipt_sequence", "emission_index"}
+            ):
+                raise _invalid()
+            validate_internal_legacy_producer(
+                event_id,
+                acceptance_sequence,
+                legacy_receipt["accepted_revision"],
+                origin,
+            )
+
+    def validate_legacy_evidence(
+        acceptance: Mapping[str, Any], entry: Mapping[str, Any] | None
+    ) -> None:
+        evidence = acceptance.get("legacy_v1_delivery")
+        if evidence is None:
+            return
+        origin = evidence["origin"]
+        mode = acceptance["delivery_mode"]
+        if (
+            evidence["delivery_sequence"] != acceptance["acceptance_sequence"]
+            or evidence["envelope_digest"] == "sha256:" + ("0" * 64)
+            or evidence["envelope_digest"] == acceptance["request_digest"]
+        ):
+            raise _invalid()
+        if mode == "input":
+            if origin != {"kind": "host_input"}:
+                raise _invalid()
+        elif not (
+            origin.get("kind") == "internal_emission"
+            and set(origin) == {"kind", "producing_receipt_sequence", "emission_index"}
+        ):
+            raise _invalid()
+        if entry is not None:
+            source = entry["envelope"]["source"]
+            legacy_envelope = copy.deepcopy(entry["envelope"])
+            legacy_envelope.pop("cause_id")
+            legacy_envelope.pop("source")
+            expected_legacy_digest = hash_value(
+                [
+                    "determa-inbox-envelope-digest-1",
+                    "1",
+                    document["root_instance_id"],
+                    entry["delivery_mode"],
+                    legacy_envelope,
+                ]
+            )
+            source_matches = (source == {"host": True} and mode == "input") or (
+                mode == "internal"
+                and source
+                == {
+                    "legacy_v1_internal": {
+                        "producing_receipt_sequence": origin["producing_receipt_sequence"],
+                        "emission_index": origin["emission_index"],
+                    }
+                }
+            )
+            if evidence["envelope_digest"] != expected_legacy_digest or not source_matches:
+                raise _invalid()
+        if mode == "internal":
+            validate_internal_legacy_producer(
+                acceptance["event_id"],
+                acceptance["acceptance_sequence"],
+                acceptance["accepted_revision"],
+                origin,
+            )
 
     for event_id, entry in pending_by_event.items():
         acceptance = acceptances.get(event_id)
@@ -217,6 +339,17 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
             producer["acceptance_sequence"] != entry["acceptance_sequence"]
             or producer["queue_sequence"] != entry["queue_sequence"]
         ):
+            raise _invalid()
+        source = entry["envelope"]["source"]
+        if "legacy_v1_internal" in source:
+            if acceptance is None or acceptance.get("legacy_v1_delivery") is None:
+                raise _invalid()
+            validate_legacy_evidence(acceptance, entry)
+        elif source == {"host": True}:
+            if acceptance is None:
+                raise _invalid()
+            validate_legacy_evidence(acceptance, entry)
+        elif acceptance is not None:
             raise _invalid()
     if set(pending_by_event) & set(terminals):
         raise _invalid()
@@ -244,6 +377,8 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
             > decimal(terminal["committed_revision"])
         ):
             raise _invalid()
+        if acceptance is not None:
+            validate_legacy_evidence(acceptance, None)
 
     tombstones = document["event_identity_tombstones"]
     tombstone_events = [item["event_id"] for item in tombstones]
@@ -260,6 +395,13 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
     ):
         raise _invalid()
     tombstones_by_event = {item["event_id"]: item for item in tombstones}
+    if (
+        set(legacy_terminal_events) & set(pending_by_event)
+        or set(legacy_terminal_events) & set(terminals)
+        or set(legacy_terminal_events) & set(tombstones_by_event)
+        or set(legacy_terminal_events) & set(acceptances)
+    ):
+        raise _invalid()
     if any(
         event_id not in pending_by_event and event_id not in terminals for event_id in acceptances
     ):
@@ -269,6 +411,30 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
         for producer in [*pending_producers.values(), *terminal_producers.values()]
     ):
         raise _invalid()
+    for event_id, references in legacy_producer_references.items():
+        if len(references) != 1:
+            raise _invalid()
+        located_entry = pending_by_event.get(event_id)
+        located_terminal = terminals.get(event_id)
+        located_tombstone = tombstones_by_event.get(event_id)
+        located_legacy_terminal = legacy_terminal_events.get(event_id)
+        locations = [
+            item
+            for item in (
+                located_entry,
+                located_terminal,
+                located_tombstone,
+                located_legacy_terminal,
+            )
+            if item is not None
+        ]
+        if len(locations) != 1:
+            raise _invalid()
+        allocation = locations[0].get(
+            "acceptance_sequence", locations[0].get("accepted_delivery_sequence")
+        )
+        if references[0][1]["delivery_sequence"] != allocation:
+            raise _invalid()
     for event_id, reference in referenced_terminal.items():
         terminal_evidence = terminals.get(event_id)
         tombstone = tombstones_by_event.get(event_id)

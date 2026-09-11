@@ -26,6 +26,7 @@ from determa.state import (
     serialize_execution_checkpoint,
     step_aggregate_v2,
     step_checkpoint_v2,
+    upgrade_checkpoint_v1_to_v2,
 )
 from determa.state.queueing import _entry_digest
 from determa.state.wire import (
@@ -157,6 +158,31 @@ def _compatible_v2_descriptor(
     }
     descriptor["migration_descriptor_digest"] = migration_descriptor_digest(descriptor)
     return descriptor
+
+
+def _upgraded_legacy_internal_checkpoint() -> tuple[Any, MemoryArtifactResolver, dict[str, Any]]:
+    bundle = load_bundle(
+        {
+            "format": 1,
+            "namespace": "tests.review83.legacy_provenance",
+            "events": {"work": {"direction": "internal"}},
+            "machines": [
+                {
+                    "machine_id": "machine",
+                    "root": {
+                        "type": "simple",
+                        "entry": [{"send": {"event": "work"}}],
+                        "on_events": {"work": {}},
+                    },
+                }
+            ],
+        }
+    )
+    resolver = _resolver(bundle)
+    host = ExecutionHost(MemoryExecutionStore(), resolver)
+    host.create(bundle, "machine", "root", "create", {})
+    upgraded = upgrade_checkpoint_v1_to_v2(host.read_checkpoint("root").document, resolver)
+    return bundle, resolver, upgraded
 
 
 def test_create_v2_routes_initial_internal_and_external_work_with_provenance() -> None:
@@ -1191,6 +1217,79 @@ def test_checkpoint_restore_rejects_resealed_false_creation_result_digest() -> N
         restore_execution_checkpoint_v2(checkpoint, _resolver(bundle))
 
 
+@pytest.mark.parametrize("field", ["producing_receipt_sequence", "emission_index"])
+def test_checkpoint_restore_rejects_resealed_legacy_origin_forgery(field: str) -> None:
+    _bundle_value, resolver, checkpoint = _upgraded_legacy_internal_checkpoint()
+    acceptance = next(
+        receipt
+        for receipt in checkpoint["operation_receipts"]
+        if receipt["operation_kind"] == "acceptance"
+    )
+    acceptance["legacy_v1_delivery"]["origin"][field] = "999"
+    checkpoint = seal_execution_checkpoint(checkpoint)
+
+    with pytest.raises(ArtifactError, match="invalid_execution_checkpoint"):
+        restore_execution_checkpoint_v2(checkpoint, resolver)
+
+
+def test_checkpoint_restore_rejects_resealed_legacy_producer_reference_forgery() -> None:
+    _bundle_value, resolver, checkpoint = _upgraded_legacy_internal_checkpoint()
+    producer = next(
+        receipt
+        for receipt in checkpoint["operation_receipts"]
+        if receipt["operation_kind"] == "legacy_v1_creation"
+    )
+    producer["legacy_receipt"]["emission_references"][0]["emission_index"] = "999"
+    checkpoint = seal_execution_checkpoint(checkpoint)
+
+    with pytest.raises(ArtifactError, match="invalid_execution_checkpoint"):
+        restore_execution_checkpoint_v2(checkpoint, resolver)
+
+
+def test_checkpoint_restore_rejects_resealed_legacy_mailbox_relabelled_native() -> None:
+    _bundle_value, resolver, checkpoint = _upgraded_legacy_internal_checkpoint()
+    aggregate = checkpoint["root_record"]["aggregate_state"]
+    entry = aggregate["runtimes"][0]["ready_mailbox"][0]
+    entry["envelope"]["source"] = {
+        "runtime": copy.deepcopy(aggregate["runtimes"][0]["target_identity"])
+    }
+    entry["envelope_digest"] = _entry_digest(
+        aggregate["root_instance_id"], entry["delivery_mode"], entry["envelope"]
+    )
+    acceptance = next(
+        receipt
+        for receipt in checkpoint["operation_receipts"]
+        if receipt["operation_kind"] == "acceptance"
+    )
+    acceptance["request_digest"] = entry["envelope_digest"]
+    checkpoint["root_record"]["aggregate_state"] = seal_aggregate_v2(aggregate)
+    checkpoint = seal_execution_checkpoint(checkpoint)
+
+    with pytest.raises(ArtifactError, match="invalid_execution_checkpoint"):
+        restore_execution_checkpoint_v2(checkpoint, resolver)
+
+
+def test_checkpoint_restore_rejects_resealed_processed_legacy_terminal_origin() -> None:
+    _bundle_value, resolver, checkpoint = _upgraded_legacy_internal_checkpoint()
+    checkpoint = step_checkpoint_v2(
+        checkpoint,
+        checkpoint["root_record"]["aggregate_state"]["root_runtime_id"],
+        resolver,
+        expected_revision=checkpoint["revision"],
+        expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+    )
+    acceptance = next(
+        receipt
+        for receipt in checkpoint["operation_receipts"]
+        if receipt["operation_kind"] == "acceptance"
+    )
+    acceptance["legacy_v1_delivery"]["origin"]["emission_index"] = "999"
+    checkpoint = seal_execution_checkpoint(checkpoint)
+
+    with pytest.raises(ArtifactError, match="invalid_execution_checkpoint"):
+        restore_execution_checkpoint_v2(checkpoint, resolver)
+
+
 def test_v1_upgrade_gate_finds_nested_inline_component_deferral() -> None:
     bundle = load_bundle(
         {
@@ -1357,6 +1456,32 @@ def test_public_v2_migration_returns_exact_ordered_audit_records() -> None:
         "dispositions": [],
         "audit_records": [],
     }
+
+
+def test_host_v2_empty_route_maintenance_migration_commits_no_operation() -> None:
+    bundle = _bundle()
+    resolver = _resolver(bundle)
+    checkpoint = create_checkpoint_v2(bundle, "machine", "root", "create", {})
+    host = ExecutionHost(
+        MemoryExecutionStore({"root": serialize_execution_checkpoint(checkpoint)}),
+        resolver,
+    )
+
+    result = host.maintenance_migration_v2(
+        "root",
+        bundle.fingerprint,
+        [],
+        expected_revision=checkpoint["revision"],
+        expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+        maintenance_mode=False,
+    )
+
+    assert int(result["revision"]) == int(checkpoint["revision"]) + 1
+    assert result["root_record"]["aggregate_state"] == checkpoint["root_record"][
+        "aggregate_state"
+    ]
+    assert result["migration_audit_records"] == checkpoint["migration_audit_records"]
+    assert host.read_checkpoint("root").document == result
 
 
 def test_multihop_migration_recalls_each_hop_and_host_appends_exact_audit() -> None:
