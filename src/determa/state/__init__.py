@@ -6,22 +6,19 @@ import logging
 
 from .__about__ import __version__
 from .checkpoint import (
-    RestoredExecutionCheckpoint,
     execution_checkpoint_digest,
-    restore_execution_checkpoint,
     seal_execution_checkpoint,
     serialize_execution_checkpoint,
     validate_execution_checkpoint_member,
-    validate_execution_checkpoint_semantics,
 )
 from .checkpoint_v2 import (
-    RestoredExecutionCheckpointV2,
+    RestoredExecutionCheckpoint,
     admit_checkpoint_v2,
     create_checkpoint_v2,
+    process_delivery_checkpoint_v2,
     prune_checkpoint_v2,
     restore_execution_checkpoint_v2,
     step_checkpoint_v2,
-    upgrade_checkpoint_v1_to_v2,
 )
 from .codes import (
     PORTABLE_CODE_SETS,
@@ -37,7 +34,6 @@ from .codes import (
     PersistenceFailureCode,
 )
 from .definition import Bundle, BundleSource, load_bundle
-from .engine import Delivery, Result, create, dispatch
 from .errors import (
     ArtifactError,
     CelError,
@@ -59,22 +55,28 @@ from .host import (
     validate_host_profile,
 )
 from .migration import (
-    MigrationDispatchResult,
-    MigrationFailure,
     MigrationLimits,
-    MigrationResult,
-    migrate_aggregate,
-    migrate_and_dispatch,
+    restore_migration_descriptor_v2,
+)
+from .persistence import (
+    DurableHostStore,
+    MemoryDurableHostStore,
+    PersistenceHost,
+    SQLiteDurableHostStore,
 )
 from .queueing import (
-    admit_aggregate_v2,
-    create_aggregate_v2,
-    downgrade_aggregate_v2_to_v1,
+    admit_aggregate_v2 as admit,
+)
+from .queueing import (
+    create_aggregate_v2 as create,
+)
+from .queueing import (
     migrate_aggregate_v2,
     restore_aggregate_v2,
     seal_aggregate_v2,
-    step_aggregate_v2,
-    upgrade_aggregate_v1_to_v2,
+)
+from .queueing import (
+    step_aggregate_v2 as step,
 )
 from .stores import (
     COMPACT_EFFECT_IDENTITY_RETENTION,
@@ -121,7 +123,7 @@ from .wire import (
 __all__ = [
     "ArtifactError",
     "ArtifactResolver",
-    "admit_aggregate_v2",
+    "admit",
     "admit_checkpoint_v2",
     "Bundle",
     "BundleSource",
@@ -132,14 +134,12 @@ __all__ = [
     "COMPACT_EFFECT_IDENTITY_RETENTION",
     "DURABLE_CONCURRENT",
     "DURABLE_SINGLE_WRITER",
+    "DurableHostStore",
     "DetermaError",
     "DefinitionResolver",
-    "Delivery",
     "CreationRejectionCode",
-    "create_aggregate_v2",
     "create_checkpoint_v2",
     "DispatchRejectionCode",
-    "downgrade_aggregate_v2_to_v1",
     "DispositionCode",
     "ErrorRecord",
     "EPHEMERAL",
@@ -154,31 +154,29 @@ __all__ = [
     "ExecutionStoreAdapterFailureCode",
     "FileExecutionStore",
     "MemoryArtifactResolver",
+    "MemoryDurableHostStore",
     "MemoryExecutionStore",
     "MachineLoadFailureCode",
     "MigrationDescriptorResolver",
-    "MigrationDispatchResult",
-    "MigrationFailure",
     "MigrationLimits",
-    "MigrationResult",
     "migrate_aggregate_v2",
     "PERMANENT_OUTBOX_TERMINAL_RETENTION",
     "PERMANENT_RECEIPT_RETENTION",
     "PostgreSQLExecutionStore",
     "PORTABLE_CODE_SETS",
     "PersistenceFailureCode",
+    "PersistenceHost",
     "RESTART_PERSISTENT",
     "ROOT_IDENTITY_RETENTION",
-    "Result",
     "RestoredAggregate",
     "RestoredAggregatePackage",
     "RestoredExecutionCheckpoint",
-    "RestoredExecutionCheckpointV2",
     "SHARED_APPLICATION_TRANSACTION",
     "STANDARD_CAPABILITIES",
     "SchemaError",
     "SharedExecutionTransaction",
     "SQLiteExecutionStore",
+    "SQLiteDurableHostStore",
     "StagedExecutionResult",
     "ValidationError",
     "__version__",
@@ -189,37 +187,32 @@ __all__ = [
     "creation_request_digest",
     "bundled_execution_store_registry",
     "delivery_request_digest",
-    "dispatch",
     "execution_checkpoint_digest",
     "file_execution_store_factory",
     "load_bundle",
-    "migrate_aggregate",
-    "migrate_and_dispatch",
     "memory_execution_store_factory",
     "maintenance_migration_request_digest",
     "outbox_intent_digest",
     "portable_envelope",
     "postgresql_execution_store_factory",
     "prune_checkpoint_v2",
+    "process_delivery_checkpoint_v2",
     "register_bundled_execution_stores",
     "restore_aggregate",
     "restore_aggregate_v2",
     "restore_aggregate_package",
-    "restore_execution_checkpoint",
     "restore_execution_checkpoint_v2",
+    "restore_migration_descriptor_v2",
     "seal_aggregate_v2",
     "seal_execution_checkpoint",
     "serialize_aggregate",
     "serialize_execution_checkpoint",
-    "step_aggregate_v2",
+    "step",
     "step_checkpoint_v2",
     "sqlite_execution_store_factory",
     "validate",
     "validate_execution_checkpoint_member",
-    "validate_execution_checkpoint_semantics",
     "validate_host_profile",
-    "upgrade_aggregate_v1_to_v2",
-    "upgrade_checkpoint_v1_to_v2",
 ]
 
 logging.getLogger("determa.state").addHandler(logging.NullHandler())

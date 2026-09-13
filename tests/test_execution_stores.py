@@ -27,10 +27,28 @@ from determa.state import (
     SQLiteExecutionStore,
     bundled_execution_store_registry,
     load_bundle,
-    portable_envelope,
 )
 
-from .test_checkpoint_host import MACHINE
+MACHINE = """
+format: 1
+namespace: test.execution_checkpoint
+events:
+  increment:
+    direction: input
+    payload:
+      amount: { type: int, required: true }
+machines:
+  - machine_id: counter
+    version: 1
+    root:
+      type: simple
+      variables:
+        count: { type: int, init: 0 }
+      on_events:
+        increment:
+          action:
+            - assign: { count: "count + event.payload.amount" }
+"""
 
 _STRONG_RETENTION_CAPABILITIES = {
     ROOT_IDENTITY_RETENTION,
@@ -47,7 +65,7 @@ def _resolver() -> MemoryArtifactResolver:
 
 def _create(store: ExecutionStore, root: str = "root") -> ExecutionHost:
     host = ExecutionHost(store, _resolver())
-    host.create(load_bundle(MACHINE), "counter", root, f"{root}-create", {})
+    host.create_v2(load_bundle(MACHINE), "counter", root, f"{root}-create", {})
     return host
 
 
@@ -68,10 +86,48 @@ def test_shared_adapter_contract_round_trip(tmp_path: Path, index: int) -> None:
     host = _create(store)
     restored = host.read_checkpoint("root")
     assert restored is not None
-    replay = host.create(
+    replay = host.create_v2(
         load_bundle(MACHINE), "counter", "root", "root-create", {}
     )
     assert replay["receipt"]["receipt_sequence"] == "0"
+
+
+@pytest.mark.parametrize("index", range(3))
+def test_adapters_commit_and_replay_keyed_v2_maintenance_receipts(
+    tmp_path: Path, index: int
+) -> None:
+    store = _factories(tmp_path)[index]()
+    store.setup_schema()
+    bundle = load_bundle(MACHINE)
+    host = ExecutionHost(store, _resolver())
+    host.create_v2(bundle, "counter", "root", "root-create", {})
+    checkpoint = host.read_checkpoint("root")
+    assert checkpoint is not None
+    aggregate = checkpoint.document["root_record"]["aggregate_state"]
+
+    committed = host.maintenance_migration_v2(
+        "root",
+        "adapter-empty-migration",
+        aggregate["validated_bundle_fingerprint"],
+        [],
+        expected_revision=checkpoint.document["revision"],
+        expected_checkpoint_digest=checkpoint.document[
+            "execution_checkpoint_digest"
+        ],
+    )
+    replay = host.maintenance_migration_v2(
+        "root",
+        "adapter-empty-migration",
+        aggregate["validated_bundle_fingerprint"],
+        [],
+        expected_revision=checkpoint.document["revision"],
+        expected_checkpoint_digest=checkpoint.document[
+            "execution_checkpoint_digest"
+        ],
+    )
+
+    assert replay == committed
+    assert host.read_checkpoint("root").document["revision"] == "1"
 
 
 @pytest.mark.parametrize("index", range(3))
@@ -163,27 +219,13 @@ def test_concurrent_stale_writer_cannot_overwrite(
     document = checkpoint.document
     aggregate = document["root_record"]["aggregate_state"]
 
-    def process(event_id: str) -> str:
-        candidate = {
-            "root_instance_id": "root",
-            "delivery_mode": "input",
-            "origin": {"kind": "host_input"},
-            "envelope": portable_envelope(
-                "increment",
-                event_id,
-                {
-                    "root": {
-                        "root_instance_id": "root",
-                        "root_runtime_id": aggregate["root_runtime_id"],
-                    }
-                },
-                {"amount": 1},
-            ),
-        }
+    def process(operation_id: str) -> str:
         try:
-            ExecutionHost(store, _resolver()).foreground_process_delivery(
+            ExecutionHost(store, _resolver()).maintenance_migration_v2(
                 "root",
-                candidate,
+                operation_id,
+                aggregate["validated_bundle_fingerprint"],
+                [],
                 expected_revision=document["revision"],
                 expected_checkpoint_digest=document[
                     "execution_checkpoint_digest"
@@ -194,7 +236,7 @@ def test_concurrent_stale_writer_cannot_overwrite(
         return "committed"
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        outcomes = sorted(executor.map(process, ["event-a", "event-b"]))
+        outcomes = sorted(executor.map(process, ["operation-a", "operation-b"]))
     assert outcomes == ["checkpoint_revision_conflict", "committed"]
 
 
@@ -368,7 +410,7 @@ def test_sqlite_persists_policy_and_forbids_native_root_or_policy_mutation(
 
     assert host.read_checkpoint("bank-root") is not None
     with pytest.raises(ExecutionHostError) as recreate:
-        host.create(
+        host.create_v2(
             load_bundle(MACHINE), "counter", "bank-root", "replacement", {}
         )
     assert recreate.value.code == "creation_id_conflict"
@@ -463,13 +505,13 @@ def test_configured_sqlite_satisfies_bank_and_outbox_profiles(
         _resolver(),
         profile="strict_durable_outbox",
         host_features={
-            "atomic_checkpoint_processing",
+            "atomic_accept_process",
             "outbox_worker",
             "total_outbox_lifecycle",
             "retain_unresolved_outbox",
         },
     )
-    checkpoint = host.create(
+    checkpoint = host.create_v2(
         load_bundle(MACHINE), "counter", "bank-root", "create", {}
     )
     assert checkpoint["result"] == "committed"
@@ -515,10 +557,10 @@ def test_configured_sqlite_satisfies_compact_outbox_profile(
         _resolver(),
         profile="compact_durable_outbox",
         host_features={
-            "atomic_checkpoint_processing",
+            "atomic_accept_process",
             "outbox_worker",
             "total_outbox_lifecycle",
-            "retain_referenced_effect_tombstones",
+            "retain_receipt_references",
         },
     )
     with pytest.raises(ExecutionHostError) as error:

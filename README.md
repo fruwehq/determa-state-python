@@ -4,14 +4,12 @@ Python implementation of [Determa State](https://github.com/fruwehq/determa-stat
 a language-agnostic statechart engine with a shared normative conformance suite.
 
 This implementation supports Determa State `format: 1` at specification
-commit `2e33036563cb966b07124197db672159b4b7e1f4`. Correctness is determined by
-the 114-case core suite, 108 persistence vectors, 12 persistence-profile steps,
-99 execution-checkpoint vectors, 106 version-2 vectors, and 101 closed-code registry
-entries at conformance commit `531468c59c7a2dc32f5cbe92cfabf89805d27f6a`.
+commit `ee38796d5e38e67e350a06548fd50faa530cbb12`. Correctness is determined by
+98 format-1 core cases, 162 version-2 vectors, 138 durable-host vectors, and 381 generated version-2 artifacts
+at conformance commit `99a4d9ad5256f7330e75b06d48f340cc7239a40d`.
 
-The package metadata remains `0.2.0`. The implementation includes the portable
-execution-checkpoint host, selected legacy artifact decoding, and authoritative portable
-code sets.
+The package metadata remains `0.2.0`. Artifact and checkpoint schema version 2 is the
+only supported portable artifact format. Machine YAML remains `format: 1`.
 
 ## Install
 
@@ -73,8 +71,9 @@ names are not accepted.
 
 ## Use The Library
 
-`create` and `dispatch` are pure foreground operations. They do not retain hidden
-machine state or call queues, timers, databases, or remote services.
+`create`, `admit`, and `step` are pure foreground operations over explicit,
+queue-bearing aggregate state. They do not retain hidden machine state or call
+databases or remote services.
 
 ```python
 from pathlib import Path
@@ -91,38 +90,55 @@ created = ds.create(
 )
 state = created["state"]
 
+resolver = ds.MemoryArtifactResolver(definitions={bundle.fingerprint: bundle})
+
 target = {
     "root": {
         "root_instance_id": state["root_instance_id"],
         "root_runtime_id": state["root_runtime_id"],
     }
 }
-result = ds.dispatch(
-    bundle,
-    state,
-    {
-        "input": {
-            "event": "increment",
-            "event_id": "counter-42:increment:1",
-            "target": target,
-            "payload": {"amount": 2},
-        }
-    },
+envelope = ds.portable_envelope(
+    "increment",
+    "counter-42:increment:1",
+    target,
+    {"amount": 2},
 )
+delivery = {
+    "delivery_mode": "input",
+    "envelope": envelope,
+    "envelope_digest": ds.delivery_request_digest(
+        "counter-42", "input", envelope
+    ),
+}
+admitted = ds.admit(
+    state,
+    [delivery],
+    resolver,
+)
+result = ds.step(admitted["state"], state["root_runtime_id"], resolver)
 
 assert result["status"] == "running"
 assert result["disposition"] == "handled"
 state = result["state"]
-root = state["runtimes"][state["root_runtime_id"]]
-assert root["scopes"]["root"]["count"] == 2
+root = next(
+    runtime
+    for runtime in state["runtimes"]
+    if runtime["runtime_id"] == state["root_runtime_id"]
+)
+count = next(
+    variable
+    for variable in root["variables"]
+    if variable["variable_declaration_pointer"].endswith("/count")
+)
+assert count["value"] == ["integer", "2"]
 ```
 
-Both calls return all result fields: `status`, `disposition`, `state`, `emissions`,
-`fault`, and `rejection` (`create` has a null disposition). The caller owns delivery:
-the core processes at most one supplied envelope and does not place it in an internal
-queue. Successful processing returns a new JSON-compatible logical aggregate while
-leaving the supplied prior state unchanged. Rejections and unhandled deliveries return
-the exact supplied state object.
+`create` initializes the aggregate, `admit` atomically appends accepted deliveries to
+its runtime mailboxes, and `step` processes at most the selected runtime's ready head.
+Ready and deferred mailboxes are literal portable aggregate state, so queued work
+survives serialization and restoration. Each operation returns a new JSON-compatible
+logical aggregate while leaving the supplied prior state unchanged.
 
 `load_bundle` also accepts a native Python mapping through the same structural and
 semantic validation path. Native values must satisfy the same portable Unicode and
@@ -134,7 +150,7 @@ definitions.
 
 ## Persist And Migrate
 
-`serialize_aggregate` produces the canonical §16 aggregate artifact. Restoration
+`serialize_aggregate` produces the canonical schema-v2 aggregate artifact. Restoration
 resolves its exact validated definition by fingerprint and fails closed when the
 definition is absent or untrusted:
 
@@ -145,11 +161,9 @@ restored = ds.restore_aggregate(encoded, resolver)
 ```
 
 `restore_aggregate_package` verifies a self-contained transport package and seeds a
-mutable resolver without replacing existing content. `migrate_aggregate` applies an
-exact trusted descriptor route as a pure operation. `migrate_and_dispatch` returns one
-commit-ready migration, audit, dispatch, aggregate, and outbox-intent boundary. Failed
-migrations return a deterministic `MigrationFailure` and do not mutate the supplied
-artifact or resolver.
+mutable resolver without replacing existing content. `migrate_aggregate_v2` applies an
+exact trusted descriptor route as a pure operation. Failed migrations do not mutate the
+supplied artifact or resolver.
 
 Definition and descriptor resolvers are protocols, so applications can back them with
 an immutable registry or a transaction-local cache.
@@ -167,7 +181,7 @@ store.setup_schema()  # always explicit
 resolver = ds.MemoryArtifactResolver(definitions={bundle.fingerprint: bundle})
 host = ds.ExecutionHost(store, resolver)
 
-created = host.create(
+created = host.create_v2(
     bundle,
     machine_id="counter",
     root_instance_id="counter-42",
@@ -241,9 +255,9 @@ configuration. Root checkpoint deletion is unsupported.
   failure propagation, and cleanup cascades;
 - atomic RTC rollback, deterministic identities/counters, pure inspection, and
   incompatible or malformed prior-state rejection;
-- canonical aggregate serialization/restoration, portable typed values, package
+- schema-v2 aggregate serialization/restoration, portable typed values, package
   attachments, exact definition resolution, trusted lazy migration, deterministic
-  audits, resource limits, and atomic migrate-and-dispatch results.
+  audits, and resource limits;
 - strict portable execution-checkpoint parsing, canonical digests, semantic
   validation, synchronous transaction/CAS/replay orchestration, receipts, pending
   delivery, outbox lifecycle, replay retention, and root tombstones;
