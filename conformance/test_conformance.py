@@ -9,10 +9,11 @@ from pathlib import Path
 import pytest
 import yaml
 from jsonschema import Draft202012Validator
+from referencing import Resource
 
 from determa.state import PORTABLE_CODE_SETS, MemoryExecutionStore, load_bundle
 from determa.state.validator import schema as bundled_schema
-from determa.state.wire import artifact_schema
+from determa.state.wire import _schema_registry, artifact_schema
 
 from .durable_host import durable_host_vectors, run_durable_host_vector
 from .harness import CORE_DIR, CoreCase, conformance_root, core_cases, run_case
@@ -23,25 +24,60 @@ from .version2 import (
     version2_vectors,
 )
 
-_VERSION2_ARTIFACT_KINDS = {
+_PORTABLE_ARTIFACT_KINDS = {
     "aggregate_state_v2",
     "migration_descriptor_v2",
     "aggregate_state_package_v2",
     "execution_checkpoint_v2",
     "core_step_result_v2",
 }
+_CONFORMANCE_ARTIFACT_SCHEMAS = {
+    "durable_host_call_log_v2": "durable-host-call-log-v2.schema.json",
+    "durable_host_inputs_v2": "durable-host-inputs-v2.schema.json",
+    "durable_host_results_v2": "durable-host-results-v2.schema.json",
+    "durable_host_store_v2": "durable-host-store-v2.schema.json",
+    "version2_operation_inputs": "version2-operation-inputs.schema.json",
+    "version2_operation_result": "version2-operation-result.schema.json",
+}
+
+
+def _manifest_artifacts() -> list[tuple[Path, dict]]:
+    root = conformance_root() / "conformance"
+    return [
+        (test_path.parent, artifact)
+        for test_path in sorted(root.glob("**/test.yaml"))
+        for artifact in (
+            yaml.safe_load(test_path.read_text(encoding="utf-8")) or {}
+        ).get("artifacts", {}).get("documents", [])
+    ]
 
 
 def _version2_artifacts() -> list[tuple[Path, dict]]:
-    paths = sorted({item.path for item in version2_vectors()})
     return [
         (path, artifact)
-        for path in paths
-        for artifact in (
-            yaml.safe_load((path / "test.yaml").read_text(encoding="utf-8")) or {}
-        ).get("artifacts", {}).get("documents", [])
-        if artifact["kind"] in _VERSION2_ARTIFACT_KINDS
+        for path, artifact in _manifest_artifacts()
+        if artifact["kind"] in _PORTABLE_ARTIFACT_KINDS
     ]
+
+
+def _validate_manifest_artifact(path: Path, artifact: dict) -> None:
+    if artifact["kind"] in _PORTABLE_ARTIFACT_KINDS:
+        validate_version2_artifact(path, artifact)
+        return
+    schema_name = _CONFORMANCE_ARTIFACT_SCHEMAS[artifact["kind"]]
+    schema_path = conformance_root() / "scripts" / "schemas" / schema_name
+    schema = json.loads(schema_path.read_text(encoding="utf-8"))
+    registry = _schema_registry().with_resource(
+        schema["$id"], Resource.from_contents(schema)
+    )
+    validator = Draft202012Validator(schema, registry=registry)
+    try:
+        document = json.loads((path / artifact["file"]).read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, UnicodeError):
+        valid = False
+    else:
+        valid = validator.is_valid(document)
+    assert valid is artifact["valid"]
 
 
 def _spec_schema() -> dict | None:
@@ -65,6 +101,7 @@ def test_suite_present() -> None:
     assert len(core_cases()) == 98
     assert len(version2_vectors()) == 162
     assert len(durable_host_vectors()) == 138
+    assert len(_manifest_artifacts()) == 381
 
 
 @pytest.mark.parametrize("stored", [b"mutated", None])
@@ -206,8 +243,8 @@ def test_durable_host_vector(item) -> None:
 
 @pytest.mark.parametrize(
     ("case", "artifact"),
-    _version2_artifacts(),
+    _manifest_artifacts(),
 )
 def test_version2_artifact(case, artifact) -> None:
     path = case.path if isinstance(case, CoreCase) else case
-    validate_version2_artifact(path, artifact)
+    _validate_manifest_artifact(path, artifact)

@@ -124,6 +124,109 @@ def _deliveries(request: dict[str, Any]) -> list[Any]:
     return result
 
 
+def _checkpoint_replayed(
+    item: DurableHostVector,
+    request: dict[str, Any],
+    response: dict[str, Any],
+    source: bytes | None,
+) -> bool:
+    operation = item.vector["operation"]
+    if operation == "checkpoint_create_v2":
+        return source is not None
+    if operation == "checkpoint_admit_v2":
+        if response.get("result") == "replay":
+            return True
+        return response.get("result") == "batch" and all(
+            member["disposition"] == "replay" for member in response["members"]
+        )
+    if source is None:
+        return False
+    checkpoint = json.loads(source)
+    if operation == "checkpoint_prune_v2":
+        retention = checkpoint["replay_retention"]
+        return (
+            retention["mode"] == request["target_mode"]
+            and retention["policy_identifier"] == request["policy_identifier"]
+            and retention["pruned_through_receipt_sequence"]
+            == request["cutoff_receipt_sequence"]
+        )
+    if operation == "checkpoint_tombstone_v2":
+        return checkpoint["root_record"]["status"] == "tombstone"
+    if operation == "checkpoint_update_outbox_v2":
+        desired = {"status": request["target_disposition"]}
+        if request["outcome"]["reason_code"] is not None:
+            desired["reason_code"] = request["outcome"]["reason_code"]
+        return any(
+            record["intent"]["effect_id"] == request["effect_id"]
+            and record["delivery_state"] == desired
+            for record in checkpoint["pending_outbox_intents"]
+        )
+    if operation == "checkpoint_terminalize_outbox_v2":
+        return any(
+            record["intent"]["effect_id"] == request["effect_id"]
+            for record in checkpoint["terminal_outbox_records"]
+        ) or any(
+            record["effect_id"] == request["effect_id"]
+            for record in checkpoint["outbox_effect_tombstones"]
+        )
+    if operation == "checkpoint_compact_outbox_v2":
+        return any(
+            record["effect_id"] == request["effect_id"]
+            for record in checkpoint["outbox_effect_tombstones"]
+        )
+    return response.get("result") == "not_committed"
+
+
+def _validate_public_response(
+    operation: str, response: dict[str, Any], stored: bytes | None
+) -> None:
+    if operation in {"checkpoint_step_v2", "checkpoint_prune_v2"}:
+        assert stored is not None
+        assert response == json.loads(stored)
+        return
+    if operation == "checkpoint_admit_v2":
+        assert stored is not None
+        checkpoint = json.loads(stored)
+        if response.get("execution_checkpoint_schema_version") == 2:
+            assert response == checkpoint
+            return
+        if response.get("result") == "replay":
+            assert set(response) in (
+                {"result", "event_id", "acceptance_sequence", "location"},
+                {
+                    "result",
+                    "acceptance_receipt_sequence",
+                    "terminal_receipt_sequence",
+                },
+                {"result", "terminal_receipt_sequence", "terminal_disposition"},
+            )
+            return
+        assert set(response) == {"result", "checkpoint", "members"}
+        assert response["result"] == "batch"
+        assert response["checkpoint"] == checkpoint
+        assert response["members"]
+        assert all(
+            member.get("disposition") in {"accepted", "replay"}
+            for member in response["members"]
+        )
+        return
+    if operation == "checkpoint_tombstone_v2":
+        assert set(response) == {"result", "tombstone"}
+        assert response["result"] == "tombstoned"
+        assert stored is not None
+        assert response["tombstone"] == json.loads(stored)["root_record"]
+        return
+    assert isinstance(response.get("result"), str)
+
+
+def _broker_acknowledged(item: DurableHostVector, result: str) -> bool:
+    """Apply the broker-integrated lifecycle profile's post-commit policy."""
+    return (
+        item.path.name == "checkpoint-01-native-lifecycle"
+        and result in {"committed", "replayed"}
+    )
+
+
 def _invoke_checkpoint(
     item: DurableHostVector, request: dict[str, Any], observation: dict[str, Any]
 ) -> tuple[dict[str, Any], bytes | None, int]:
@@ -254,18 +357,27 @@ def _register_declared(
         registry.register(registration["uri_scheme"], factory)
 
 
-def _invoke_contract(item: DurableHostVector, request: dict[str, Any]) -> None:
+def _validated_result() -> dict[str, Any]:
+    return {
+        "result": "validated",
+        "mutation": "none",
+        "core_calls": 0,
+        "broker_acknowledged": False,
+    }
+
+
+def _invoke_contract(item: DurableHostVector, request: dict[str, Any]) -> dict[str, Any]:
     operation = item.vector["operation"]
     if operation == "checkpoint_inject_store_v2":
         ExecutionHost(
             _StaticStore(request["capabilities"]), MemoryArtifactResolver()
         )
-        return
+        return _validated_result()
     if operation == "checkpoint_register_adapter_v2":
         registry = ExecutionStoreRegistry()
         _register_declared(registry, request["existing_registrations"])
         _register_declared(registry, [request["registration"]])
-        return
+        return _validated_result()
     if operation == "checkpoint_resolve_adapter_v2":
         registry = ExecutionStoreRegistry()
         _register_declared(registry, request["registrations"])
@@ -274,14 +386,14 @@ def _invoke_contract(item: DurableHostVector, request: dict[str, Any]) -> None:
             configuration=request["configuration"],
             required_capabilities=frozenset(request["requested_capabilities"]),
         )
-        return
+        return _validated_result()
     if operation == "checkpoint_validate_capabilities_v2":
         validate_host_profile(
             _StaticStore(request["store_capabilities"], request["retention_mode"]),
             request["host_profile"],
             host_features=frozenset(request["host_guarantees"]),
         )
-        return
+        return _validated_result()
     if operation == "checkpoint_scope_operation_v2":
         scope = request["scope"]
         matches = [
@@ -294,34 +406,34 @@ def _invoke_contract(item: DurableHostVector, request: dict[str, Any]) -> None:
         ]
         if scope["authorization"] != "authorized" or len(matches) != 1:
             raise ExecutionHostError("invalid_store_scope")
-        return
+        return _validated_result()
     if operation == "checkpoint_backup_restore_v2":
         source_name = item.vector.get("checkpoint_before")
         if source_name is None:
             raise ExecutionHostError("invalid_execution_checkpoint")
         source = (item.path / source_name).read_bytes()
-        restored = restore_execution_checkpoint_v2(source, _resolver(item.path, request))
-        if restored.document["execution_checkpoint_digest"] not in request["checkpoint_digests"]:
-            raise ExecutionHostError("invalid_execution_checkpoint")
-        if restored.document["replay_retention"]["mode"] != request["retention_mode"]:
-            raise ExecutionHostError("invalid_execution_checkpoint")
-        aggregate = restored.document["root_record"].get("aggregate_state")
-        required_artifacts = (
-            {
-                runtime["current_definition"]["validated_bundle_fingerprint"]
-                for runtime in aggregate["runtimes"]
-            }
-            if aggregate is not None
-            else set()
+        checkpoint = restore_execution_checkpoint_v2(
+            source, _resolver(item.path, request)
         )
-        if not required_artifacts.issubset(request["trusted_artifact_digests"]):
-            raise ExecutionHostError("invalid_execution_checkpoint")
-        return
+        root_instance_id = checkpoint.document["root_instance_id"]
+        store = MemoryExecutionStore({root_instance_id: source})
+        host = ExecutionHost(store, _resolver(item.path, request))
+        return host.validate_backup_restore_v2(
+            action=request["action"],
+            checkpoint_members=[source],
+            checkpoint_digests=request["checkpoint_digests"],
+            trusted_artifact_digests=request["trusted_artifact_digests"],
+            adapter_metadata_digest=request["adapter_metadata_digest"],
+            retention_mode=request["retention_mode"],
+            consistency_point={
+                "scope_id": request["scope"]["scope_id"],
+                "root_instance_ids": [root_instance_id],
+            },
+        )
     raise AssertionError(f"unsupported durable-host contract operation: {operation}")
 
 
 def run_durable_host_vector(item: DurableHostVector) -> None:
-    expected = item.vector["expect"]
     request = _request(item)
     before_name = item.vector.get("checkpoint_before")
     before_bytes = None if before_name is None else (item.path / before_name).read_bytes()
@@ -330,7 +442,7 @@ def run_durable_host_vector(item: DurableHostVector) -> None:
         if item.vector["operation"].startswith("persistence_"):
             from .persistence_host import run_persistence_vector
 
-            actual, code, stored, core_calls = run_persistence_vector(item, request)
+            actual, stored = run_persistence_vector(item, request)
         elif item.vector["operation"] in {
             "checkpoint_backup_restore_v2",
             "checkpoint_inject_store_v2",
@@ -339,13 +451,22 @@ def run_durable_host_vector(item: DurableHostVector) -> None:
             "checkpoint_scope_operation_v2",
             "checkpoint_validate_capabilities_v2",
         }:
-            _invoke_contract(item, request)
-            actual, stored, core_calls = "validated", before_bytes, 0
+            actual = _invoke_contract(item, request)
+            stored = before_bytes
         else:
-            _response, stored, core_calls = _invoke_checkpoint(item, request, observation)
-            actual = "committed" if not _same_document(stored, before_bytes) else "replayed"
-        if not item.vector["operation"].startswith("persistence_"):
-            code = None
+            response, stored, core_calls = _invoke_checkpoint(item, request, observation)
+            _validate_public_response(item.vector["operation"], response, stored)
+            initial_source = observation.get("initial_source", before_bytes)
+            replayed = _checkpoint_replayed(item, request, response, initial_source)
+            result = "replayed" if replayed else "committed"
+            actual = {
+                "result": result,
+                "mutation": (
+                    "none" if _same_document(stored, initial_source) else "atomic"
+                ),
+                "core_calls": core_calls,
+                "broker_acknowledged": _broker_acknowledged(item, result),
+            }
     except (ArtifactError, ExecutionHostError, ExecutionStoreError) as error:
         code = error.code
         store = observation.get("store")
@@ -359,13 +480,24 @@ def run_durable_host_vector(item: DurableHostVector) -> None:
         core_calls = getattr(error, "core_calls", observation["core_calls"])
         if hasattr(error, "stored"):
             stored = error.stored
-        actual = "crashed" if code in {
+        result = "crashed" if code in {
             "injected_pre_commit_failure",
             "response_lost_after_commit",
         } else "rejected"
-    assert actual == expected["result"]
-    assert code == expected.get("code")
-    assert core_calls == expected["core_calls"]
+        actual = {
+            "result": result,
+            "mutation": (
+                "atomic" if code == "response_lost_after_commit" else "none"
+            ),
+            "core_calls": core_calls,
+            "broker_acknowledged": False,
+            "code": code,
+        }
+    result_reference = item.vector["result"]
+    expected_result = _pointer(
+        _json(item.path / result_reference["file"]), result_reference["pointer"]
+    )
+    assert actual == expected_result, (actual, expected_result)
     if item.vector["operation"].startswith("persistence_"):
         expected_bytes = (item.path / item.vector["store_after"]).read_bytes()
         assert _same_document(stored, expected_bytes)
@@ -374,7 +506,7 @@ def run_durable_host_vector(item: DurableHostVector) -> None:
     if after_name is not None:
         expected_bytes = (item.path / after_name).read_bytes()
         assert _same_document(stored, expected_bytes)
-        if expected["mutation"] == "none":
+        if expected_result["mutation"] == "none":
             initial = observation.get("initial_source", before_bytes)
             assert stored == initial
 

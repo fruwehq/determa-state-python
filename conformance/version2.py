@@ -20,9 +20,9 @@ from determa.state import (
     MigrationLimits,
     load_bundle,
     restore_aggregate_package,
+    restore_migration_descriptor_v2,
     serialize_execution_checkpoint,
 )
-from determa.state.checkpoint import execution_checkpoint_digest
 from determa.state.checkpoint_v2 import (
     admit_checkpoint_v2,
     prune_checkpoint_v2,
@@ -37,7 +37,6 @@ from determa.state.queueing import (
     step_aggregate_v2,
 )
 from determa.state.wire import (
-    aggregate_state_digest,
     canonical_bytes,
     load_json_artifact,
     migration_descriptor_digest,
@@ -175,13 +174,10 @@ def _invoke(
     if operation == "restore_package_v2":
         package = _json(path / vector["package_file"])
         restored_package = restore_aggregate_package(package, resolver)
-        if vector["name"] == "put_if_absent_is_idempotent":
-            restored_package = restore_aggregate_package(package, resolver)
-        if vector["name"] not in {
-            "attachments_seed_empty_resolver_and_drive_route",
-            "put_if_absent_is_idempotent",
-        }:
+        if request["intent"] == "restore_aggregate":
             return restored_package.aggregate.aggregate_envelope
+        if request["intent"] != "restore_and_apply_migration_route":
+            raise AssertionError("unsupported restore-package intent")
         descriptor = resolver.resolve_migration_descriptor(
             restored_package.migration_route[-1]
         )
@@ -344,21 +340,13 @@ def validate_version2_artifact(path: Path, artifact: dict[str, Any]) -> None:
         if artifact["valid"]:
             document, _ = load_json_artifact(source, artifact["kind"])
             if artifact.get("verify_digest", True):
-                if artifact["kind"] == "aggregate_state_v2" and (
-                    aggregate_state_digest(document) != document["aggregate_state_digest"]
-                ):
-                    raise ArtifactError("aggregate_state_digest_mismatch")
-                if artifact["kind"] == "execution_checkpoint_v2" and (
-                    execution_checkpoint_digest(document)
-                    != document["execution_checkpoint_digest"]
-                ):
-                    raise ArtifactError("execution_checkpoint_digest_mismatch")
-                if artifact["kind"] == "migration_descriptor_v2" and (
-                    migration_descriptor_digest(document)
-                    != document["migration_descriptor_digest"]
-                ):
-                    raise ArtifactError("migration_descriptor_digest_mismatch")
-                if artifact["kind"] == "aggregate_state_package_v2":
+                if artifact["kind"] == "aggregate_state_v2":
+                    restore_aggregate_v2(source, resolver)
+                elif artifact["kind"] == "execution_checkpoint_v2":
+                    restore_execution_checkpoint_v2(source, resolver)
+                elif artifact["kind"] == "migration_descriptor_v2":
+                    restore_migration_descriptor_v2(source, resolver)
+                elif artifact["kind"] == "aggregate_state_package_v2":
                     restore_aggregate_package(source, resolver)
             if artifact.get("canonical_of"):
                 assert canonical_bytes(document) == source
@@ -381,5 +369,28 @@ def validate_version2_artifact(path: Path, artifact: dict[str, Any]) -> None:
             return
         code = None
     except ArtifactError as error:
+        if artifact["valid"] and _is_declared_semantic_rejection(
+            path, artifact["file"], error.code
+        ):
+            return
         code = error.code
     assert code == (None if artifact["valid"] else artifact["error"])
+
+
+def _is_declared_semantic_rejection(path: Path, filename: str, code: str) -> bool:
+    """Recognize a schema-valid fixture exercised as a contextual negative."""
+    reference_fields = {
+        "state_before",
+        "descriptor_file",
+        "checkpoint_before",
+        "package_file",
+    }
+    for item in version2_vectors():
+        if item.path != path:
+            continue
+        if not any(item.vector.get(field) == filename for field in reference_fields):
+            continue
+        expected = item.vector.get("expect", {})
+        if expected.get("result") == "failure" and expected.get("code") == code:
+            return True
+    return False

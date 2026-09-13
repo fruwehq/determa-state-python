@@ -420,6 +420,34 @@ def _resolve_descriptor(
     return document, encoded
 
 
+def restore_migration_descriptor_v2(
+    source: ArtifactSource,
+    artifact_resolver: ArtifactResolver,
+    *,
+    resource_limits: MigrationLimits | None = None,
+) -> dict[str, Any]:
+    """Structurally and semantically restore one trusted v2 descriptor."""
+    limits = resource_limits or MigrationLimits()
+    document, _raw = load_json_artifact(source, "migration_descriptor_v2")
+    digest = document["migration_descriptor_digest"]
+    if migration_descriptor_digest(document) != digest:
+        raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)
+    source_bundle = _bundle_from_resolver(
+        artifact_resolver,
+        document["source_validated_bundle_fingerprint"],
+        source=True,
+        require_trust=True,
+    )
+    target_bundle = _bundle_from_resolver(
+        artifact_resolver,
+        document["target_validated_bundle_fingerprint"],
+        source=False,
+        require_trust=True,
+    )
+    _validate_descriptor_semantics(document, source_bundle, target_bundle, limits)
+    return copy.deepcopy(document)
+
+
 def _compatible_candidate(
     source: dict[str, Any],
     target_bundle: Bundle,

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-CONFORMANCE_COMMIT = "4e841e9afbf3f20e918e8af625d01c22d05d14db"
+CONFORMANCE_COMMIT = "99a4d9ad5256f7330e75b06d48f340cc7239a40d"
 SPEC_COMMIT = "ee38796d5e38e67e350a06548fd50faa530cbb12"
 
 ROOT = Path(__file__).resolve().parent.parent

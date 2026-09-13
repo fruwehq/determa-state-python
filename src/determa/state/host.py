@@ -40,6 +40,7 @@ from .stores import (
     ExecutionStoreRegistry,
     ExecutionStoreTransaction,
 )
+from .stores.base import checkpoint_metadata
 from .wire import (
     ArtifactResolver,
     decoded_typed_value,
@@ -472,6 +473,88 @@ class ExecutionHost:
             source = transaction.load()
             return None if source is None else self._restore(source, root_instance_id)
 
+    def validate_backup_restore_v2(
+        self,
+        *,
+        action: str,
+        checkpoint_members: Sequence[bytes],
+        checkpoint_digests: Sequence[str],
+        trusted_artifact_digests: Sequence[str],
+        adapter_metadata_digest: str,
+        retention_mode: str,
+        consistency_point: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Validate one complete, byte-exact checkpoint backup/restore manifest."""
+        if (
+            action not in {"backup", "restore"}
+            or retention_mode not in {"permanent", "bounded"}
+            or not checkpoint_members
+            or len(checkpoint_members) != len(checkpoint_digests)
+            or not all(isinstance(item, bytes) for item in checkpoint_members)
+            or not all(isinstance(item, str) and item for item in checkpoint_digests)
+            or not all(
+                isinstance(item, str) and item for item in trusted_artifact_digests
+            )
+            or set(consistency_point) != {"scope_id", "root_instance_ids"}
+            or not isinstance(consistency_point["scope_id"], str)
+            or not consistency_point["scope_id"]
+            or not isinstance(consistency_point["root_instance_ids"], Sequence)
+            or isinstance(consistency_point["root_instance_ids"], str | bytes)
+        ):
+            raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
+        expected_metadata_digest = hash_value(
+            [
+                "determa-backup-adapter-metadata-2",
+                consistency_point["scope_id"],
+            ]
+        )
+        if adapter_metadata_digest != expected_metadata_digest:
+            raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
+
+        restored_members = []
+        for source, digest in zip(
+            checkpoint_members, checkpoint_digests, strict=True
+        ):
+            restored = self._restore(source, checkpoint_metadata(source)[0])
+            if (
+                restored.document["execution_checkpoint_digest"] != digest
+                or restored.document["replay_retention"]["mode"] != retention_mode
+            ):
+                raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
+            restored_members.append(restored)
+        root_instance_ids = [
+            restored.document["root_instance_id"] for restored in restored_members
+        ]
+        if (
+            list(consistency_point["root_instance_ids"]) != root_instance_ids
+            or len(root_instance_ids) != len(set(root_instance_ids))
+        ):
+            raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
+
+        trusted = set(trusted_artifact_digests)
+        for restored in restored_members:
+            aggregate = restored.document["root_record"].get("aggregate_state")
+            if aggregate is not None:
+                required = {
+                    runtime["current_definition"]["validated_bundle_fingerprint"]
+                    for runtime in aggregate["runtimes"]
+                }
+                if not required.issubset(trusted):
+                    raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
+        if action == "backup":
+            for source, root_instance_id in zip(
+                checkpoint_members, root_instance_ids, strict=True
+            ):
+                with self._transaction(root_instance_id) as transaction:
+                    if transaction.load() != source:
+                        raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
+        return {
+            "result": "validated",
+            "mutation": "none",
+            "core_calls": 0,
+            "broker_acknowledged": False,
+        }
+
     def create_v2(
         self,
         bundle: Bundle | BundleSource,
@@ -593,6 +676,39 @@ class ExecutionHost:
         ):
             self._after_commit()
         return result
+
+    def process_delivery_v2(
+        self,
+        root_instance_id: str,
+        delivery: Mapping[str, Any],
+        *,
+        target_validated_bundle_fingerprint: str,
+        migration_descriptor_digest_route: Sequence[str],
+        expected_revision: str,
+        expected_checkpoint_digest: str,
+    ) -> dict[str, Any]:
+        """Commit migration, admission, and one RTC step as one host transaction."""
+        from .checkpoint_v2 import process_delivery_checkpoint_v2
+
+        with self._transaction(root_instance_id) as transaction:
+            source = transaction.load()
+            if source is None:
+                raise ExecutionHostError(PreAcceptanceCode.WRONG_ROOT)
+            prior = self._restore(source, root_instance_id).document
+            candidate = process_delivery_checkpoint_v2(
+                prior,
+                delivery,
+                self.artifact_resolver,
+                target_validated_bundle_fingerprint=(
+                    target_validated_bundle_fingerprint
+                ),
+                migration_descriptor_digest_route=migration_descriptor_digest_route,
+                expected_revision=expected_revision,
+                expected_checkpoint_digest=expected_checkpoint_digest,
+            )
+            self._stage_replace(transaction, prior, candidate)
+        self._after_commit()
+        return {"result": "committed", "checkpoint": candidate}
 
     def prune_v2(
         self,
@@ -1291,6 +1407,29 @@ class SharedExecutionTransaction:
             lambda: self._host.process_ready_v2(
                 self.root_instance_id,
                 target_runtime_id,
+                expected_revision=expected_revision,
+                expected_checkpoint_digest=expected_checkpoint_digest,
+            ),
+        )
+
+    def process_delivery_v2(
+        self,
+        delivery: Mapping[str, Any],
+        *,
+        target_validated_bundle_fingerprint: str,
+        migration_descriptor_digest_route: Sequence[str],
+        expected_revision: str,
+        expected_checkpoint_digest: str,
+    ) -> StagedExecutionResult:
+        return self._stage(
+            "process_delivery_v2",
+            lambda: self._host.process_delivery_v2(
+                self.root_instance_id,
+                delivery,
+                target_validated_bundle_fingerprint=(
+                    target_validated_bundle_fingerprint
+                ),
+                migration_descriptor_digest_route=migration_descriptor_digest_route,
                 expected_revision=expected_revision,
                 expected_checkpoint_digest=expected_checkpoint_digest,
             ),

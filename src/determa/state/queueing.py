@@ -673,7 +673,7 @@ def _enqueue_emissions(
     projected: list[dict[str, Any]] = []
     runtimes = {runtime["runtime_id"]: runtime for runtime in encoded["runtimes"]}
     root_completed = _root_status(encoded) == "completed"
-    for index, emission in enumerate(native_emissions):
+    for emission in native_emissions:
         if emission.get("target") == "external":
             projected_emission = {
                 "effect_id": emission["effect_id"],
@@ -735,7 +735,9 @@ def _enqueue_emissions(
             projected.append(
                 {
                     "kind": "internal_mailbox",
-                    "emission_index": str(index),
+                    "emission_index": str(
+                        emission.get("_determa_v2_emission_index", 0)
+                    ),
                     "event_id": emission["event_id"],
                     "acceptance_sequence": acceptance,
                     "queue_sequence": queue,
@@ -747,7 +749,9 @@ def _enqueue_emissions(
             projected.append(
                 {
                     "kind": "internal_disposed",
-                    "emission_index": str(index),
+                    "emission_index": str(
+                        emission.get("_determa_v2_emission_index", 0)
+                    ),
                     "event_id": emission["event_id"],
                     "acceptance_sequence": acceptance,
                     "lifecycle_disposition_index": disposition_index,

@@ -2153,6 +2153,8 @@ class _Execution:
                 }
                 if correlation is not None:
                     emission["correlation_id"] = correlation
+                if self.capture_emission_provenance:
+                    emission["_determa_v2_emission_index"] = index
             self.append_emission(emission, runtime)
 
     def resolve_send_target(

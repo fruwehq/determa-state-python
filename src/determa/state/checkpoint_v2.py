@@ -1005,6 +1005,70 @@ def step_checkpoint_v2(
     return seal_execution_checkpoint(candidate)
 
 
+def process_delivery_checkpoint_v2(
+    source: ArtifactSource,
+    delivery: Mapping[str, Any],
+    definition_resolver: DefinitionResolver,
+    *,
+    target_validated_bundle_fingerprint: str,
+    migration_descriptor_digest_route: Sequence[str],
+    expected_revision: str,
+    expected_checkpoint_digest: str,
+) -> dict[str, Any]:
+    """Migrate, admit, and process one delivery under one checkpoint revision."""
+    from .queueing import _runtime_id_for_target, migrate_aggregate_v2
+
+    restored = restore_execution_checkpoint_v2(source, definition_resolver)
+    prior = restored.document
+    _check_cas(prior, expected_revision, expected_checkpoint_digest)
+    aggregate = prior["root_record"].get("aggregate_state")
+    if aggregate is None:
+        raise ArtifactError("tombstoned_root")
+    migration = migrate_aggregate_v2(
+        aggregate,
+        target_validated_bundle_fingerprint,
+        migration_descriptor_digest_route,
+        definition_resolver,
+        maintenance_mode=False,
+    )
+    candidate = copy.deepcopy(prior)
+    committed_revision = str(int(prior["revision"]) + 1)
+    candidate["revision"] = committed_revision
+    candidate["root_record"]["aggregate_state"] = migration["aggregate_state"]
+    candidate["migration_audit_records"].extend(migration["audit_records"])
+    candidate = seal_execution_checkpoint(candidate)
+    original_receipt_count = len(candidate["operation_receipts"])
+    admitted = admit_checkpoint_v2(
+        candidate,
+        [delivery],
+        definition_resolver,
+        expected_revision=candidate["revision"],
+        expected_checkpoint_digest=candidate["execution_checkpoint_digest"],
+    )
+    if admitted.get("execution_checkpoint_schema_version") != 2:
+        raise ArtifactError(CheckpointArtifactFailureCode.INVALID_EXECUTION_CHECKPOINT)
+    target_runtime_id = _runtime_id_for_target(delivery["envelope"]["target"])
+    processed = step_checkpoint_v2(
+        admitted,
+        target_runtime_id,
+        definition_resolver,
+        expected_revision=admitted["revision"],
+        expected_checkpoint_digest=admitted["execution_checkpoint_digest"],
+    )
+    if processed.get("execution_checkpoint_schema_version") != 2:
+        raise ArtifactError(CheckpointArtifactFailureCode.INVALID_EXECUTION_CHECKPOINT)
+    processed["revision"] = committed_revision
+    for receipt in processed["operation_receipts"][original_receipt_count:]:
+        if "accepted_revision" in receipt:
+            receipt["accepted_revision"] = committed_revision
+        if "committed_revision" in receipt:
+            receipt["committed_revision"] = committed_revision
+    for intent in processed["pending_outbox_intents"]:
+        if int(intent["state_revision"]) > int(prior["revision"]):
+            intent["state_revision"] = committed_revision
+    return seal_execution_checkpoint(processed)
+
+
 def prune_checkpoint_v2(
     source: ArtifactSource,
     cutoff_receipt_sequence: str,

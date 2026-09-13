@@ -15,6 +15,7 @@ from .checkpoint_v2 import (
     RestoredExecutionCheckpoint,
     admit_checkpoint_v2,
     create_checkpoint_v2,
+    process_delivery_checkpoint_v2,
     prune_checkpoint_v2,
     restore_execution_checkpoint_v2,
     step_checkpoint_v2,
@@ -56,6 +57,13 @@ from .host import (
 )
 from .migration import (
     MigrationLimits,
+    restore_migration_descriptor_v2,
+)
+from .persistence import (
+    DurableHostStore,
+    MemoryDurableHostStore,
+    PersistenceHost,
+    SQLiteDurableHostStore,
 )
 from .queueing import (
     admit_aggregate_v2,
@@ -121,6 +129,7 @@ __all__ = [
     "COMPACT_EFFECT_IDENTITY_RETENTION",
     "DURABLE_CONCURRENT",
     "DURABLE_SINGLE_WRITER",
+    "DurableHostStore",
     "DetermaError",
     "DefinitionResolver",
     "Delivery",
@@ -142,6 +151,7 @@ __all__ = [
     "ExecutionStoreAdapterFailureCode",
     "FileExecutionStore",
     "MemoryArtifactResolver",
+    "MemoryDurableHostStore",
     "MemoryExecutionStore",
     "MachineLoadFailureCode",
     "MigrationDescriptorResolver",
@@ -152,6 +162,7 @@ __all__ = [
     "PostgreSQLExecutionStore",
     "PORTABLE_CODE_SETS",
     "PersistenceFailureCode",
+    "PersistenceHost",
     "RESTART_PERSISTENT",
     "ROOT_IDENTITY_RETENTION",
     "Result",
@@ -163,6 +174,7 @@ __all__ = [
     "SchemaError",
     "SharedExecutionTransaction",
     "SQLiteExecutionStore",
+    "SQLiteDurableHostStore",
     "StagedExecutionResult",
     "ValidationError",
     "__version__",
@@ -183,11 +195,13 @@ __all__ = [
     "portable_envelope",
     "postgresql_execution_store_factory",
     "prune_checkpoint_v2",
+    "process_delivery_checkpoint_v2",
     "register_bundled_execution_stores",
     "restore_aggregate",
     "restore_aggregate_v2",
     "restore_aggregate_package",
     "restore_execution_checkpoint_v2",
+    "restore_migration_descriptor_v2",
     "seal_aggregate_v2",
     "seal_execution_checkpoint",
     "serialize_aggregate",
