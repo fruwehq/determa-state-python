@@ -45,6 +45,8 @@ from .wire import (
     ArtifactResolver,
     decoded_typed_value,
     hash_value,
+    load_json_artifact,
+    migration_descriptor_digest,
     typed_value,
 )
 
@@ -214,23 +216,26 @@ _BACKUP_DESCRIPTOR_DIGEST_FIELDS = frozenset(
 )
 
 
-def _required_backup_artifact_digests(value: Any) -> frozenset[str]:
-    """Collect every immutable definition or migration artifact needed for recovery."""
-    required: set[str] = set()
+def _required_backup_artifacts(
+    value: Any,
+) -> tuple[frozenset[str], frozenset[str]]:
+    """Collect definitions and migration descriptors needed for recovery."""
+    definitions: set[str] = set()
+    descriptors: set[str] = set()
 
     def visit(item: Any) -> None:
         if isinstance(item, Mapping):
             for key, member in item.items():
                 if key in _BACKUP_DEFINITION_DIGEST_FIELDS and isinstance(member, str):
-                    required.add(member)
+                    definitions.add(member)
                 elif key in _BACKUP_DESCRIPTOR_DIGEST_FIELDS and isinstance(
                     member, str
                 ):
-                    required.add(member)
+                    descriptors.add(member)
                 elif key == "migration_descriptor_digest_route" and isinstance(
                     member, Sequence
                 ) and not isinstance(member, str | bytes):
-                    required.update(
+                    descriptors.update(
                         digest for digest in member if isinstance(digest, str)
                     )
                 visit(member)
@@ -266,7 +271,54 @@ def _required_backup_artifact_digests(value: Any) -> frozenset[str]:
                 )
     else:
         visit(value)
-    return frozenset(required)
+    return frozenset(definitions), frozenset(descriptors)
+
+
+def _required_backup_artifact_digests(value: Any) -> frozenset[str]:
+    """Collect every immutable artifact digest needed for recovery."""
+    definitions, descriptors = _required_backup_artifacts(value)
+    return definitions | descriptors
+
+
+def _validate_required_backup_artifacts(
+    resolver: ArtifactResolver,
+    trusted_artifact_digests: set[str],
+    value: Any,
+) -> None:
+    """Require every recovery artifact to resolve to trusted addressed content."""
+    definitions, descriptors = _required_backup_artifacts(value)
+    try:
+        for fingerprint in definitions:
+            if (
+                fingerprint not in trusted_artifact_digests
+                or not resolver.definition_is_trusted(fingerprint)
+            ):
+                raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
+            source = resolver.resolve_definition(fingerprint)
+            if source is None:
+                raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
+            bundle = source if isinstance(source, Bundle) else load_bundle(source)
+            if bundle.fingerprint != fingerprint:
+                raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
+
+        for digest in descriptors:
+            if (
+                digest not in trusted_artifact_digests
+                or not resolver.migration_descriptor_is_trusted(digest)
+            ):
+                raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
+            descriptor_source = resolver.resolve_migration_descriptor(digest)
+            if descriptor_source is None:
+                raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
+            descriptor, _ = load_json_artifact(
+                descriptor_source, "migration_descriptor_v2"
+            )
+            if migration_descriptor_digest(descriptor) != digest:
+                raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
+    except DetermaError as exc:
+        if isinstance(exc, ExecutionHostError):
+            raise
+        raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT) from exc
 
 
 def validate_host_profile(
@@ -601,9 +653,11 @@ class ExecutionHost:
 
         trusted = set(trusted_artifact_digests)
         for restored in restored_members:
-            required = _required_backup_artifact_digests(restored.document)
-            if not required.issubset(trusted):
-                raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
+            _validate_required_backup_artifacts(
+                self.artifact_resolver,
+                trusted,
+                restored.document,
+            )
         if action == "backup":
             for source, root_instance_id in zip(
                 checkpoint_members, root_instance_ids, strict=True

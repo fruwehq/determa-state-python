@@ -16,12 +16,22 @@ from determa.state import (
     PORTABLE_CODE_SETS,
     ExecutionHost,
     ExecutionHostError,
+    MemoryArtifactResolver,
     MemoryExecutionStore,
     load_bundle,
 )
-from determa.state.host import _required_backup_artifact_digests
+from determa.state.host import (
+    _required_backup_artifact_digests,
+    _required_backup_artifacts,
+    _validate_required_backup_artifacts,
+)
 from determa.state.validator import schema as bundled_schema
-from determa.state.wire import _schema_registry, artifact_schema, hash_value
+from determa.state.wire import (
+    _schema_registry,
+    artifact_schema,
+    hash_value,
+    migration_descriptor_digest,
+)
 
 from .durable_host import durable_host_vectors, run_durable_host_vector
 from .harness import CORE_DIR, CoreCase, conformance_root, core_cases, run_case
@@ -200,6 +210,108 @@ def test_backup_manifest_requires_migration_recovery_route() -> None:
         assert error.value.code == "invalid_execution_checkpoint"
 
 
+@pytest.mark.parametrize(
+    ("artifact_kind", "failure"),
+    [
+        ("definition", "missing"),
+        ("definition", "untrusted"),
+        ("definition", "mismatched"),
+        ("descriptor", "missing"),
+        ("descriptor", "untrusted"),
+        ("descriptor", "mismatched"),
+    ],
+)
+def test_backup_manifest_requires_restorable_artifacts(
+    artifact_kind: str, failure: str
+) -> None:
+    path = (
+        conformance_root()
+        / "conformance"
+        / "profiles"
+        / "execution-checkpoint"
+        / "checkpoint-04-version2-mailboxes"
+    )
+    source = (path / "maintenance-one-hop-checkpoint-v2.json").read_bytes()
+    checkpoint = json.loads(source)
+    definitions, descriptors = _required_backup_artifacts(checkpoint)
+    bundles = {}
+    for name in ["maintenance-source.yaml", "maintenance-target-one.yaml"]:
+        text = (path / name).read_text(encoding="utf-8")
+        bundles[load_bundle(text).fingerprint] = text
+    descriptor_documents = {
+        migration_descriptor_digest(document): document
+        for document in [
+            json.loads((path / "maintenance-descriptor-one.json").read_text()),
+            json.loads((path / "maintenance-descriptor-two.json").read_text()),
+        ]
+    }
+    required_definition = next(iter(definitions))
+    required_descriptor = next(iter(descriptors))
+    resolver_definitions = dict(bundles)
+    resolver_descriptors = dict(descriptor_documents)
+    trusted_definitions = list(resolver_definitions)
+    trusted_descriptors = list(resolver_descriptors)
+
+    if artifact_kind == "definition":
+        if failure == "missing":
+            resolver_definitions.pop(required_definition)
+        elif failure == "untrusted":
+            trusted_definitions.remove(required_definition)
+        else:
+            resolver_definitions[required_definition] = next(
+                bundle
+                for fingerprint, bundle in bundles.items()
+                if fingerprint != required_definition
+            )
+    elif failure == "missing":
+        resolver_descriptors.pop(required_descriptor)
+    elif failure == "untrusted":
+        trusted_descriptors.remove(required_descriptor)
+    else:
+        resolver_descriptors[required_descriptor] = next(
+            descriptor
+            for digest, descriptor in descriptor_documents.items()
+            if digest != required_descriptor
+        )
+
+    root_instance_id = checkpoint["root_instance_id"]
+    host = ExecutionHost(
+        MemoryExecutionStore({root_instance_id: source}),
+        MemoryArtifactResolver(
+            definitions=resolver_definitions,
+            migration_descriptors=resolver_descriptors,
+            trusted_definitions=trusted_definitions,
+            trusted_migration_descriptors=trusted_descriptors,
+        ),
+    )
+    if artifact_kind == "definition":
+        with pytest.raises(ExecutionHostError) as error:
+            _validate_required_backup_artifacts(
+                host.artifact_resolver,
+                set(definitions | descriptors),
+                checkpoint,
+            )
+        assert error.value.code == "invalid_execution_checkpoint"
+        return
+
+    with pytest.raises(ExecutionHostError) as error:
+        host.validate_backup_restore_v2(
+            action="backup",
+            checkpoint_members=[source],
+            checkpoint_digests=[checkpoint["execution_checkpoint_digest"]],
+            trusted_artifact_digests=sorted(definitions | descriptors),
+            adapter_metadata_digest=hash_value(
+                ["determa-backup-adapter-metadata-2", "migration-backup"]
+            ),
+            retention_mode=checkpoint["replay_retention"]["mode"],
+            consistency_point={
+                "scope_id": "migration-backup",
+                "root_instance_ids": [root_instance_id],
+            },
+        )
+    assert error.value.code == "invalid_execution_checkpoint"
+
+
 def test_backup_manifest_includes_historical_fault_definition() -> None:
     path = (
         conformance_root()
@@ -209,7 +321,8 @@ def test_backup_manifest_includes_historical_fault_definition() -> None:
     )
     result = json.loads((path / "migration-historical-fault-result.json").read_text())
     runtime = result["aggregate_state"]["runtimes"][0]
-    required = _required_backup_artifact_digests(result)
+    definitions, descriptors = _required_backup_artifacts(result)
+    required = definitions | descriptors
 
     assert runtime["fault"]["definition_fingerprint"] in required
     assert (
@@ -218,6 +331,28 @@ def test_backup_manifest_includes_historical_fault_definition() -> None:
     )
     assert runtime["current_definition"]["validated_bundle_fingerprint"] in required
     assert result["audit_records"][0]["migration_descriptor_digest"] in required
+
+    resolver = _resolver(path)
+    _validate_required_backup_artifacts(resolver, set(required), result)
+    origin = runtime["identity_origin"]["definition"][
+        "validated_bundle_fingerprint"
+    ]
+    with pytest.raises(ExecutionHostError) as error:
+        _validate_required_backup_artifacts(
+            MemoryArtifactResolver(
+                definitions={
+                    fingerprint: resolver.resolve_definition(fingerprint)
+                    for fingerprint in definitions - {origin}
+                },
+                migration_descriptors={
+                    digest: resolver.resolve_migration_descriptor(digest)
+                    for digest in descriptors
+                },
+            ),
+            set(required),
+            result,
+        )
+    assert error.value.code == "invalid_execution_checkpoint"
 
 
 @pytest.mark.parametrize("malformation", ["extra_field", "wrong_record"])
