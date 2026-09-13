@@ -71,8 +71,9 @@ names are not accepted.
 
 ## Use The Library
 
-`create` and `dispatch` are pure foreground operations. They do not retain hidden
-machine state or call queues, timers, databases, or remote services.
+`create`, `admit`, and `step` are pure foreground operations over explicit,
+queue-bearing aggregate state. They do not retain hidden machine state or call
+databases or remote services.
 
 ```python
 from pathlib import Path
@@ -89,38 +90,55 @@ created = ds.create(
 )
 state = created["state"]
 
+resolver = ds.MemoryArtifactResolver(definitions={bundle.fingerprint: bundle})
+
 target = {
     "root": {
         "root_instance_id": state["root_instance_id"],
         "root_runtime_id": state["root_runtime_id"],
     }
 }
-result = ds.dispatch(
-    bundle,
-    state,
-    {
-        "input": {
-            "event": "increment",
-            "event_id": "counter-42:increment:1",
-            "target": target,
-            "payload": {"amount": 2},
-        }
-    },
+envelope = ds.portable_envelope(
+    "increment",
+    "counter-42:increment:1",
+    target,
+    {"amount": 2},
 )
+delivery = {
+    "delivery_mode": "input",
+    "envelope": envelope,
+    "envelope_digest": ds.delivery_request_digest(
+        "counter-42", "input", envelope
+    ),
+}
+admitted = ds.admit(
+    state,
+    [delivery],
+    resolver,
+)
+result = ds.step(admitted["state"], state["root_runtime_id"], resolver)
 
 assert result["status"] == "running"
 assert result["disposition"] == "handled"
 state = result["state"]
-root = state["runtimes"][state["root_runtime_id"]]
-assert root["scopes"]["root"]["count"] == 2
+root = next(
+    runtime
+    for runtime in state["runtimes"]
+    if runtime["runtime_id"] == state["root_runtime_id"]
+)
+count = next(
+    variable
+    for variable in root["variables"]
+    if variable["variable_declaration_pointer"].endswith("/count")
+)
+assert count["value"] == ["integer", "2"]
 ```
 
-Both calls return all result fields: `status`, `disposition`, `state`, `emissions`,
-`fault`, and `rejection` (`create` has a null disposition). The caller owns delivery:
-the core processes at most one supplied envelope and does not place it in an internal
-queue. Successful processing returns a new JSON-compatible logical aggregate while
-leaving the supplied prior state unchanged. Rejections and unhandled deliveries return
-the exact supplied state object.
+`create` initializes the aggregate, `admit` atomically appends accepted deliveries to
+its runtime mailboxes, and `step` processes at most the selected runtime's ready head.
+Ready and deferred mailboxes are literal portable aggregate state, so queued work
+survives serialization and restoration. Each operation returns a new JSON-compatible
+logical aggregate while leaving the supplied prior state unchanged.
 
 `load_bundle` also accepts a native Python mapping through the same structural and
 semantic validation path. Native values must satisfy the same portable Unicode and

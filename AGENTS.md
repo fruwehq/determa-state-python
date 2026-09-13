@@ -20,8 +20,10 @@ The package metadata remains `0.2.0`.
 
 ## Boundaries
 
-The pure public API remains `load_bundle`, `create`, and `dispatch`, plus validation
-and error types exported by `determa.state`. Portable artifacts and checkpoints support
+The pure public API is `load_bundle`, `create`, `admit`, and `step`, plus validation
+and error types exported by `determa.state`. Creation, admission, and stepping operate
+only on queue-bearing aggregate state; the mailbox-free engine helpers are private.
+Portable artifacts and checkpoints support
 schema version 2 only. The optional synchronous `ExecutionHost` and execution-store
 APIs wrap that core without changing its exact `format: 1` machine grammar. Do not
 restore abandoned draft field names, artifact version 1 paths, or compatibility aliases.

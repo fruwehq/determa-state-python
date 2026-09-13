@@ -18,6 +18,8 @@ from .codes import (
 )
 from .definition import Bundle, BundleSource, load_bundle
 from .engine import (
+    _create,
+    _dispatch,
     _Execution,
     _normalize_payload,
     _normalize_value,
@@ -25,8 +27,6 @@ from .engine import (
     _runtime_model,
     _validate_envelope,
     _validate_reserved_payload,
-    create,
-    dispatch,
 )
 from .errors import ArtifactError, StepFault
 from .migration import MigrationLimits, migrate_aggregate
@@ -97,7 +97,7 @@ def create_aggregate_v2(
 ) -> dict[str, Any]:
     """Create one queue-bearing aggregate and route initialization emissions."""
     validated = bundle if isinstance(bundle, Bundle) else load_bundle(bundle)
-    result = create(
+    result = _create(
         validated,
         machine_id,
         root_instance_id,
@@ -890,7 +890,7 @@ def step_aggregate_v2(
     mailboxes = _mailbox_maps(before)
     ready, deferred = mailboxes[target_runtime_id]
     native = _native_envelope(selected)
-    result = dispatch(
+    result = _dispatch(
         restored.bundle,
         restored.state,
         {selected["delivery_mode"]: native},

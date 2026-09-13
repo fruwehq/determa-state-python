@@ -201,6 +201,74 @@ def outbox_intent_digest(root_instance_id: str, intent: Mapping[str, Any]) -> st
     )
 
 
+_BACKUP_DEFINITION_DIGEST_FIELDS = frozenset(
+    {
+        "validated_bundle_fingerprint",
+        "definition_fingerprint",
+        "source_validated_bundle_fingerprint",
+        "target_validated_bundle_fingerprint",
+    }
+)
+_BACKUP_DESCRIPTOR_DIGEST_FIELDS = frozenset(
+    {"migration_descriptor_digest", "migration_descriptor_digest_route"}
+)
+
+
+def _required_backup_artifact_digests(value: Any) -> frozenset[str]:
+    """Collect every immutable definition or migration artifact needed for recovery."""
+    required: set[str] = set()
+
+    def visit(item: Any) -> None:
+        if isinstance(item, Mapping):
+            for key, member in item.items():
+                if key in _BACKUP_DEFINITION_DIGEST_FIELDS and isinstance(member, str):
+                    required.add(member)
+                elif key in _BACKUP_DESCRIPTOR_DIGEST_FIELDS and isinstance(
+                    member, str
+                ):
+                    required.add(member)
+                elif key == "migration_descriptor_digest_route" and isinstance(
+                    member, Sequence
+                ) and not isinstance(member, str | bytes):
+                    required.update(
+                        digest for digest in member if isinstance(digest, str)
+                    )
+                visit(member)
+        elif isinstance(item, Sequence) and not isinstance(item, str | bytes):
+            for member in item:
+                visit(member)
+
+    if (
+        isinstance(value, Mapping)
+        and value.get("execution_checkpoint_schema_version") == 2
+    ):
+        aggregate = value.get("root_record", {}).get("aggregate_state")
+        if aggregate is not None:
+            visit(aggregate)
+        visit(value.get("migration_audit_records", []))
+        for receipt in value.get("operation_receipts", []):
+            if receipt.get("operation_kind") == "maintenance_migration":
+                visit(
+                    {
+                        "target_validated_bundle_fingerprint": receipt.get(
+                            "target_validated_bundle_fingerprint"
+                        )
+                    }
+                )
+            outcome = receipt.get("outcome")
+            if isinstance(outcome, Mapping) and "migration_descriptor_digest" in outcome:
+                visit(
+                    {
+                        "migration_descriptor_digest": outcome[
+                            "migration_descriptor_digest"
+                        ]
+                    }
+                )
+    else:
+        visit(value)
+    return frozenset(required)
+
+
 def validate_host_profile(
     store: ExecutionStore,
     profile: str,
@@ -533,14 +601,9 @@ class ExecutionHost:
 
         trusted = set(trusted_artifact_digests)
         for restored in restored_members:
-            aggregate = restored.document["root_record"].get("aggregate_state")
-            if aggregate is not None:
-                required = {
-                    runtime["current_definition"]["validated_bundle_fingerprint"]
-                    for runtime in aggregate["runtimes"]
-                }
-                if not required.issubset(trusted):
-                    raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
+            required = _required_backup_artifact_digests(restored.document)
+            if not required.issubset(trusted):
+                raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
         if action == "backup":
             for source, root_instance_id in zip(
                 checkpoint_members, root_instance_ids, strict=True

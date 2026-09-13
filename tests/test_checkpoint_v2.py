@@ -11,15 +11,14 @@ from determa.state import (
     ExecutionHostError,
     MemoryArtifactResolver,
     MemoryExecutionStore,
-    admit_aggregate_v2,
     create_checkpoint_v2,
     delivery_request_digest,
     load_bundle,
     portable_envelope,
     restore_execution_checkpoint_v2,
     seal_execution_checkpoint,
-    step_aggregate_v2,
 )
+from determa.state.queueing import admit_aggregate_v2, step_aggregate_v2
 
 MACHINE = """
 format: 1

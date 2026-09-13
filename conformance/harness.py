@@ -11,7 +11,9 @@ from typing import Any
 
 import yaml
 
-from determa.state import ValidationError, create, dispatch, load_bundle
+from determa.state import ValidationError, load_bundle
+from determa.state.engine import _create as create
+from determa.state.engine import _dispatch as dispatch
 
 from .pins import CONFORMANCE_CACHE
 

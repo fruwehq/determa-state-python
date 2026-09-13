@@ -34,7 +34,6 @@ from .codes import (
     PersistenceFailureCode,
 )
 from .definition import Bundle, BundleSource, load_bundle
-from .engine import Delivery, Result, create, dispatch
 from .errors import (
     ArtifactError,
     CelError,
@@ -66,12 +65,18 @@ from .persistence import (
     SQLiteDurableHostStore,
 )
 from .queueing import (
-    admit_aggregate_v2,
-    create_aggregate_v2,
+    admit_aggregate_v2 as admit,
+)
+from .queueing import (
+    create_aggregate_v2 as create,
+)
+from .queueing import (
     migrate_aggregate_v2,
     restore_aggregate_v2,
     seal_aggregate_v2,
-    step_aggregate_v2,
+)
+from .queueing import (
+    step_aggregate_v2 as step,
 )
 from .stores import (
     COMPACT_EFFECT_IDENTITY_RETENTION,
@@ -118,7 +123,7 @@ from .wire import (
 __all__ = [
     "ArtifactError",
     "ArtifactResolver",
-    "admit_aggregate_v2",
+    "admit",
     "admit_checkpoint_v2",
     "Bundle",
     "BundleSource",
@@ -132,9 +137,7 @@ __all__ = [
     "DurableHostStore",
     "DetermaError",
     "DefinitionResolver",
-    "Delivery",
     "CreationRejectionCode",
-    "create_aggregate_v2",
     "create_checkpoint_v2",
     "DispatchRejectionCode",
     "DispositionCode",
@@ -165,7 +168,6 @@ __all__ = [
     "PersistenceHost",
     "RESTART_PERSISTENT",
     "ROOT_IDENTITY_RETENTION",
-    "Result",
     "RestoredAggregate",
     "RestoredAggregatePackage",
     "RestoredExecutionCheckpoint",
@@ -185,7 +187,6 @@ __all__ = [
     "creation_request_digest",
     "bundled_execution_store_registry",
     "delivery_request_digest",
-    "dispatch",
     "execution_checkpoint_digest",
     "file_execution_store_factory",
     "load_bundle",
@@ -206,7 +207,7 @@ __all__ = [
     "seal_execution_checkpoint",
     "serialize_aggregate",
     "serialize_execution_checkpoint",
-    "step_aggregate_v2",
+    "step",
     "step_checkpoint_v2",
     "sqlite_execution_store_factory",
     "validate",

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 from pathlib import Path
@@ -11,14 +12,22 @@ import yaml
 from jsonschema import Draft202012Validator
 from referencing import Resource
 
-from determa.state import PORTABLE_CODE_SETS, MemoryExecutionStore, load_bundle
+from determa.state import (
+    PORTABLE_CODE_SETS,
+    ExecutionHost,
+    ExecutionHostError,
+    MemoryExecutionStore,
+    load_bundle,
+)
+from determa.state.host import _required_backup_artifact_digests
 from determa.state.validator import schema as bundled_schema
-from determa.state.wire import _schema_registry, artifact_schema
+from determa.state.wire import _schema_registry, artifact_schema, hash_value
 
 from .durable_host import durable_host_vectors, run_durable_host_vector
 from .harness import CORE_DIR, CoreCase, conformance_root, core_cases, run_case
 from .version2 import (
     _assert_checkpoint_unchanged,
+    _resolver,
     run_version2_vector,
     validate_version2_artifact,
     version2_vectors,
@@ -142,6 +151,97 @@ def test_valid_artifact_manifest_does_not_accept_forged_digest(tmp_path: Path) -
             tmp_path,
             {"file": forged.name, "kind": "aggregate_state_v2", "valid": True},
         )
+
+
+def test_backup_manifest_requires_migration_recovery_route() -> None:
+    path = (
+        conformance_root()
+        / "conformance"
+        / "profiles"
+        / "execution-checkpoint"
+        / "checkpoint-04-version2-mailboxes"
+    )
+    source = (path / "maintenance-one-hop-checkpoint-v2.json").read_bytes()
+    checkpoint = json.loads(source)
+    required = _required_backup_artifact_digests(checkpoint)
+    audit = checkpoint["migration_audit_records"][0]
+    expected = {
+        audit["source_validated_bundle_fingerprint"],
+        audit["target_validated_bundle_fingerprint"],
+        audit["migration_descriptor_digest"],
+    }
+    assert expected.issubset(required)
+    root_instance_id = checkpoint["root_instance_id"]
+    host = ExecutionHost(
+        MemoryExecutionStore({root_instance_id: source}), _resolver(path)
+    )
+    arguments = {
+        "action": "backup",
+        "checkpoint_members": [source],
+        "checkpoint_digests": [checkpoint["execution_checkpoint_digest"]],
+        "adapter_metadata_digest": hash_value(
+            ["determa-backup-adapter-metadata-2", "migration-backup"]
+        ),
+        "retention_mode": checkpoint["replay_retention"]["mode"],
+        "consistency_point": {
+            "scope_id": "migration-backup",
+            "root_instance_ids": [root_instance_id],
+        },
+    }
+    host.validate_backup_restore_v2(
+        **arguments, trusted_artifact_digests=sorted(required)
+    )
+    for omitted in expected:
+        with pytest.raises(ExecutionHostError) as error:
+            host.validate_backup_restore_v2(
+                **arguments,
+                trusted_artifact_digests=sorted(required - {omitted}),
+            )
+        assert error.value.code == "invalid_execution_checkpoint"
+
+
+def test_backup_manifest_includes_historical_fault_definition() -> None:
+    path = (
+        conformance_root()
+        / "conformance"
+        / "core"
+        / "118-version2-persistence"
+    )
+    result = json.loads((path / "migration-historical-fault-result.json").read_text())
+    runtime = result["aggregate_state"]["runtimes"][0]
+    required = _required_backup_artifact_digests(result)
+
+    assert runtime["fault"]["definition_fingerprint"] in required
+    assert (
+        runtime["identity_origin"]["definition"]["validated_bundle_fingerprint"]
+        in required
+    )
+    assert runtime["current_definition"]["validated_bundle_fingerprint"] in required
+    assert result["audit_records"][0]["migration_descriptor_digest"] in required
+
+
+@pytest.mark.parametrize("malformation", ["extra_field", "wrong_record"])
+def test_durable_host_rejects_malformed_outbox_response(
+    monkeypatch: pytest.MonkeyPatch, malformation: str
+) -> None:
+    item = next(
+        item
+        for item in durable_host_vectors()
+        if item.vector["name"] == "outbox_retryable_failure"
+    )
+    original = ExecutionHost.update_pending_outbox
+
+    def malformed_response(*args, **kwargs):
+        response = original(*args, **kwargs)
+        if malformation == "extra_field":
+            return {**response, "unexpected": True}
+        forged = copy.deepcopy(response)
+        forged["record"]["delivery_state"] = {"status": "ambiguous"}
+        return forged
+
+    monkeypatch.setattr(ExecutionHost, "update_pending_outbox", malformed_response)
+    with pytest.raises(AssertionError):
+        run_durable_host_vector(item)
 
 
 def test_portable_code_sets_match_authoritative_registry() -> None:

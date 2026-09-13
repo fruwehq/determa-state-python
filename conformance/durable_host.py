@@ -30,6 +30,8 @@ from determa.state.queueing import _runtime_id_for_target
 from .harness import conformance_root
 from .version2 import _json, _pointer, _resolver
 
+_CHECKPOINT_BROKER_MANAGED_ROOTS = frozenset({"checkpoint-lifecycle-root"})
+
 
 @dataclass(frozen=True)
 class DurableHostVector:
@@ -177,54 +179,184 @@ def _checkpoint_replayed(
     return response.get("result") == "not_committed"
 
 
+def _replay_evidence(checkpoint: dict[str, Any], event_id: str) -> dict[str, Any]:
+    for runtime in checkpoint["root_record"].get("aggregate_state", {}).get(
+        "runtimes", []
+    ):
+        for mailbox, location in (
+            ("ready_mailbox", "ready"),
+            ("deferred_mailbox", "deferred"),
+        ):
+            for entry in runtime[mailbox]:
+                if entry["envelope"]["event_id"] == event_id:
+                    return {
+                        "result": "replay",
+                        "event_id": event_id,
+                        "acceptance_sequence": entry["acceptance_sequence"],
+                        "location": location,
+                    }
+    acceptance = next(
+        (
+            receipt
+            for receipt in checkpoint["operation_receipts"]
+            if receipt["operation_kind"] == "acceptance"
+            and receipt["event_id"] == event_id
+        ),
+        None,
+    )
+    terminal = next(
+        (
+            receipt
+            for receipt in checkpoint["operation_receipts"]
+            if receipt["operation_kind"] == "event_terminal"
+            and receipt["event_id"] == event_id
+        ),
+        None,
+    )
+    if terminal is not None:
+        return {
+            "result": "replay",
+            "acceptance_receipt_sequence": (
+                acceptance["receipt_sequence"] if acceptance is not None else "0"
+            ),
+            "terminal_receipt_sequence": terminal["receipt_sequence"],
+        }
+    tombstone = next(
+        (
+            record
+            for record in checkpoint["event_identity_tombstones"]
+            if record["event_id"] == event_id
+        ),
+        None,
+    )
+    assert tombstone is not None
+    return {
+        "result": "replay",
+        "terminal_receipt_sequence": tombstone["terminal_receipt_sequence"],
+        "terminal_disposition": tombstone["terminal_disposition"],
+    }
+
+
 def _validate_public_response(
-    operation: str, response: dict[str, Any], stored: bytes | None
+    operation: str,
+    request: dict[str, Any],
+    response: dict[str, Any],
+    stored: bytes | None,
 ) -> None:
+    assert type(response) is dict
+    checkpoint = None if stored is None else json.loads(stored)
+    if operation == "checkpoint_create_v2":
+        assert checkpoint is not None
+        assert response == {
+            "result": "committed",
+            "receipt": checkpoint["operation_receipts"][0],
+        }
+        return
     if operation in {"checkpoint_step_v2", "checkpoint_prune_v2"}:
-        assert stored is not None
-        assert response == json.loads(stored)
+        assert checkpoint is not None
+        assert response == checkpoint
         return
     if operation == "checkpoint_admit_v2":
-        assert stored is not None
-        checkpoint = json.loads(stored)
+        assert checkpoint is not None
         if response.get("execution_checkpoint_schema_version") == 2:
             assert response == checkpoint
             return
         if response.get("result") == "replay":
-            assert set(response) in (
-                {"result", "event_id", "acceptance_sequence", "location"},
-                {
-                    "result",
-                    "acceptance_receipt_sequence",
-                    "terminal_receipt_sequence",
-                },
-                {"result", "terminal_receipt_sequence", "terminal_disposition"},
-            )
+            deliveries = _deliveries(request)
+            assert len(deliveries) == 1
+            event_id = deliveries[0]["envelope"]["event_id"]
+            assert response == _replay_evidence(checkpoint, event_id)
             return
         assert set(response) == {"result", "checkpoint", "members"}
         assert response["result"] == "batch"
         assert response["checkpoint"] == checkpoint
-        assert response["members"]
-        assert all(
-            member.get("disposition") in {"accepted", "replay"}
-            for member in response["members"]
-        )
+        event_ids = [
+            delivery["envelope"]["event_id"] for delivery in _deliveries(request)
+        ]
+        assert [member.get("event_id") for member in response["members"]] == event_ids
+        for member in response["members"]:
+            if member.get("disposition") == "accepted":
+                assert set(member) == {
+                    "event_id",
+                    "disposition",
+                    "acceptance_sequence",
+                    "queue_sequence",
+                }
+                assert any(
+                    entry["envelope"]["event_id"] == member["event_id"]
+                    and entry["acceptance_sequence"] == member["acceptance_sequence"]
+                    and entry["queue_sequence"] == member["queue_sequence"]
+                    for runtime in checkpoint["root_record"]["aggregate_state"][
+                        "runtimes"
+                    ]
+                    for mailbox in ("ready_mailbox", "deferred_mailbox")
+                    for entry in runtime[mailbox]
+                )
+            else:
+                assert set(member) == {"event_id", "disposition", "evidence"}
+                assert member["disposition"] == "replay"
+                assert member["evidence"] == _replay_evidence(
+                    checkpoint, member["event_id"]
+                )
         return
     if operation == "checkpoint_tombstone_v2":
         assert set(response) == {"result", "tombstone"}
         assert response["result"] == "tombstoned"
-        assert stored is not None
-        assert response["tombstone"] == json.loads(stored)["root_record"]
+        assert checkpoint is not None
+        assert response["tombstone"] == checkpoint["root_record"]
         return
-    assert isinstance(response.get("result"), str)
+    assert checkpoint is not None
+    if operation == "checkpoint_update_outbox_v2":
+        records = checkpoint["pending_outbox_intents"]
+    elif operation == "checkpoint_terminalize_outbox_v2":
+        records = [
+            *checkpoint["terminal_outbox_records"],
+            *checkpoint["outbox_effect_tombstones"],
+        ]
+    elif operation == "checkpoint_compact_outbox_v2":
+        records = checkpoint["outbox_effect_tombstones"]
+    else:
+        raise AssertionError(f"unvalidated production response: {operation}")
+    assert set(response) == {"result", "record"}
+    assert response["result"] == "committed"
+    assert response["record"] in records
+    record = response["record"]
+    effect_id = record.get("effect_id", record.get("intent", {}).get("effect_id"))
+    assert effect_id == request["effect_id"]
+    if operation == "checkpoint_update_outbox_v2":
+        desired = {"status": request["target_disposition"]}
+        if request["outcome"]["reason_code"] is not None:
+            desired["reason_code"] = request["outcome"]["reason_code"]
+        assert record["delivery_state"] == desired
+    elif operation == "checkpoint_terminalize_outbox_v2":
+        desired = {"status": request["target_disposition"]}
+        if request["outcome"]["reason_code"] is not None:
+            desired["reason_code"] = request["outcome"]["reason_code"]
+        assert record["outcome"] == desired
 
 
-def _broker_acknowledged(item: DurableHostVector, result: str) -> bool:
-    """Apply the broker-integrated lifecycle profile's post-commit policy."""
-    return (
-        item.path.name == "checkpoint-01-native-lifecycle"
-        and result in {"committed", "replayed"}
-    )
+def _request_root_instance_id(request: dict[str, Any]) -> str | None:
+    if isinstance(request.get("root_instance_id"), str):
+        return request["root_instance_id"]
+    expected = request.get("expected_checkpoint")
+    if isinstance(expected, dict) and isinstance(expected.get("root_instance_id"), str):
+        return expected["root_instance_id"]
+    return None
+
+
+class _BrokerAcknowledgementAdapter:
+    """Exercise host-owned broker acknowledgement for explicitly managed roots."""
+
+    def __init__(self, managed_root_instance_ids: frozenset[str]) -> None:
+        self._managed_root_instance_ids = managed_root_instance_ids
+        self._acknowledged_request_ids: set[str] = set()
+
+    def acknowledge(self, request: dict[str, Any]) -> None:
+        if _request_root_instance_id(request) in self._managed_root_instance_ids:
+            self._acknowledged_request_ids.add(request["request_id"])
+
+    def acknowledged(self, request: dict[str, Any]) -> bool:
+        return request["request_id"] in self._acknowledged_request_ids
 
 
 def _invoke_checkpoint(
@@ -435,6 +567,7 @@ def _invoke_contract(item: DurableHostVector, request: dict[str, Any]) -> dict[s
 
 def run_durable_host_vector(item: DurableHostVector) -> None:
     request = _request(item)
+    broker = _BrokerAcknowledgementAdapter(_CHECKPOINT_BROKER_MANAGED_ROOTS)
     before_name = item.vector.get("checkpoint_before")
     before_bytes = None if before_name is None else (item.path / before_name).read_bytes()
     observation: dict[str, Any] = {"core_calls": 0}
@@ -455,17 +588,21 @@ def run_durable_host_vector(item: DurableHostVector) -> None:
             stored = before_bytes
         else:
             response, stored, core_calls = _invoke_checkpoint(item, request, observation)
-            _validate_public_response(item.vector["operation"], response, stored)
+            _validate_public_response(
+                item.vector["operation"], request, response, stored
+            )
             initial_source = observation.get("initial_source", before_bytes)
             replayed = _checkpoint_replayed(item, request, response, initial_source)
             result = "replayed" if replayed else "committed"
+            if result in {"committed", "replayed"}:
+                broker.acknowledge(request)
             actual = {
                 "result": result,
                 "mutation": (
                     "none" if _same_document(stored, initial_source) else "atomic"
                 ),
                 "core_calls": core_calls,
-                "broker_acknowledged": _broker_acknowledged(item, result),
+                "broker_acknowledged": broker.acknowledged(request),
             }
     except (ArtifactError, ExecutionHostError, ExecutionStoreError) as error:
         code = error.code

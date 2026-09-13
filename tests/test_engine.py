@@ -5,7 +5,7 @@ import math
 
 import pytest
 
-from determa.state import Bundle, create, dispatch, load_bundle
+from determa.state import Bundle, load_bundle
 from determa.state.engine import (
     _cause_id,
     _component_runtime_id,
@@ -13,6 +13,8 @@ from determa.state.engine import (
     _root_runtime_id,
     _spawned_runtime_id,
 )
+from determa.state.engine import _create as create
+from determa.state.engine import _dispatch as dispatch
 from determa.state.errors import StepFault
 from determa.state.model import BundleModel
 
@@ -44,6 +46,22 @@ machines:
                 - assign: { count: "count + 1" }
                 - assign: { count: "count / 0" }
 """
+
+
+def test_public_execution_api_is_queue_bearing_only() -> None:
+    import determa.state as state
+
+    assert {"create", "admit", "step"}.issubset(state.__all__)
+    for removed in (
+        "dispatch",
+        "Delivery",
+        "Result",
+        "create_aggregate_v2",
+        "admit_aggregate_v2",
+        "step_aggregate_v2",
+    ):
+        assert removed not in state.__all__
+        assert not hasattr(state, removed)
 
 BINDING_BUNDLE = """
 format: 1

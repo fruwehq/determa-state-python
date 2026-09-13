@@ -39,8 +39,8 @@ from .yaml12 import (
     validate_unicode,
 )
 
-Result = dict[str, Any]
-Delivery = dict[str, dict[str, Any]] | None
+_Result = dict[str, Any]
+_Delivery = dict[str, dict[str, Any]] | None
 _INT_MIN = -(2**63)
 _INT_MAX = 2**63 - 1
 
@@ -275,7 +275,7 @@ def _normalize_payload(declaration: dict[str, Any], payload: Any) -> dict[str, A
     return normalized
 
 
-def _empty_result(*, status: str, state: dict[str, Any] | None, disposition: str | None) -> Result:
+def _empty_result(*, status: str, state: dict[str, Any] | None, disposition: str | None) -> _Result:
     return {
         "status": status,
         "disposition": disposition,
@@ -286,7 +286,7 @@ def _empty_result(*, status: str, state: dict[str, Any] | None, disposition: str
     }
 
 
-def create(
+def _create(
     bundle: Bundle | BundleSource,
     machine_id: str,
     root_instance_id: str,
@@ -294,7 +294,7 @@ def create(
     bindings: dict[str, dict[str, Any]] | None = None,
     *,
     _capture_emission_provenance: bool = False,
-) -> Result:
+) -> _Result:
     """Create and synchronously initialize one root ownership aggregate."""
     validated = _coerce_bundle(bundle)
     if (
@@ -386,13 +386,13 @@ def create(
     return result
 
 
-def dispatch(
+def _dispatch(
     bundle: Bundle | BundleSource,
     prior_state: dict[str, Any],
-    delivery: Delivery = None,
+    delivery: _Delivery = None,
     *,
     _capture_emission_provenance: bool = False,
-) -> Result:
+) -> _Result:
     """Validate and process at most one envelope against an aggregate copy."""
     validated = _coerce_bundle(bundle)
     if not _valid_prior_state(prior_state, validated):
@@ -506,7 +506,7 @@ def dispatch(
     return result
 
 
-def _rejected(prior_state: dict[str, Any], code: DispatchCode) -> Result:
+def _rejected(prior_state: dict[str, Any], code: DispatchCode) -> _Result:
     result = _empty_result(
         status=prior_state["status"],
         state=prior_state,
