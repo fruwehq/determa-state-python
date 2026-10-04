@@ -4,25 +4,25 @@ import copy
 
 import pytest
 
-import determa.state.checkpoint_v2 as checkpoint_v2
+import determa.state.checkpoint_v1 as checkpoint_v1
 from determa.state import (
     ArtifactError,
     ExecutionHost,
     ExecutionHostError,
     MemoryArtifactResolver,
     MemoryExecutionStore,
-    create_checkpoint_v2,
+    create_checkpoint_v1,
     delivery_request_digest,
     load_bundle,
     portable_envelope,
-    restore_execution_checkpoint_v2,
+    restore_execution_checkpoint_v1,
     seal_execution_checkpoint,
 )
-from determa.state.queueing import admit_aggregate_v2, step_aggregate_v2
+from determa.state.queueing import admit_aggregate_v1, step_aggregate_v1
 
 MACHINE = """
 format: 1
-namespace: test.checkpoint_v2
+namespace: test.checkpoint_v1
 events:
   increment:
     direction: input
@@ -50,7 +50,7 @@ machines:
 
 TERMINAL_MACHINE = """
 format: 1
-namespace: test.checkpoint_v2_terminal
+namespace: test.checkpoint_v1_terminal
 machines:
   - machine_id: terminal
     version: 1
@@ -60,7 +60,7 @@ machines:
 
 OUTPUT_MACHINE = """
 format: 1
-namespace: test.checkpoint_v2_output
+namespace: test.checkpoint_v1_output
 events:
   trigger:
     direction: input
@@ -103,7 +103,7 @@ def _host() -> tuple[ExecutionHost, MemoryExecutionStore]:
 
 def _created_checkpoint() -> tuple[dict, MemoryArtifactResolver]:
     bundle, resolver = _bundle_and_resolver()
-    return create_checkpoint_v2(bundle, "counter", "root", "create", {}), resolver
+    return create_checkpoint_v1(bundle, "counter", "root", "create", {}), resolver
 
 
 def _delivery(
@@ -135,12 +135,12 @@ def _delivery(
     }
 
 
-def test_v2_is_the_only_supported_checkpoint_schema() -> None:
+def test_v1_is_the_only_supported_checkpoint_schema() -> None:
     checkpoint, resolver = _created_checkpoint()
-    checkpoint["execution_checkpoint_schema_version"] = 1
+    checkpoint["execution_checkpoint_schema_version"] = 2
 
     with pytest.raises(ArtifactError) as error:
-        restore_execution_checkpoint_v2(checkpoint, resolver)
+        restore_execution_checkpoint_v1(checkpoint, resolver)
 
     assert error.value.code == "unsupported_execution_checkpoint_schema_version"
 
@@ -150,11 +150,11 @@ def test_tombstone_response_is_exact_and_replay_is_read_only() -> None:
     resolver = MemoryArtifactResolver(definitions={bundle.fingerprint: bundle})
     store = MemoryExecutionStore()
     host = ExecutionHost(store, resolver)
-    host.create_v2(bundle, "terminal", "root", "create", {})
+    host.create_v1(bundle, "terminal", "root", "create", {})
     before = host.read_checkpoint("root")
     assert before is not None
 
-    committed = host.tombstone_root_v2(
+    committed = host.tombstone_root_v1(
         "root",
         "tombstone",
         expected_revision=before.document["revision"],
@@ -166,7 +166,7 @@ def test_tombstone_response_is_exact_and_replay_is_read_only() -> None:
     after = host.read_checkpoint("root")
     assert after is not None
 
-    replay = host.tombstone_root_v2(
+    replay = host.tombstone_root_v1(
         "root",
         "tombstone",
         expected_revision="stale",
@@ -181,11 +181,11 @@ def test_tombstone_response_is_exact_and_replay_is_read_only() -> None:
 def test_empty_maintenance_receipt_records_target_and_replays_before_cas() -> None:
     bundle, _resolver = _bundle_and_resolver()
     host, _store = _host()
-    host.create_v2(bundle, "counter", "root", "create", {})
+    host.create_v1(bundle, "counter", "root", "create", {})
     before = host.read_checkpoint("root")
     assert before is not None
 
-    committed = host.maintenance_migration_v2(
+    committed = host.maintenance_migration_v1(
         "root",
         "migration-1",
         bundle.fingerprint,
@@ -198,7 +198,7 @@ def test_empty_maintenance_receipt_records_target_and_replays_before_cas() -> No
     assert receipt["result_code"] == "migration_no_operation"
     assert receipt["migration_sequences"] == []
 
-    replay = host.maintenance_migration_v2(
+    replay = host.maintenance_migration_v1(
         "root",
         "migration-1",
         bundle.fingerprint,
@@ -212,10 +212,10 @@ def test_empty_maintenance_receipt_records_target_and_replays_before_cas() -> No
 def test_same_maintenance_operation_id_with_changed_target_conflicts() -> None:
     bundle, _resolver = _bundle_and_resolver()
     host, _store = _host()
-    host.create_v2(bundle, "counter", "root", "create", {})
+    host.create_v1(bundle, "counter", "root", "create", {})
     before = host.read_checkpoint("root")
     assert before is not None
-    host.maintenance_migration_v2(
+    host.maintenance_migration_v1(
         "root",
         "migration-1",
         bundle.fingerprint,
@@ -225,7 +225,7 @@ def test_same_maintenance_operation_id_with_changed_target_conflicts() -> None:
     )
 
     with pytest.raises(ExecutionHostError) as error:
-        host.maintenance_migration_v2(
+        host.maintenance_migration_v1(
             "root",
             "migration-1",
             "sha256:" + "1" * 64,
@@ -240,10 +240,10 @@ def test_same_maintenance_operation_id_with_changed_target_conflicts() -> None:
 def test_restore_rejects_maintenance_receipt_revision_regression() -> None:
     bundle, resolver = _bundle_and_resolver()
     host = ExecutionHost(MemoryExecutionStore(), resolver)
-    host.create_v2(bundle, "counter", "root", "create", {})
+    host.create_v1(bundle, "counter", "root", "create", {})
     before = host.read_checkpoint("root")
     assert before is not None
-    host.maintenance_migration_v2(
+    host.maintenance_migration_v1(
         "root",
         "migration-1",
         bundle.fingerprint,
@@ -258,7 +258,7 @@ def test_restore_rejects_maintenance_receipt_revision_regression() -> None:
     forged = seal_execution_checkpoint(forged)
 
     with pytest.raises(ArtifactError) as error:
-        restore_execution_checkpoint_v2(forged, resolver)
+        restore_execution_checkpoint_v1(forged, resolver)
 
     assert error.value.code == "invalid_execution_checkpoint"
 
@@ -273,9 +273,9 @@ def test_checkpoint_admission_validates_before_calling_aggregate_core(
     def unexpected_core_call(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("aggregate admission core must not run")
 
-    monkeypatch.setattr(checkpoint_v2, "admit_aggregate_v2", unexpected_core_call)
+    monkeypatch.setattr(checkpoint_v1, "admit_aggregate_v1", unexpected_core_call)
     with pytest.raises(ArtifactError) as error:
-        checkpoint_v2.admit_checkpoint_v2(
+        checkpoint_v1.admit_checkpoint_v1(
             checkpoint,
             [delivery],
             resolver,
@@ -292,7 +292,7 @@ def test_checkpoint_admission_payload_failure_precedes_missing_correlation() -> 
     delivery = _delivery(checkpoint, "work_completed", "invalid-contract", {})
 
     with pytest.raises(ArtifactError) as error:
-        checkpoint_v2.admit_checkpoint_v2(
+        checkpoint_v1.admit_checkpoint_v1(
             checkpoint,
             [delivery],
             resolver,
@@ -315,7 +315,7 @@ def test_checkpoint_admission_mode_failure_precedes_later_member_contract_failur
     )
 
     with pytest.raises(ArtifactError) as error:
-        checkpoint_v2.admit_checkpoint_v2(
+        checkpoint_v1.admit_checkpoint_v1(
             checkpoint,
             [invalid_event, invalid_mode],
             resolver,
@@ -337,8 +337,8 @@ def test_checkpoint_empty_mailbox_does_not_call_aggregate_core(
     def unexpected_core_call(*_args: object, **_kwargs: object) -> None:
         raise AssertionError("aggregate step core must not run")
 
-    monkeypatch.setattr(checkpoint_v2, "step_aggregate_v2", unexpected_core_call)
-    result = checkpoint_v2.step_checkpoint_v2(
+    monkeypatch.setattr(checkpoint_v1, "step_aggregate_v1", unexpected_core_call)
+    result = checkpoint_v1.step_checkpoint_v1(
         checkpoint,
         root_runtime_id,
         resolver,
@@ -355,30 +355,30 @@ def test_checkpoint_empty_mailbox_does_not_call_aggregate_core(
 def test_external_action_ordinals_are_private_core_evidence_for_checkpoint_receipts() -> None:
     bundle = load_bundle(OUTPUT_MACHINE)
     resolver = MemoryArtifactResolver(definitions={bundle.fingerprint: bundle})
-    checkpoint = create_checkpoint_v2(bundle, "outputter", "root", "create", {})
+    checkpoint = create_checkpoint_v1(bundle, "outputter", "root", "create", {})
     delivery = _delivery(checkpoint, "trigger", "trigger-1", {})
 
-    admitted_core = admit_aggregate_v2(
+    admitted_core = admit_aggregate_v1(
         checkpoint["root_record"]["aggregate_state"], [delivery], resolver
     )
-    core_result = step_aggregate_v2(
+    core_result = step_aggregate_v1(
         admitted_core["state"],
         admitted_core["state"]["root_runtime_id"],
         resolver,
     )
     assert len(core_result["emissions"]) == 2
     assert all(
-        "_determa_v2_emission_index" not in emission for emission in core_result["emissions"]
+        "_determa_v1_emission_index" not in emission for emission in core_result["emissions"]
     )
 
-    admitted_checkpoint = checkpoint_v2.admit_checkpoint_v2(
+    admitted_checkpoint = checkpoint_v1.admit_checkpoint_v1(
         checkpoint,
         [delivery],
         resolver,
         expected_revision=checkpoint["revision"],
         expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
     )
-    processed = checkpoint_v2.step_checkpoint_v2(
+    processed = checkpoint_v1.step_checkpoint_v1(
         admitted_checkpoint,
         admitted_checkpoint["root_record"]["aggregate_state"]["root_runtime_id"],
         resolver,
@@ -389,7 +389,7 @@ def test_external_action_ordinals_are_private_core_evidence_for_checkpoint_recei
     references = processed["operation_receipts"][-1]["emission_references"]
     assert [reference["emission_index"] for reference in references] == ["0", "0"]
     assert all(
-        "_determa_v2_emission_index" not in pending["intent"]
+        "_determa_v1_emission_index" not in pending["intent"]
         for pending in processed["pending_outbox_intents"]
     )
-    restore_execution_checkpoint_v2(processed, resolver)
+    restore_execution_checkpoint_v1(processed, resolver)

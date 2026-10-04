@@ -1,4 +1,4 @@
-"""Pure queue-bearing aggregate-state version 2 operations."""
+"""Pure queue-bearing aggregate-state version 1 operations."""
 
 from __future__ import annotations
 
@@ -51,8 +51,8 @@ from .wire import (
 )
 
 
-def seal_aggregate_v2(document: Mapping[str, Any]) -> dict[str, Any]:
-    """Copy, canonically order, and seal one version-2 aggregate."""
+def seal_aggregate_v1(document: Mapping[str, Any]) -> dict[str, Any]:
+    """Copy, canonically order, and seal one version-1 aggregate."""
     result = copy.deepcopy(dict(document))
     for runtime in result.get("runtimes", []):
         runtime["active_leaf_state_definition_pointers"].sort(key=_utf8)
@@ -86,7 +86,7 @@ def _utf8(value: str) -> bytes:
     return value.encode("utf-8", errors="strict")
 
 
-def create_aggregate_v2(
+def create_aggregate_v1(
     bundle: Bundle | BundleSource,
     machine_id: str,
     root_instance_id: str,
@@ -122,8 +122,8 @@ def create_aggregate_v2(
         lifecycle,
         include_host_evidence=_include_host_evidence,
     )
-    encoded = seal_aggregate_v2(encoded)
-    restore_aggregate_v2(encoded, resolver_for_bundle(validated))
+    encoded = seal_aggregate_v1(encoded)
+    restore_aggregate_v1(encoded, resolver_for_bundle(validated))
     result_fault = copy.deepcopy(root_runtime["fault"]) if result["status"] == "faulted" else None
     return {
         "status": result["status"],
@@ -140,7 +140,7 @@ def create_aggregate_v2(
 def _envelope_validator() -> Any:
     import jsonschema
 
-    schema = artifact_schema("aggregate_state_v2")
+    schema = artifact_schema("aggregate_state_v1")
     return jsonschema.Draft202012Validator(
         {"$ref": f"{schema['$id']}#/$defs/envelope"}, registry=_schema_registry()
     )
@@ -153,7 +153,7 @@ def _valid_envelope_shape(value: Any) -> bool:
 
 
 def _entry_digest(root_instance_id: str, mode: str, envelope: Mapping[str, Any]) -> str:
-    return hash_value(["determa-inbox-envelope-digest-2", "2", root_instance_id, mode, envelope])
+    return hash_value(["determa-inbox-envelope-digest-1", "1", root_instance_id, mode, envelope])
 
 
 def _validate_mailboxes(document: dict[str, Any]) -> None:
@@ -324,11 +324,11 @@ def _validate_mailbox_semantics(document: Mapping[str, Any], restored: RestoredA
                     raise ArtifactError(PersistenceFailureCode.INVALID_AGGREGATE_STATE)
 
 
-def restore_aggregate_v2(
+def restore_aggregate_v1(
     source: ArtifactSource, definition_resolver: DefinitionResolver
 ) -> RestoredAggregate:
     """Structurally and semantically restore one queue-bearing aggregate."""
-    document, raw = load_json_artifact(source, "aggregate_state_v2")
+    document, raw = load_json_artifact(source, "aggregate_state_v1")
     if aggregate_state_digest(document) != document["aggregate_state_digest"]:
         raise ArtifactError(PersistenceFailureCode.AGGREGATE_STATE_DIGEST_MISMATCH)
     if document["runtimes"] != sorted(
@@ -500,13 +500,13 @@ def _validate_new_deliveries(
     return None
 
 
-def admit_aggregate_v2(
+def admit_aggregate_v1(
     source: ArtifactSource,
     deliveries: Sequence[Mapping[str, Any]],
     definition_resolver: DefinitionResolver,
 ) -> dict[str, Any]:
     """Atomically admit or replay an ordered delivery batch."""
-    restored = restore_aggregate_v2(source, definition_resolver)
+    restored = restore_aggregate_v1(source, definition_resolver)
     document = restored.aggregate_envelope
     if (
         not isinstance(deliveries, Sequence)
@@ -607,7 +607,7 @@ def admit_aggregate_v2(
         )
         candidate["next_acceptance_sequence"] = str(int(acceptance) + 1)
         candidate["next_queue_sequence"] = str(int(queue) + 1)
-    candidate = seal_aggregate_v2(candidate)
+    candidate = seal_aggregate_v1(candidate)
     return {
         "result": "accepted",
         "status": _root_status(candidate),
@@ -683,12 +683,12 @@ def _enqueue_emissions(
                 "correlation_id": emission["correlation_id"],
             }
             if include_host_evidence:
-                provenance = emission.get("_determa_v2_provenance")
+                provenance = emission.get("_determa_v1_provenance")
                 if not isinstance(provenance, Mapping) or not isinstance(
                     provenance.get("emission_index"), int
                 ):
                     raise ArtifactError(PersistenceFailureCode.INVALID_AGGREGATE_STATE)
-                projected_emission["_determa_v2_emission_index"] = str(provenance["emission_index"])
+                projected_emission["_determa_v1_emission_index"] = str(provenance["emission_index"])
             projected.append(projected_emission)
             continue
         target = cast(Mapping[str, Any], emission["target"])
@@ -698,7 +698,7 @@ def _enqueue_emissions(
         queue = encoded["next_queue_sequence"]
         encoded["next_acceptance_sequence"] = str(int(acceptance) + 1)
         encoded["next_queue_sequence"] = str(int(queue) + 1)
-        provenance = emission.get("_determa_v2_provenance")
+        provenance = emission.get("_determa_v1_provenance")
         if not isinstance(provenance, Mapping):
             raise ArtifactError(PersistenceFailureCode.INVALID_AGGREGATE_STATE)
         envelope = {
@@ -733,7 +733,7 @@ def _enqueue_emissions(
             projected.append(
                 {
                     "kind": "internal_mailbox",
-                    "emission_index": str(emission.get("_determa_v2_emission_index", 0)),
+                    "emission_index": str(emission.get("_determa_v1_emission_index", 0)),
                     "event_id": emission["event_id"],
                     "acceptance_sequence": acceptance,
                     "queue_sequence": queue,
@@ -745,7 +745,7 @@ def _enqueue_emissions(
             projected.append(
                 {
                     "kind": "internal_disposed",
-                    "emission_index": str(emission.get("_determa_v2_emission_index", 0)),
+                    "emission_index": str(emission.get("_determa_v1_emission_index", 0)),
                     "event_id": emission["event_id"],
                     "acceptance_sequence": acceptance,
                     "lifecycle_disposition_index": disposition_index,
@@ -767,7 +767,7 @@ def _encode_after_dispatch(
         ready, deferred = mailboxes.get(runtime["runtime_id"], ([], []))
         runtime["ready_mailbox"] = ready
         runtime["deferred_mailbox"] = deferred
-    return seal_aggregate_v2(result)
+    return seal_aggregate_v1(result)
 
 
 def _runtime_capacity(bundle: Bundle, state: dict[str, Any], runtime_id: str) -> int | None:
@@ -835,7 +835,7 @@ def _step_result(
 ) -> dict[str, Any]:
     return {
         "core_step_result_format": "determa.core_step_result",
-        "core_step_result_schema_version": 2,
+        "core_step_result_schema_version": 1,
         "status": _root_status(state),
         "disposition": disposition,
         "state": state,
@@ -846,7 +846,7 @@ def _step_result(
     }
 
 
-def step_aggregate_v2(
+def step_aggregate_v1(
     source: ArtifactSource,
     target_runtime_id: str,
     definition_resolver: DefinitionResolver,
@@ -854,7 +854,7 @@ def step_aggregate_v2(
     _include_host_evidence: bool = False,
 ) -> dict[str, Any]:
     """Process at most the selected runtime's ready-mailbox head."""
-    restored = restore_aggregate_v2(source, definition_resolver)
+    restored = restore_aggregate_v1(source, definition_resolver)
     before = restored.aggregate_envelope
     wire_runtime = next(
         (runtime for runtime in before["runtimes"] if runtime["runtime_id"] == target_runtime_id),
@@ -941,7 +941,7 @@ def step_aggregate_v2(
             encoded_fault["step_sequence"] = str(encoded_fault["step_sequence"])
             encoded_fault["definition_fingerprint"] = restored.bundle.fingerprint
             return _step_result(
-                seal_aggregate_v2(encoded),
+                seal_aggregate_v1(encoded),
                 DispositionCode.FAULTED.value,
                 emissions=emissions,
                 lifecycle=overflow_lifecycle,
@@ -960,7 +960,7 @@ def step_aggregate_v2(
             if runtime["runtime_id"] == target_runtime_id:
                 runtime["ready_mailbox"] = ready
                 runtime["deferred_mailbox"] = deferred
-        return _step_result(seal_aggregate_v2(candidate), disposition)
+        return _step_result(seal_aggregate_v1(candidate), disposition)
 
     state = cast(dict[str, Any], result["state"])
     encoded = _encode_after_dispatch(restored.bundle, state, before, mailboxes)
@@ -1018,7 +1018,7 @@ def step_aggregate_v2(
                 deferred_entry["queue_sequence"] = encoded["next_queue_sequence"]
                 encoded["next_queue_sequence"] = str(int(encoded["next_queue_sequence"]) + 1)
                 current_ready.append(deferred_entry)
-    encoded = seal_aggregate_v2(encoded)
+    encoded = seal_aggregate_v1(encoded)
     result_fault = result.get("fault")
     if isinstance(result_fault, dict):
         result_fault = copy.deepcopy(result_fault)
@@ -1090,7 +1090,7 @@ def _queue_compatible(
     return normalized is not None and typed_value(normalized) == envelope["payload"]
 
 
-def migrate_aggregate_v2(
+def migrate_aggregate_v1(
     aggregate: ArtifactSource,
     target_validated_bundle_fingerprint: str,
     migration_route: Sequence[str],
@@ -1100,8 +1100,8 @@ def migrate_aggregate_v2(
     resource_limits: MigrationLimits | None = None,
     _include_host_evidence: bool = False,
 ) -> dict[str, Any]:
-    """Migrate one queue-bearing aggregate through exact version-2 descriptors."""
-    restored = restore_aggregate_v2(aggregate, artifact_resolver)
+    """Migrate one queue-bearing aggregate through exact version-1 descriptors."""
+    restored = restore_aggregate_v1(aggregate, artifact_resolver)
     limits = resource_limits or MigrationLimits()
     if (
         not isinstance(migration_route, Sequence)
@@ -1119,7 +1119,7 @@ def migrate_aggregate_v2(
         source = artifact_resolver.resolve_migration_descriptor(digest)
         if source is None or not artifact_resolver.migration_descriptor_is_trusted(digest):
             raise ArtifactError(PersistenceFailureCode.MIGRATION_DESCRIPTOR_UNTRUSTED)
-        descriptor, _ = load_json_artifact(source, "migration_descriptor_v2")
+        descriptor, _ = load_json_artifact(source, "migration_descriptor_v1")
         if migration_descriptor_digest(descriptor) != digest:
             raise ArtifactError(PersistenceFailureCode.INVALID_MIGRATION_DESCRIPTOR)
         descriptors.append(descriptor)
@@ -1229,11 +1229,11 @@ def migrate_aggregate_v2(
             capacity = _runtime_capacity(target_bundle, target_state, runtime["runtime_id"])
             if capacity is not None and len(deferred) > capacity:
                 raise ArtifactError(PersistenceFailureCode.MIGRATION_TOTALITY_FAILURE)
-        candidate = seal_aggregate_v2(hop)
-        restore_aggregate_v2(candidate, artifact_resolver)
+        candidate = seal_aggregate_v1(hop)
+        restore_aggregate_v1(candidate, artifact_resolver)
         audits.append(
             {
-                "migration_audit_record_schema_version": 2,
+                "migration_audit_record_schema_version": 1,
                 "root_instance_id": candidate["root_instance_id"],
                 "root_runtime_id": candidate["root_runtime_id"],
                 "migration_sequence": candidate["migration_sequence"],

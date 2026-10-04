@@ -1,4 +1,4 @@
-"""Queue-bearing execution-checkpoint version 2 operations."""
+"""Queue-bearing execution-checkpoint version 1 operations."""
 
 from __future__ import annotations
 
@@ -21,10 +21,10 @@ from .queueing import (
     _entry_digest,
     _valid_envelope_shape,
     _validate_new_deliveries,
-    admit_aggregate_v2,
-    create_aggregate_v2,
-    restore_aggregate_v2,
-    step_aggregate_v2,
+    admit_aggregate_v1,
+    create_aggregate_v1,
+    restore_aggregate_v1,
+    step_aggregate_v1,
 )
 from .wire import (
     ArtifactSource,
@@ -471,17 +471,17 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
         raise _invalid()
 
 
-def restore_execution_checkpoint_v2(
+def restore_execution_checkpoint_v1(
     source: ArtifactSource, definition_resolver: DefinitionResolver
 ) -> RestoredExecutionCheckpoint:
-    """Restore one structurally and relationally valid version-2 checkpoint."""
-    document, raw = load_json_artifact(source, "execution_checkpoint_v2")
+    """Restore one structurally and relationally valid version-1 checkpoint."""
+    document, raw = load_json_artifact(source, "execution_checkpoint_v1")
     if execution_checkpoint_digest(document) != document["execution_checkpoint_digest"]:
         raise ArtifactError(CheckpointArtifactFailureCode.EXECUTION_CHECKPOINT_DIGEST_MISMATCH)
     aggregate = document["root_record"].get("aggregate_state")
     if aggregate is not None:
         try:
-            restore_aggregate_v2(aggregate, definition_resolver)
+            restore_aggregate_v1(aggregate, definition_resolver)
         except ArtifactError as error:
             if error.code in {
                 "invalid_aggregate_state",
@@ -533,15 +533,15 @@ def _append_external_intent(
     )
 
 
-def create_checkpoint_v2(
+def create_checkpoint_v1(
     bundle: Any,
     machine_id: str,
     root_instance_id: str,
     creation_id: str,
     bindings: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Create a fresh queue-bearing checkpoint from the public v2 core result."""
-    result = create_aggregate_v2(
+    """Create a fresh queue-bearing checkpoint from the public v1 core result."""
+    result = create_aggregate_v1(
         bundle,
         machine_id,
         root_instance_id,
@@ -567,7 +567,7 @@ def create_checkpoint_v2(
     }
     checkpoint: dict[str, Any] = {
         "execution_checkpoint_format": "determa.execution_checkpoint",
-        "execution_checkpoint_schema_version": 2,
+        "execution_checkpoint_schema_version": 1,
         "root_instance_id": root_instance_id,
         "revision": "0",
         "root_record": {"status": "retained", "aggregate_state": aggregate},
@@ -590,7 +590,7 @@ def create_checkpoint_v2(
     checkpoint["next_operation_receipt_sequence"] = str(1 + len(lifecycle_sequences))
     for index, emission in enumerate(result["emissions"]):
         if "kind" not in emission:
-            emission_index = int(emission.get("_determa_v2_emission_index", index))
+            emission_index = int(emission.get("_determa_v1_emission_index", index))
             _append_external_intent(
                 checkpoint, receipt["emission_references"], emission, emission_index
             )
@@ -707,7 +707,7 @@ def _retained_replay(
     return None
 
 
-def admit_checkpoint_v2(
+def admit_checkpoint_v1(
     source: ArtifactSource,
     deliveries: Sequence[Mapping[str, Any]],
     definition_resolver: DefinitionResolver,
@@ -715,8 +715,8 @@ def admit_checkpoint_v2(
     expected_revision: str,
     expected_checkpoint_digest: str,
 ) -> dict[str, Any]:
-    """Atomically admit or replay a delivery batch against one v2 checkpoint."""
-    restored = restore_execution_checkpoint_v2(source, definition_resolver)
+    """Atomically admit or replay a delivery batch against one v1 checkpoint."""
+    restored = restore_execution_checkpoint_v1(source, definition_resolver)
     document = restored.document
     snapshot = copy.deepcopy(deliveries)
     terminal_code: str | None
@@ -812,11 +812,11 @@ def admit_checkpoint_v2(
         for delivery, evidence in zip(deliveries, replay_evidence, strict=True)
         if evidence is None
     ]
-    restored_aggregate = restore_aggregate_v2(aggregate, definition_resolver)
+    restored_aggregate = restore_aggregate_v1(aggregate, definition_resolver)
     validation_code = _validate_new_deliveries(restored_aggregate, new_deliveries)
     if validation_code is not None:
         raise ArtifactError(validation_code)
-    admission = admit_aggregate_v2(aggregate, new_deliveries, definition_resolver)
+    admission = admit_aggregate_v1(aggregate, new_deliveries, definition_resolver)
     if admission["result"] == "rejected":
         raise ArtifactError(admission["rejection"]["code"])
 
@@ -856,16 +856,17 @@ def admit_checkpoint_v2(
     return {"result": "batch", "checkpoint": sealed, "members": members}
 
 
-def step_checkpoint_v2(
+def step_checkpoint_v1(
     source: ArtifactSource,
     target_runtime_id: str,
     definition_resolver: DefinitionResolver,
     *,
     expected_revision: str,
     expected_checkpoint_digest: str,
+    _include_host_response: bool = False,
 ) -> dict[str, Any]:
     """Process one ready mailbox head and append its terminal receipt."""
-    restored = restore_execution_checkpoint_v2(source, definition_resolver)
+    restored = restore_execution_checkpoint_v1(source, definition_resolver)
     document = restored.document
     _check_cas(document, expected_revision, expected_checkpoint_digest)
     aggregate = document["root_record"].get("aggregate_state")
@@ -888,7 +889,7 @@ def step_checkpoint_v2(
             "result": "not_committed",
             "step_result": {
                 "core_step_result_format": "determa.core_step_result",
-                "core_step_result_schema_version": 2,
+                "core_step_result_schema_version": 1,
                 "status": root_status,
                 "disposition": "not_runnable",
                 "state": copy.deepcopy(aggregate),
@@ -899,7 +900,7 @@ def step_checkpoint_v2(
             },
             "checkpoint": document,
         }
-    result = step_aggregate_v2(
+    result = step_aggregate_v1(
         aggregate,
         target_runtime_id,
         definition_resolver,
@@ -937,7 +938,7 @@ def step_checkpoint_v2(
     references: list[dict[str, Any]] = []
     for emission_index, emission in enumerate(result["emissions"]):
         if "kind" not in emission:
-            action_emission_index = int(emission.get("_determa_v2_emission_index", emission_index))
+            action_emission_index = int(emission.get("_determa_v1_emission_index", emission_index))
             _append_external_intent(candidate, references, emission, action_emission_index)
             continue
         if emission["kind"] != "internal_disposed":
@@ -953,25 +954,24 @@ def step_checkpoint_v2(
                 "terminal_receipt_sequence": lifecycle_sequences[index],
             }
         )
-    candidate["operation_receipts"].append(
-        {
-            "operation_kind": "event_terminal",
-            "receipt_sequence": receipt_sequence,
-            "event_id": selected["envelope"]["event_id"],
-            "request_digest": selected["envelope_digest"],
-            "acceptance_sequence": selected["acceptance_sequence"],
-            "final_queue_sequence": selected["queue_sequence"],
-            "committed_revision": candidate["revision"],
-            "resulting_aggregate_state_digest": result["state"]["aggregate_state_digest"],
-            "outcome": {
-                "status": result["status"],
-                "disposition": result["disposition"],
-                "fault": copy.deepcopy(result["fault"]),
-                "rejection": copy.deepcopy(result["rejection"]),
-            },
-            "emission_references": references,
-        }
-    )
+    terminal_receipt = {
+        "operation_kind": "event_terminal",
+        "receipt_sequence": receipt_sequence,
+        "event_id": selected["envelope"]["event_id"],
+        "request_digest": selected["envelope_digest"],
+        "acceptance_sequence": selected["acceptance_sequence"],
+        "final_queue_sequence": selected["queue_sequence"],
+        "committed_revision": candidate["revision"],
+        "resulting_aggregate_state_digest": result["state"]["aggregate_state_digest"],
+        "outcome": {
+            "status": result["status"],
+            "disposition": result["disposition"],
+            "fault": copy.deepcopy(result["fault"]),
+            "rejection": copy.deepcopy(result["rejection"]),
+        },
+        "emission_references": references,
+    }
+    candidate["operation_receipts"].append(terminal_receipt)
     for lifecycle, terminal_sequence in zip(
         result["lifecycle_dispositions"], lifecycle_sequences, strict=True
     ):
@@ -996,10 +996,20 @@ def step_checkpoint_v2(
             }
         )
     _synchronize_mailbox_references(candidate)
-    return seal_execution_checkpoint(candidate)
+    sealed = seal_execution_checkpoint(candidate)
+    if _include_host_response:
+        public_result = copy.deepcopy(result)
+        for emission in public_result["emissions"]:
+            emission.pop("_determa_v1_emission_index", None)
+        return {
+            "checkpoint": sealed,
+            "core_result": public_result,
+            "receipt": terminal_receipt,
+        }
+    return sealed
 
 
-def process_delivery_checkpoint_v2(
+def process_delivery_checkpoint_v1(
     source: ArtifactSource,
     delivery: Mapping[str, Any],
     definition_resolver: DefinitionResolver,
@@ -1008,17 +1018,18 @@ def process_delivery_checkpoint_v2(
     migration_descriptor_digest_route: Sequence[str],
     expected_revision: str,
     expected_checkpoint_digest: str,
+    _include_host_response: bool = False,
 ) -> dict[str, Any]:
     """Migrate, admit, and process one delivery under one checkpoint revision."""
-    from .queueing import _runtime_id_for_target, migrate_aggregate_v2
+    from .queueing import _runtime_id_for_target, migrate_aggregate_v1
 
-    restored = restore_execution_checkpoint_v2(source, definition_resolver)
+    restored = restore_execution_checkpoint_v1(source, definition_resolver)
     prior = restored.document
     _check_cas(prior, expected_revision, expected_checkpoint_digest)
     aggregate = prior["root_record"].get("aggregate_state")
     if aggregate is None:
         raise ArtifactError("tombstoned_root")
-    migration = migrate_aggregate_v2(
+    migration = migrate_aggregate_v1(
         aggregate,
         target_validated_bundle_fingerprint,
         migration_descriptor_digest_route,
@@ -1032,24 +1043,28 @@ def process_delivery_checkpoint_v2(
     candidate["migration_audit_records"].extend(migration["audit_records"])
     candidate = seal_execution_checkpoint(candidate)
     original_receipt_count = len(candidate["operation_receipts"])
-    admitted = admit_checkpoint_v2(
+    admitted = admit_checkpoint_v1(
         candidate,
         [delivery],
         definition_resolver,
         expected_revision=candidate["revision"],
         expected_checkpoint_digest=candidate["execution_checkpoint_digest"],
     )
-    if admitted.get("execution_checkpoint_schema_version") != 2:
+    if admitted.get("execution_checkpoint_schema_version") != 1:
         raise ArtifactError(CheckpointArtifactFailureCode.INVALID_EXECUTION_CHECKPOINT)
     target_runtime_id = _runtime_id_for_target(delivery["envelope"]["target"])
-    processed = step_checkpoint_v2(
+    processed = step_checkpoint_v1(
         admitted,
         target_runtime_id,
         definition_resolver,
         expected_revision=admitted["revision"],
         expected_checkpoint_digest=admitted["execution_checkpoint_digest"],
+        _include_host_response=_include_host_response,
     )
-    if processed.get("execution_checkpoint_schema_version") != 2:
+    host_response = processed if _include_host_response and "checkpoint" in processed else None
+    if host_response is not None:
+        processed = processed["checkpoint"]
+    if processed.get("execution_checkpoint_schema_version") != 1:
         raise ArtifactError(CheckpointArtifactFailureCode.INVALID_EXECUTION_CHECKPOINT)
     processed["revision"] = committed_revision
     for receipt in processed["operation_receipts"][original_receipt_count:]:
@@ -1060,10 +1075,26 @@ def process_delivery_checkpoint_v2(
     for intent in processed["pending_outbox_intents"]:
         if int(intent["state_revision"]) > int(prior["revision"]):
             intent["state_revision"] = committed_revision
-    return seal_execution_checkpoint(processed)
+    sealed = seal_execution_checkpoint(processed)
+    if host_response is not None:
+        event_id = delivery["envelope"]["event_id"]
+        receipt = next(
+            item
+            for item in sealed["operation_receipts"]
+            if item["operation_kind"] == "event_terminal" and item["event_id"] == event_id
+        )
+        return {
+            "checkpoint": sealed,
+            "raw_response": {
+                "core_result": host_response["core_result"],
+                "receipt": receipt,
+                "migration_audit_records": migration["audit_records"],
+            },
+        }
+    return sealed
 
 
-def prune_checkpoint_v2(
+def prune_checkpoint_v1(
     source: ArtifactSource,
     cutoff_receipt_sequence: str,
     definition_resolver: DefinitionResolver,
@@ -1074,7 +1105,7 @@ def prune_checkpoint_v2(
     expected_checkpoint_digest: str,
 ) -> dict[str, Any]:
     """Advance bounded replay retention through one dependency-closed cutoff."""
-    restored = restore_execution_checkpoint_v2(source, definition_resolver)
+    restored = restore_execution_checkpoint_v1(source, definition_resolver)
     document = restored.document
     current_mode = document["replay_retention"]["mode"]
     selected_mode = current_mode if target_mode is None else target_mode
@@ -1174,7 +1205,7 @@ def prune_checkpoint_v2(
                 {
                     "event_id": receipt["event_id"],
                     "request_digest": receipt["request_digest"],
-                    "request_digest_domain": "determa-inbox-envelope-digest-2",
+                    "request_digest_domain": "determa-inbox-envelope-digest-1",
                     "acceptance_sequence": receipt["acceptance_sequence"],
                     "terminal_receipt_sequence": receipt["receipt_sequence"],
                     "terminal_disposition": receipt["outcome"]["disposition"],

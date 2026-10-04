@@ -19,6 +19,8 @@ from determa.state import (
     MemoryArtifactResolver,
     MemoryExecutionStore,
     load_bundle,
+    restore_execution_checkpoint_v1,
+    seal_execution_checkpoint,
 )
 from determa.state.host import (
     _required_backup_artifact_digests,
@@ -35,28 +37,30 @@ from determa.state.wire import (
 
 from .durable_host import durable_host_vectors, run_durable_host_vector
 from .harness import CORE_DIR, CoreCase, conformance_root, core_cases, run_case
-from .version2 import (
+from .version1 import (
     _assert_checkpoint_unchanged,
     _resolver,
-    run_version2_vector,
-    validate_version2_artifact,
-    version2_vectors,
+    run_version1_vector,
+    validate_version1_artifact,
+    version1_vectors,
 )
 
 _PORTABLE_ARTIFACT_KINDS = {
-    "aggregate_state_v2",
-    "migration_descriptor_v2",
-    "aggregate_state_package_v2",
-    "execution_checkpoint_v2",
-    "core_step_result_v2",
+    "aggregate_state_v1",
+    "migration_descriptor_v1",
+    "aggregate_state_package_v1",
+    "execution_checkpoint_v1",
+    "core_step_result_v1",
 }
 _CONFORMANCE_ARTIFACT_SCHEMAS = {
-    "durable_host_call_log_v2": "durable-host-call-log-v2.schema.json",
-    "durable_host_inputs_v2": "durable-host-inputs-v2.schema.json",
-    "durable_host_results_v2": "durable-host-results-v2.schema.json",
-    "durable_host_store_v2": "durable-host-store-v2.schema.json",
-    "version2_operation_inputs": "version2-operation-inputs.schema.json",
-    "version2_operation_result": "version2-operation-result.schema.json",
+    "durable_host_call_log_v1": "durable-host-call-log-v1.schema.json",
+    "durable_host_inputs_v1": "durable-host-inputs-v1.schema.json",
+    "durable_host_results_v1": "durable-host-results-v1.schema.json",
+    "durable_host_responses_v1": "durable-host-responses-v1.schema.json",
+    "durable_host_store_v1": "durable-host-store-v1.schema.json",
+    "version1_operation_inputs": "version1-operation-inputs.schema.json",
+    "version1_operation_result": "version1-operation-result.schema.json",
+    "version1_operation_failures": "version1-operation-failures.schema.json",
 }
 
 
@@ -71,7 +75,7 @@ def _manifest_artifacts() -> list[tuple[Path, dict]]:
     ]
 
 
-def _version2_artifacts() -> list[tuple[Path, dict]]:
+def _version1_artifacts() -> list[tuple[Path, dict]]:
     return [
         (path, artifact)
         for path, artifact in _manifest_artifacts()
@@ -81,12 +85,15 @@ def _version2_artifacts() -> list[tuple[Path, dict]]:
 
 def _validate_manifest_artifact(path: Path, artifact: dict) -> None:
     if artifact["kind"] in _PORTABLE_ARTIFACT_KINDS:
-        validate_version2_artifact(path, artifact)
+        validate_version1_artifact(path, artifact)
         return
     schema_name = _CONFORMANCE_ARTIFACT_SCHEMAS[artifact["kind"]]
     schema_path = conformance_root() / "scripts" / "schemas" / schema_name
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
-    registry = _schema_registry().with_resource(schema["$id"], Resource.from_contents(schema))
+    registry = _schema_registry()
+    for reference_path in sorted(schema_path.parent.glob("*.schema.json")):
+        reference = json.loads(reference_path.read_text(encoding="utf-8"))
+        registry = registry.with_resource(reference["$id"], Resource.from_contents(reference))
     validator = Draft202012Validator(schema, registry=registry)
     try:
         document = json.loads((path / artifact["file"]).read_text(encoding="utf-8"))
@@ -116,19 +123,19 @@ def _spec_root() -> Path | None:
 def test_suite_present() -> None:
     assert CORE_DIR.exists(), "pinned conformance suite is unavailable"
     assert len(core_cases()) == 98
-    assert len(version2_vectors()) == 162
-    assert len(durable_host_vectors()) == 138
-    assert len(_manifest_artifacts()) == 381
+    assert len(version1_vectors()) == 162
+    assert len(durable_host_vectors()) == 142
+    assert len(_manifest_artifacts()) == 403
 
 
 @pytest.mark.parametrize("stored", [b"mutated", None])
-def test_v2_maintenance_failure_requires_exact_unchanged_checkpoint(
+def test_v1_maintenance_failure_requires_exact_unchanged_checkpoint(
     stored: bytes | None,
 ) -> None:
     item = next(
         item
-        for item in version2_vectors()
-        if item.vector["name"] == "native_v2_maintenance_stale_writer"
+        for item in version1_vectors()
+        if item.vector["name"] == "native_v1_maintenance_stale_writer"
     )
     before = json.loads((item.path / item.vector["checkpoint_before"]).read_text(encoding="utf-8"))
     initial = {} if stored is None else {before["root_instance_id"]: stored}
@@ -168,7 +175,7 @@ def test_tombstone_response_uses_fixture_oracle(
     monkeypatch: pytest.MonkeyPatch, vector_name: str
 ) -> None:
     item = next(item for item in durable_host_vectors() if item.vector["name"] == vector_name)
-    original = ExecutionHost.tombstone_root_v2
+    original = ExecutionHost.tombstone_root_v1
 
     def altered_response(self: ExecutionHost, *args: object, **kwargs: object) -> dict:
         response = original(self, *args, **kwargs)
@@ -176,16 +183,89 @@ def test_tombstone_response_uses_fixture_oracle(
         result["tombstone"]["final_aggregate_state_digest"] = "sha256:" + "0" * 64
         return result
 
-    monkeypatch.setattr(ExecutionHost, "tombstone_root_v2", altered_response)
+    monkeypatch.setattr(ExecutionHost, "tombstone_root_v1", altered_response)
     with pytest.raises(AssertionError):
         run_durable_host_vector(item)
+
+
+@pytest.mark.parametrize(
+    ("vector_name", "method_name"),
+    [
+        ("checkpoint_admission_commit", "admit_v1"),
+        ("checkpoint_processing_commit", "process_ready_v1"),
+    ],
+)
+def test_literal_host_response_rejects_malformed_production_body(
+    monkeypatch: pytest.MonkeyPatch, vector_name: str, method_name: str
+) -> None:
+    item = next(item for item in durable_host_vectors() if item.vector["name"] == vector_name)
+    original = getattr(ExecutionHost, method_name)
+
+    def malformed(self: ExecutionHost, *args: object, **kwargs: object) -> dict:
+        result = copy.deepcopy(original(self, *args, **kwargs))
+        result["unexpected"] = True
+        return result
+
+    monkeypatch.setattr(ExecutionHost, method_name, malformed)
+    with pytest.raises(AssertionError):
+        run_durable_host_vector(item)
+
+
+def test_literal_capability_report_rejects_boolean_integer_substitution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from . import durable_host as driver
+
+    item = next(
+        item for item in durable_host_vectors() if item.vector["name"] == "exactly_once_positive"
+    )
+    original = driver.validate_host_profile_report
+
+    def malformed(*args: object, **kwargs: object) -> dict:
+        response = original(*args, **kwargs)
+        return {**response, "validated": 1}
+
+    monkeypatch.setattr(driver, "validate_host_profile_report", malformed)
+    with pytest.raises(AssertionError):
+        run_durable_host_vector(item)
+
+
+def test_literal_failure_rejects_wrong_code_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    item = next(
+        item
+        for item in durable_host_vectors()
+        if item.vector["name"] == "checkpoint_creation_conflict"
+    )
+
+    def malformed(*args: object, **kwargs: object) -> dict:
+        raise ExecutionHostError(True)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(ExecutionHost, "create_v1", malformed)
+    with pytest.raises(AssertionError):
+        run_durable_host_vector(item)
+
+
+def test_resealed_checkpoint_requires_resolved_definition() -> None:
+    path = (
+        conformance_root()
+        / "conformance"
+        / "profiles"
+        / "execution-checkpoint"
+        / "checkpoint-01-native-lifecycle"
+    )
+    original = json.loads((path / "processed-checkpoint-v1.json").read_text())
+    resealed = seal_execution_checkpoint(original)
+    assert resealed == original
+    with pytest.raises(Exception) as error:
+        restore_execution_checkpoint_v1(resealed, MemoryArtifactResolver())
+    assert getattr(error.value, "code", None) == "source_definition_unavailable"
 
 
 def test_valid_artifact_manifest_does_not_accept_forged_digest(tmp_path: Path) -> None:
     case, artifact = next(
         (case, artifact)
-        for case, artifact in _version2_artifacts()
-        if artifact["kind"] == "aggregate_state_v2" and artifact["valid"]
+        for case, artifact in _version1_artifacts()
+        if artifact["kind"] == "aggregate_state_v1" and artifact["valid"]
     )
     document = json.loads((case / artifact["file"]).read_text(encoding="utf-8"))
     document["aggregate_state_digest"] = "sha256:" + "0" * 64
@@ -193,9 +273,9 @@ def test_valid_artifact_manifest_does_not_accept_forged_digest(tmp_path: Path) -
     forged.write_text(json.dumps(document), encoding="utf-8")
 
     with pytest.raises(AssertionError):
-        validate_version2_artifact(
+        validate_version1_artifact(
             tmp_path,
-            {"file": forged.name, "kind": "aggregate_state_v2", "valid": True},
+            {"file": forged.name, "kind": "aggregate_state_v1", "valid": True},
         )
 
 
@@ -205,9 +285,9 @@ def test_backup_manifest_requires_migration_recovery_route() -> None:
         / "conformance"
         / "profiles"
         / "execution-checkpoint"
-        / "checkpoint-04-version2-mailboxes"
+        / "checkpoint-04-version1-mailboxes"
     )
-    source = (path / "maintenance-one-hop-checkpoint-v2.json").read_bytes()
+    source = (path / "maintenance-one-hop-checkpoint-v1.json").read_bytes()
     checkpoint = json.loads(source)
     required = _required_backup_artifact_digests(checkpoint)
     audit = checkpoint["migration_audit_records"][0]
@@ -224,7 +304,7 @@ def test_backup_manifest_requires_migration_recovery_route() -> None:
         "checkpoint_members": [source],
         "checkpoint_digests": [checkpoint["execution_checkpoint_digest"]],
         "adapter_metadata_digest": hash_value(
-            ["determa-backup-adapter-metadata-2", "migration-backup"]
+            ["determa-backup-adapter-metadata-1", "migration-backup"]
         ),
         "retention_mode": checkpoint["replay_retention"]["mode"],
         "consistency_point": {
@@ -232,10 +312,10 @@ def test_backup_manifest_requires_migration_recovery_route() -> None:
             "root_instance_ids": [root_instance_id],
         },
     }
-    host.validate_backup_restore_v2(**arguments, trusted_artifact_digests=sorted(required))
+    host.validate_backup_restore_v1(**arguments, trusted_artifact_digests=sorted(required))
     for omitted in expected:
         with pytest.raises(ExecutionHostError) as error:
-            host.validate_backup_restore_v2(
+            host.validate_backup_restore_v1(
                 **arguments,
                 trusted_artifact_digests=sorted(required - {omitted}),
             )
@@ -259,9 +339,9 @@ def test_backup_manifest_requires_restorable_artifacts(artifact_kind: str, failu
         / "conformance"
         / "profiles"
         / "execution-checkpoint"
-        / "checkpoint-04-version2-mailboxes"
+        / "checkpoint-04-version1-mailboxes"
     )
-    source = (path / "maintenance-one-hop-checkpoint-v2.json").read_bytes()
+    source = (path / "maintenance-one-hop-checkpoint-v1.json").read_bytes()
     checkpoint = json.loads(source)
     definitions, descriptors = _required_backup_artifacts(checkpoint)
     bundles = {}
@@ -325,13 +405,13 @@ def test_backup_manifest_requires_restorable_artifacts(artifact_kind: str, failu
         return
 
     with pytest.raises(ExecutionHostError) as error:
-        host.validate_backup_restore_v2(
+        host.validate_backup_restore_v1(
             action="backup",
             checkpoint_members=[source],
             checkpoint_digests=[checkpoint["execution_checkpoint_digest"]],
             trusted_artifact_digests=sorted(definitions | descriptors),
             adapter_metadata_digest=hash_value(
-                ["determa-backup-adapter-metadata-2", "migration-backup"]
+                ["determa-backup-adapter-metadata-1", "migration-backup"]
             ),
             retention_mode=checkpoint["replay_retention"]["mode"],
             consistency_point={
@@ -343,7 +423,7 @@ def test_backup_manifest_requires_restorable_artifacts(artifact_kind: str, failu
 
 
 def test_backup_manifest_includes_historical_fault_definition() -> None:
-    path = conformance_root() / "conformance" / "core" / "118-version2-persistence"
+    path = conformance_root() / "conformance" / "core" / "118-version1-persistence"
     result = json.loads((path / "migration-historical-fault-result.json").read_text())
     runtime = result["aggregate_state"]["runtimes"][0]
     definitions, descriptors = _required_backup_artifacts(result)
@@ -433,11 +513,11 @@ def test_bundled_schema_matches_pinned_spec() -> None:
 @pytest.mark.parametrize(
     ("name", "kind"),
     [
-        ("aggregate-state-v2.schema.json", "aggregate_state_v2"),
-        ("migration-descriptor-v2.schema.json", "migration_descriptor_v2"),
-        ("aggregate-state-package-v2.schema.json", "aggregate_state_package_v2"),
-        ("execution-checkpoint-v2.schema.json", "execution_checkpoint_v2"),
-        ("core-step-result-v2.schema.json", "core_step_result_v2"),
+        ("aggregate-state-v1.schema.json", "aggregate_state_v1"),
+        ("migration-descriptor-v1.schema.json", "migration_descriptor_v1"),
+        ("aggregate-state-package-v1.schema.json", "aggregate_state_package_v1"),
+        ("execution-checkpoint-v1.schema.json", "execution_checkpoint_v1"),
+        ("core-step-result-v1.schema.json", "core_step_result_v1"),
     ],
 )
 def test_bundled_artifact_schemas_match_pinned_spec(name: str, kind: str) -> None:
@@ -450,11 +530,11 @@ def test_bundled_artifact_schemas_match_pinned_spec(name: str, kind: str) -> Non
 @pytest.mark.parametrize(
     "kind",
     [
-        "aggregate_state_v2",
-        "migration_descriptor_v2",
-        "aggregate_state_package_v2",
-        "execution_checkpoint_v2",
-        "core_step_result_v2",
+        "aggregate_state_v1",
+        "migration_descriptor_v1",
+        "aggregate_state_package_v1",
+        "execution_checkpoint_v1",
+        "core_step_result_v1",
     ],
 )
 def test_bundled_artifact_schema_is_valid_draft_2020_12(kind: str) -> None:
@@ -480,9 +560,9 @@ def test_core_case(case: CoreCase) -> None:
     run_case(case)
 
 
-@pytest.mark.parametrize("item", version2_vectors(), ids=lambda item: item.name)
-def test_version2_vector(item) -> None:
-    run_version2_vector(item)
+@pytest.mark.parametrize("item", version1_vectors(), ids=lambda item: item.name)
+def test_version1_vector(item) -> None:
+    run_version1_vector(item)
 
 
 @pytest.mark.parametrize("item", durable_host_vectors(), ids=lambda item: item.name)
@@ -494,6 +574,6 @@ def test_durable_host_vector(item) -> None:
     ("case", "artifact"),
     _manifest_artifacts(),
 )
-def test_version2_artifact(case, artifact) -> None:
+def test_version1_artifact(case, artifact) -> None:
     path = case.path if isinstance(case, CoreCase) else case
     _validate_manifest_artifact(path, artifact)

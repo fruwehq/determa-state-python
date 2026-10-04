@@ -11,7 +11,7 @@ from typing import Any
 import yaml
 from jsonschema import Draft202012Validator
 
-import determa.state.checkpoint_v2 as checkpoint_module
+import determa.state.checkpoint_v1 as checkpoint_module
 from determa.state import (
     ArtifactError,
     ExecutionHost,
@@ -22,13 +22,17 @@ from determa.state import (
     MemoryArtifactResolver,
     MemoryExecutionStore,
     load_bundle,
-    restore_execution_checkpoint_v2,
-    validate_host_profile,
+    restore_execution_checkpoint_v1,
+)
+from determa.state.host import (
+    injected_store_reference,
+    select_scope_record,
+    validate_host_profile_report,
 )
 from determa.state.queueing import _runtime_id_for_target
 
 from .harness import conformance_root
-from .version2 import _json, _pointer, _resolver
+from .version1 import _json, _pointer, _resolver
 
 _CHECKPOINT_BROKER_MANAGED_ROOTS = frozenset({"checkpoint-lifecycle-root"})
 
@@ -60,6 +64,25 @@ def _request(item: DurableHostVector) -> dict[str, Any]:
     if reference is None:
         return copy.deepcopy(item.vector["raw_admission_request"])
     return copy.deepcopy(_pointer(_json(item.path / reference["file"]), reference["pointer"]))
+
+
+def _raw_response(item: DurableHostVector) -> dict[str, Any]:
+    reference = item.vector["raw_response"]
+    return _pointer(_json(item.path / reference["file"]), reference["pointer"])
+
+
+def _same_typed_json(actual: Any, expected: Any) -> bool:
+    if type(actual) is not type(expected):
+        return False
+    if isinstance(expected, dict):
+        return actual.keys() == expected.keys() and all(
+            _same_typed_json(actual[key], value) for key, value in expected.items()
+        )
+    if isinstance(expected, list):
+        return len(actual) == len(expected) and all(
+            _same_typed_json(left, right) for left, right in zip(actual, expected, strict=True)
+        )
+    return actual == expected
 
 
 def _fault_injector(boundary: str | None) -> Any:
@@ -131,9 +154,24 @@ def _checkpoint_replayed(
     source: bytes | None,
 ) -> bool:
     operation = item.vector["operation"]
-    if operation == "checkpoint_create_v2":
+    if operation == "checkpoint_create_v1":
         return source is not None
-    if operation == "checkpoint_admit_v2":
+    if operation == "checkpoint_step_v1":
+        return response.get("operation_kind") == "event_terminal"
+    if operation == "checkpoint_admit_v1":
+        if set(response) == {"evidence"}:
+            if source is None:
+                return False
+            before = json.loads(source)
+            known = {
+                receipt["event_id"]
+                for receipt in before["operation_receipts"]
+                if receipt["operation_kind"] in {"acceptance", "event_terminal"}
+            }
+            known.update(tombstone["event_id"] for tombstone in before["event_identity_tombstones"])
+            return all(
+                delivery["envelope"]["event_id"] in known for delivery in _deliveries(request)
+            )
         if response.get("result") == "replay":
             return True
         return response.get("result") == "batch" and all(
@@ -142,16 +180,16 @@ def _checkpoint_replayed(
     if source is None:
         return False
     checkpoint = json.loads(source)
-    if operation == "checkpoint_prune_v2":
+    if operation == "checkpoint_prune_v1":
         retention = checkpoint["replay_retention"]
         return (
             retention["mode"] == request["target_mode"]
             and retention["policy_identifier"] == request["policy_identifier"]
             and retention["pruned_through_receipt_sequence"] == request["cutoff_receipt_sequence"]
         )
-    if operation == "checkpoint_tombstone_v2":
+    if operation == "checkpoint_tombstone_v1":
         return checkpoint["root_record"]["status"] == "tombstone"
-    if operation == "checkpoint_update_outbox_v2":
+    if operation == "checkpoint_update_outbox_v1":
         desired = {"status": request["target_disposition"]}
         if request["outcome"]["reason_code"] is not None:
             desired["reason_code"] = request["outcome"]["reason_code"]
@@ -160,7 +198,7 @@ def _checkpoint_replayed(
             and record["delivery_state"] == desired
             for record in checkpoint["pending_outbox_intents"]
         )
-    if operation == "checkpoint_terminalize_outbox_v2":
+    if operation == "checkpoint_terminalize_outbox_v1":
         return any(
             record["intent"]["effect_id"] == request["effect_id"]
             for record in checkpoint["terminal_outbox_records"]
@@ -168,7 +206,7 @@ def _checkpoint_replayed(
             record["effect_id"] == request["effect_id"]
             for record in checkpoint["outbox_effect_tombstones"]
         )
-    if operation == "checkpoint_compact_outbox_v2":
+    if operation == "checkpoint_compact_outbox_v1":
         return any(
             record["effect_id"] == request["effect_id"]
             for record in checkpoint["outbox_effect_tombstones"]
@@ -235,92 +273,11 @@ def _validate_public_response(
     request: dict[str, Any],
     response: dict[str, Any],
 ) -> None:
-    operation = item.vector["operation"]
-    assert type(response) is dict
-    after_name = item.vector.get("checkpoint_after")
-    checkpoint = None if after_name is None else _json(item.path / after_name)
-    if operation == "checkpoint_create_v2":
-        assert checkpoint is not None
-        assert response == {
-            "result": "committed",
-            "receipt": checkpoint["operation_receipts"][0],
-        }
-        return
-    if operation in {"checkpoint_step_v2", "checkpoint_prune_v2"}:
-        assert checkpoint is not None
-        assert response == checkpoint
-        return
-    if operation == "checkpoint_admit_v2":
-        assert checkpoint is not None
-        if response.get("execution_checkpoint_schema_version") == 2:
-            assert response == checkpoint
-            return
-        if response.get("result") == "replay":
-            deliveries = _deliveries(request)
-            assert len(deliveries) == 1
-            event_id = deliveries[0]["envelope"]["event_id"]
-            assert response == _replay_evidence(checkpoint, event_id)
-            return
-        assert set(response) == {"result", "checkpoint", "members"}
-        assert response["result"] == "batch"
-        assert response["checkpoint"] == checkpoint
-        event_ids = [delivery["envelope"]["event_id"] for delivery in _deliveries(request)]
-        assert [member.get("event_id") for member in response["members"]] == event_ids
-        for member in response["members"]:
-            if member.get("disposition") == "accepted":
-                assert set(member) == {
-                    "event_id",
-                    "disposition",
-                    "acceptance_sequence",
-                    "queue_sequence",
-                }
-                assert any(
-                    entry["envelope"]["event_id"] == member["event_id"]
-                    and entry["acceptance_sequence"] == member["acceptance_sequence"]
-                    and entry["queue_sequence"] == member["queue_sequence"]
-                    for runtime in checkpoint["root_record"]["aggregate_state"]["runtimes"]
-                    for mailbox in ("ready_mailbox", "deferred_mailbox")
-                    for entry in runtime[mailbox]
-                )
-            else:
-                assert set(member) == {"event_id", "disposition", "evidence"}
-                assert member["disposition"] == "replay"
-                assert member["evidence"] == _replay_evidence(checkpoint, member["event_id"])
-        return
-    if operation == "checkpoint_tombstone_v2":
-        assert set(response) == {"result", "tombstone"}
-        assert response["result"] == "tombstoned"
-        assert checkpoint is not None
-        assert response["tombstone"] == checkpoint["root_record"]
-        return
-    assert checkpoint is not None
-    if operation == "checkpoint_update_outbox_v2":
-        records = checkpoint["pending_outbox_intents"]
-    elif operation == "checkpoint_terminalize_outbox_v2":
-        records = [
-            *checkpoint["terminal_outbox_records"],
-            *checkpoint["outbox_effect_tombstones"],
-        ]
-    elif operation == "checkpoint_compact_outbox_v2":
-        records = checkpoint["outbox_effect_tombstones"]
-    else:
-        raise AssertionError(f"unvalidated production response: {operation}")
-    assert set(response) == {"result", "record"}
-    assert response["result"] == "committed"
-    assert response["record"] in records
-    record = response["record"]
-    effect_id = record.get("effect_id", record.get("intent", {}).get("effect_id"))
-    assert effect_id == request["effect_id"]
-    if operation == "checkpoint_update_outbox_v2":
-        desired = {"status": request["target_disposition"]}
-        if request["outcome"]["reason_code"] is not None:
-            desired["reason_code"] = request["outcome"]["reason_code"]
-        assert record["delivery_state"] == desired
-    elif operation == "checkpoint_terminalize_outbox_v2":
-        desired = {"status": request["target_disposition"]}
-        if request["outcome"]["reason_code"] is not None:
-            desired["reason_code"] = request["outcome"]["reason_code"]
-        assert record["outcome"] == desired
+    """Match the literal production response to the pinned response body."""
+    del request
+    oracle = _raw_response(item)
+    assert oracle["kind"] not in {"typed_failure", "no_response"}
+    assert _same_typed_json(response, oracle["body"])
 
 
 def _request_root_instance_id(request: dict[str, Any]) -> str | None:
@@ -370,9 +327,9 @@ def _invoke_checkpoint(
     }
     core_calls = 0
     originals = (
-        checkpoint_module.create_aggregate_v2,
-        checkpoint_module.admit_aggregate_v2,
-        checkpoint_module.step_aggregate_v2,
+        checkpoint_module.create_aggregate_v1,
+        checkpoint_module.admit_aggregate_v1,
+        checkpoint_module.step_aggregate_v1,
     )
 
     def observe(index: int) -> Any:
@@ -384,75 +341,80 @@ def _invoke_checkpoint(
 
         return wrapped
 
-    checkpoint_module.create_aggregate_v2 = observe(0)
-    checkpoint_module.admit_aggregate_v2 = observe(1)
-    checkpoint_module.step_aggregate_v2 = observe(2)
+    checkpoint_module.create_aggregate_v1 = observe(0)
+    checkpoint_module.admit_aggregate_v1 = observe(1)
+    checkpoint_module.step_aggregate_v1 = observe(2)
     try:
-        if operation == "checkpoint_create_v2":
+        if operation == "checkpoint_create_v1":
             bundle = load_bundle(
                 (item.path / request["bundle"]["file"]).read_text(encoding="utf-8")
             )
-            response = host.create_v2(
+            response = host.create_v1(
                 bundle,
                 request["machine"]["machine_id"],
                 request["root_instance_id"],
                 request["creation_id"],
                 request["bindings"],
             )
-        elif operation == "checkpoint_admit_v2":
-            response = host.admit_v2(root_instance_id, _deliveries(request), **expected)
-        elif operation == "checkpoint_step_v2":
-            response = host.process_ready_v2(
+        elif operation == "checkpoint_admit_v1":
+            response = host.admit_v1(root_instance_id, _deliveries(request), **expected)
+        elif operation == "checkpoint_step_v1":
+            response = host.process_ready_v1(
                 root_instance_id,
                 _runtime_id_for_target(request["target"]),
+                event_id=request.get("event_id"),
+                envelope_digest=request.get("envelope_digest"),
+                acceptance_sequence=request.get("acceptance_sequence"),
+                queue_sequence=request.get("queue_sequence"),
                 **expected,
             )
-        elif operation == "checkpoint_prune_v2":
-            response = host.prune_v2(
+        elif operation == "checkpoint_prune_v1":
+            response = host.prune_v1(
                 root_instance_id,
                 request["cutoff_receipt_sequence"],
                 target_mode=request["target_mode"],
                 policy_identifier=request["policy_identifier"],
                 **expected,
             )
-        elif operation == "checkpoint_tombstone_v2":
-            response = host.tombstone_root_v2(
+        elif operation == "checkpoint_tombstone_v1":
+            response = host.tombstone_root_v1(
                 root_instance_id,
                 request["tombstone_operation_id"],
                 **expected,
             )
-        elif operation == "checkpoint_update_outbox_v2":
+        elif operation == "checkpoint_update_outbox_v1":
             state = {"status": request["target_disposition"]}
             if request["outcome"]["reason_code"] is not None:
                 state["reason_code"] = request["outcome"]["reason_code"]
             response = host.update_pending_outbox(
                 root_instance_id, request["effect_id"], state, **expected
             )
-        elif operation == "checkpoint_terminalize_outbox_v2":
+        elif operation == "checkpoint_terminalize_outbox_v1":
             outcome = {"status": request["target_disposition"]}
             if request["outcome"]["reason_code"] is not None:
                 outcome["reason_code"] = request["outcome"]["reason_code"]
             response = host.terminalize_outbox(
                 root_instance_id, request["effect_id"], outcome, **expected
             )
-        elif operation == "checkpoint_compact_outbox_v2":
+        elif operation == "checkpoint_compact_outbox_v1":
             response = host.compact_outbox(root_instance_id, request["effect_id"], **expected)
-        elif operation == "checkpoint_delete_retained_record_v2":
+        elif operation == "checkpoint_delete_retained_record_v1":
             response = host.delete_retained_record(root_instance_id, **expected)
         else:
             raise AssertionError(f"unsupported checkpoint operation: {operation}")
     finally:
         (
-            checkpoint_module.create_aggregate_v2,
-            checkpoint_module.admit_aggregate_v2,
-            checkpoint_module.step_aggregate_v2,
+            checkpoint_module.create_aggregate_v1,
+            checkpoint_module.admit_aggregate_v1,
+            checkpoint_module.step_aggregate_v1,
         ) = originals
     return response, _store_bytes(store, root_instance_id), core_calls
 
 
 def _register_declared(
     registry: ExecutionStoreRegistry, registrations: list[dict[str, Any]]
-) -> None:
+) -> list[dict[str, Any]]:
+    registered = []
     for registration in registrations:
         capabilities = registration["capabilities"]
         schema = registration["configuration_schema"]
@@ -470,7 +432,10 @@ def _register_declared(
                 raise ExecutionStoreError("invalid_adapter_configuration")
             return _StaticStore(declared_capabilities)
 
-        registry.register(registration["uri_scheme"], factory)
+        report = registry.register(registration["uri_scheme"], factory, descriptor=registration)
+        assert report is not None
+        registered.append(report)
+    return registered
 
 
 def _validated_result() -> dict[str, Any]:
@@ -482,55 +447,63 @@ def _validated_result() -> dict[str, Any]:
     }
 
 
-def _invoke_contract(item: DurableHostVector, request: dict[str, Any]) -> dict[str, Any]:
+def _invoke_contract(
+    item: DurableHostVector, request: dict[str, Any]
+) -> tuple[dict[str, Any], dict[str, Any]]:
     operation = item.vector["operation"]
-    if operation == "checkpoint_inject_store_v2":
-        ExecutionHost(_StaticStore(request["capabilities"]), MemoryArtifactResolver())
-        return _validated_result()
-    if operation == "checkpoint_register_adapter_v2":
+    if operation == "checkpoint_inject_store_v1":
+        store = _StaticStore(request["capabilities"])
+        ExecutionHost(store, MemoryArtifactResolver())
+        return _validated_result(), injected_store_reference(
+            store,
+            request["store_adapter_identifier"],
+            request["store_uri"],
+            request["configuration"],
+        )
+    if operation == "checkpoint_register_adapter_v1":
         registry = ExecutionStoreRegistry()
         _register_declared(registry, request["existing_registrations"])
-        _register_declared(registry, [request["registration"]])
-        return _validated_result()
-    if operation == "checkpoint_resolve_adapter_v2":
+        raw = _register_declared(registry, [request["registration"]])[0]
+        return _validated_result(), raw
+    if operation == "checkpoint_resolve_adapter_v1":
         registry = ExecutionStoreRegistry()
         _register_declared(registry, request["registrations"])
-        registry.resolve(
+        raw = registry.resolve_report(
             request["uri"],
             configuration=request["configuration"],
             required_capabilities=frozenset(request["requested_capabilities"]),
+            adapter_identifier=request.get("adapter_identifier"),
         )
-        return _validated_result()
-    if operation == "checkpoint_validate_capabilities_v2":
-        validate_host_profile(
+        return _validated_result(), raw
+    if operation == "checkpoint_validate_capabilities_v1":
+        raw = validate_host_profile_report(
             _StaticStore(request["store_capabilities"], request["retention_mode"]),
+            request["adapter_identifier"],
             request["host_profile"],
             host_features=frozenset(request["host_guarantees"]),
+            declared_capabilities=request["store_capabilities"],
+            declared_host_guarantees=request["host_guarantees"],
         )
-        return _validated_result()
-    if operation == "checkpoint_scope_operation_v2":
+        return _validated_result(), raw
+    if operation == "checkpoint_scope_operation_v1":
         scope = request["scope"]
-        matches = [
-            record
-            for record in request["store_records"]
-            if record["scope_id"] == scope["scope_id"]
-            and record["ownership_binding"] == scope["ownership_binding"]
-            and record["portable_identity"] == request["portable_identity"]
-            and record["effect_id"] == request["effect_id"]
-        ]
-        if scope["authorization"] != "authorized" or len(matches) != 1:
-            raise ExecutionHostError("invalid_store_scope")
-        return _validated_result()
-    if operation == "checkpoint_backup_restore_v2":
+        raw = select_scope_record(
+            scope,
+            request["portable_identity"],
+            request["effect_id"],
+            request["store_records"],
+        )
+        return _validated_result(), raw
+    if operation == "checkpoint_backup_restore_v1":
         source_name = item.vector.get("checkpoint_before")
         if source_name is None:
             raise ExecutionHostError("invalid_execution_checkpoint")
         source = (item.path / source_name).read_bytes()
-        checkpoint = restore_execution_checkpoint_v2(source, _resolver(item.path, request))
+        checkpoint = restore_execution_checkpoint_v1(source, _resolver(item.path, request))
         root_instance_id = checkpoint.document["root_instance_id"]
         store = MemoryExecutionStore({root_instance_id: source})
         host = ExecutionHost(store, _resolver(item.path, request))
-        return host.validate_backup_restore_v2(
+        raw = host.validate_backup_restore_v1(
             action=request["action"],
             checkpoint_members=[source],
             checkpoint_digests=request["checkpoint_digests"],
@@ -542,6 +515,7 @@ def _invoke_contract(item: DurableHostVector, request: dict[str, Any]) -> dict[s
                 "root_instance_ids": [root_instance_id],
             },
         )
+        return _validated_result(), raw
     raise AssertionError(f"unsupported durable-host contract operation: {operation}")
 
 
@@ -557,14 +531,15 @@ def run_durable_host_vector(item: DurableHostVector) -> None:
 
             actual, stored = run_persistence_vector(item, request)
         elif item.vector["operation"] in {
-            "checkpoint_backup_restore_v2",
-            "checkpoint_inject_store_v2",
-            "checkpoint_register_adapter_v2",
-            "checkpoint_resolve_adapter_v2",
-            "checkpoint_scope_operation_v2",
-            "checkpoint_validate_capabilities_v2",
+            "checkpoint_backup_restore_v1",
+            "checkpoint_inject_store_v1",
+            "checkpoint_register_adapter_v1",
+            "checkpoint_resolve_adapter_v1",
+            "checkpoint_scope_operation_v1",
+            "checkpoint_validate_capabilities_v1",
         }:
-            actual = _invoke_contract(item, request)
+            actual, raw_response = _invoke_contract(item, request)
+            assert _same_typed_json(raw_response, _raw_response(item)["body"])
             stored = before_bytes
         else:
             response, stored, core_calls = _invoke_checkpoint(item, request, observation)
@@ -572,7 +547,9 @@ def run_durable_host_vector(item: DurableHostVector) -> None:
             initial_source = observation.get("initial_source", before_bytes)
             replayed = _checkpoint_replayed(item, request, response, initial_source)
             result = "replayed" if replayed else "committed"
-            if result in {"committed", "replayed"}:
+            if result in {"committed", "replayed"} and not (
+                item.vector["operation"] == "checkpoint_step_v1" and replayed
+            ):
                 broker.acknowledge(request)
             actual = {
                 "result": result,
@@ -582,6 +559,12 @@ def run_durable_host_vector(item: DurableHostVector) -> None:
             }
     except (ArtifactError, ExecutionHostError, ExecutionStoreError) as error:
         code = error.code
+        raw_oracle = _raw_response(item)
+        if raw_oracle["kind"] == "typed_failure":
+            assert _same_typed_json({"code": code}, raw_oracle["body"])
+        else:
+            assert raw_oracle["kind"] == "no_response"
+            assert "body" not in raw_oracle
         store = observation.get("store")
         root_instance_id = observation.get("root_instance_id")
         stored = (

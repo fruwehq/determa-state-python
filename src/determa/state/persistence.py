@@ -6,7 +6,7 @@ import copy
 import json
 import sqlite3
 import threading
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -223,11 +223,15 @@ class PersistenceHost:
         self,
         store: DurableHostStore,
         artifact_resolver: ArtifactResolver,
+        *,
+        fault_injector: Callable[[str], None] | None = None,
     ) -> None:
         self.store = store
         self.execution_host = ExecutionHost(store, artifact_resolver)
         self.calls: list[str] = []
         self.core_calls = 0
+        self._fault_injector = fault_injector
+        self.raw_response: dict[str, Any] | None = None
 
     @staticmethod
     def _delivery(request: Mapping[str, Any]) -> dict[str, Any]:
@@ -258,7 +262,8 @@ class PersistenceHost:
                 host_features=frozenset(request.get("host_guarantees", [])),
             )
 
-    def process_v2(self, request: Mapping[str, Any]) -> dict[str, Any]:
+    def process_v1(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        self.raw_response = None
         self._preflight(request)
         root_instance_id = request["expected_checkpoint"]["root_instance_id"]
         event_id = request["presented_envelope"]["event_id"]
@@ -278,6 +283,10 @@ class PersistenceHost:
                     }
                 )
             self.calls.append("quarantine")
+            self.raw_response = {
+                "code": "permanent_processing_failure",
+                "record": copy.deepcopy(document["quarantine"]),
+            }
             return {
                 "result": "quarantined",
                 "mutation": "atomic",
@@ -303,6 +312,12 @@ class PersistenceHost:
                 if prior["request_digest"] != request["envelope_digest"]:
                     raise ExecutionHostError("event_id_conflict")
                 self.calls.append("acknowledge")
+                self.raw_response = next(
+                    copy.deepcopy(receipt)
+                    for receipt in document["checkpoint"]["operation_receipts"]
+                    if receipt["operation_kind"] == "event_terminal"
+                    and receipt["event_id"] == event_id
+                )
                 return {
                     "result": "replayed",
                     "mutation": "none",
@@ -316,7 +331,7 @@ class PersistenceHost:
             self.core_calls = 1
             expected = request["expected_checkpoint"]
             bound = self.execution_host._bound(transaction)
-            bound.process_delivery_v2(
+            processed = bound.process_delivery_v1(
                 root_instance_id,
                 self._delivery(request),
                 target_validated_bundle_fingerprint=request["transaction_inputs"][
@@ -328,6 +343,7 @@ class PersistenceHost:
                 expected_revision=expected["revision"],
                 expected_checkpoint_digest=expected["digest"],
             )
+            self.raw_response = processed["raw_response"]
             identity = {
                 "event_id": event_id,
                 "request_digest": request["envelope_digest"],
@@ -344,6 +360,13 @@ class PersistenceHost:
                 request["transaction_inputs"].get("application_writes", {})
             )
             self.calls.extend(["stage_checkpoint", "stage_inbox", "stage_outbox", "stage_audit"])
+            if self._fault_injector is not None:
+                try:
+                    self._fault_injector("before_commit")
+                    self._fault_injector("after_audit_staged")
+                except ExecutionHostError:
+                    self.calls.append("rollback")
+                    raise
             if policy == "inject_pre_commit":
                 self.calls.append("rollback")
                 raise ExecutionHostError("injected_pre_commit_failure")
@@ -352,6 +375,8 @@ class PersistenceHost:
             self.calls.append("commit")
         if policy == "inject_post_commit_response_loss":
             raise ExecutionHostError("response_lost_after_commit")
+        if self._fault_injector is not None:
+            self._fault_injector("after_commit_before_acknowledgement")
         self.calls.append("acknowledge")
         return {
             "result": "committed",
@@ -360,7 +385,8 @@ class PersistenceHost:
             "broker_acknowledged": True,
         }
 
-    def release_quarantine_v2(self, request: Mapping[str, Any]) -> dict[str, Any]:
+    def release_quarantine_v1(self, request: Mapping[str, Any]) -> dict[str, Any]:
+        self.raw_response = None
         self._preflight(request)
         root_instance_id = request["expected_checkpoint"]["root_instance_id"]
         with self.store.host_transaction(root_instance_id) as (document, _tx):
@@ -374,6 +400,7 @@ class PersistenceHost:
                 raise ExecutionHostError("invalid_execution_checkpoint")
             quarantine["released"] = True
         self.calls.append("release_quarantine")
+        self.raw_response = {"result": "released"}
         return {
             "result": "released",
             "mutation": "atomic",

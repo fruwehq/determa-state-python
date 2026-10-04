@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import re
 from collections.abc import Callable, Mapping
 from typing import Any
@@ -19,17 +20,40 @@ class ExecutionStoreRegistry:
 
     def __init__(self) -> None:
         self._factories: dict[str, ExecutionStoreFactory] = {}
+        self._descriptors: dict[str, dict[str, Any]] = {}
 
     @property
     def identifiers(self) -> tuple[str, ...]:
         return tuple(sorted(self._factories))
 
-    def register(self, identifier: str, factory: ExecutionStoreFactory) -> None:
+    def register(
+        self,
+        identifier: str,
+        factory: ExecutionStoreFactory,
+        *,
+        descriptor: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
         if _IDENTIFIER.fullmatch(identifier) is None:
             raise ExecutionStoreError(AdapterCode.INVALID_ADAPTER_CONFIGURATION)
         if identifier in self._factories:
             raise ExecutionStoreError(AdapterCode.DUPLICATE_ADAPTER_REGISTRATION)
+        if descriptor is not None and (
+            set(descriptor)
+            != {
+                "adapter_identifier",
+                "uri_scheme",
+                "source",
+                "configuration_schema",
+                "capabilities",
+            }
+            or descriptor["uri_scheme"] != identifier
+        ):
+            raise ExecutionStoreError(AdapterCode.INVALID_ADAPTER_CONFIGURATION)
         self._factories[identifier] = factory
+        if descriptor is not None:
+            self._descriptors[identifier] = copy.deepcopy(dict(descriptor))
+            return copy.deepcopy(self._descriptors[identifier])
+        return None
 
     def resolve(
         self,
@@ -53,6 +77,36 @@ class ExecutionStoreRegistry:
         if required_capabilities and not required_capabilities.issubset(store.capabilities):
             raise ExecutionStoreError(AdapterCode.ADAPTER_CAPABILITY_MISMATCH)
         return store
+
+    def resolve_report(
+        self,
+        uri: str,
+        *,
+        configuration: Mapping[str, Any] | None = None,
+        required_capabilities: set[str] | frozenset[str] = frozenset(),
+        adapter_identifier: str | None = None,
+    ) -> dict[str, Any]:
+        """Resolve an adapter and report the exact registered descriptor and request."""
+        store = self.resolve(
+            uri,
+            configuration=configuration,
+            required_capabilities=required_capabilities,
+        )
+        descriptor = self._descriptors.get(urlsplit(uri).scheme)
+        if (
+            descriptor is None
+            or not required_capabilities.issubset(store.capabilities)
+            or (
+                adapter_identifier is not None
+                and descriptor["adapter_identifier"] != adapter_identifier
+            )
+        ):
+            raise ExecutionStoreError(AdapterCode.INVALID_ADAPTER_CONFIGURATION)
+        return {
+            "registration": copy.deepcopy(descriptor),
+            "configuration": copy.deepcopy(dict(configuration or {})),
+            "requested_capabilities": sorted(required_capabilities),
+        }
 
 
 def register_bundled_execution_stores(

@@ -11,14 +11,14 @@ from .checkpoint import (
     serialize_execution_checkpoint,
     validate_execution_checkpoint_member,
 )
-from .checkpoint_v2 import (
+from .checkpoint_v1 import (
     RestoredExecutionCheckpoint,
-    admit_checkpoint_v2,
-    create_checkpoint_v2,
-    process_delivery_checkpoint_v2,
-    prune_checkpoint_v2,
-    restore_execution_checkpoint_v2,
-    step_checkpoint_v2,
+    admit_checkpoint_v1,
+    create_checkpoint_v1,
+    process_delivery_checkpoint_v1,
+    prune_checkpoint_v1,
+    restore_execution_checkpoint_v1,
+    step_checkpoint_v1,
 )
 from .codes import (
     PORTABLE_CODE_SETS,
@@ -30,6 +30,7 @@ from .codes import (
     DispositionCode,
     EngineFaultCode,
     ExecutionStoreAdapterFailureCode,
+    ExtensionNegotiationFailureCode,
     MachineLoadFailureCode,
     PersistenceFailureCode,
 )
@@ -56,7 +57,7 @@ from .host import (
 )
 from .migration import (
     MigrationLimits,
-    restore_migration_descriptor_v2,
+    restore_migration_descriptor_v1,
 )
 from .persistence import (
     DurableHostStore,
@@ -65,18 +66,18 @@ from .persistence import (
     SQLiteDurableHostStore,
 )
 from .queueing import (
-    admit_aggregate_v2 as admit,
+    admit_aggregate_v1 as admit,
 )
 from .queueing import (
-    create_aggregate_v2 as create,
+    create_aggregate_v1 as create,
 )
 from .queueing import (
-    migrate_aggregate_v2,
-    restore_aggregate_v2,
-    seal_aggregate_v2,
+    migrate_aggregate_v1,
+    restore_aggregate_v1,
+    seal_aggregate_v1,
 )
 from .queueing import (
-    step_aggregate_v2 as step,
+    step_aggregate_v1 as step,
 )
 from .stores import (
     COMPACT_EFFECT_IDENTITY_RETENTION,
@@ -124,7 +125,7 @@ __all__ = [
     "ArtifactError",
     "ArtifactResolver",
     "admit",
-    "admit_checkpoint_v2",
+    "admit_checkpoint_v1",
     "Bundle",
     "BundleSource",
     "CelError",
@@ -138,7 +139,7 @@ __all__ = [
     "DetermaError",
     "DefinitionResolver",
     "CreationRejectionCode",
-    "create_checkpoint_v2",
+    "create_checkpoint_v1",
     "DispatchRejectionCode",
     "DispositionCode",
     "ErrorRecord",
@@ -152,6 +153,7 @@ __all__ = [
     "ExecutionStoreRegistry",
     "ExecutionStoreTransaction",
     "ExecutionStoreAdapterFailureCode",
+    "ExtensionNegotiationFailureCode",
     "FileExecutionStore",
     "MemoryArtifactResolver",
     "MemoryDurableHostStore",
@@ -159,7 +161,7 @@ __all__ = [
     "MachineLoadFailureCode",
     "MigrationDescriptorResolver",
     "MigrationLimits",
-    "migrate_aggregate_v2",
+    "migrate_aggregate_v1",
     "PERMANENT_OUTBOX_TERMINAL_RETENTION",
     "PERMANENT_RECEIPT_RETENTION",
     "PostgreSQLExecutionStore",
@@ -195,20 +197,20 @@ __all__ = [
     "outbox_intent_digest",
     "portable_envelope",
     "postgresql_execution_store_factory",
-    "prune_checkpoint_v2",
-    "process_delivery_checkpoint_v2",
+    "prune_checkpoint_v1",
+    "process_delivery_checkpoint_v1",
     "register_bundled_execution_stores",
     "restore_aggregate",
-    "restore_aggregate_v2",
+    "restore_aggregate_v1",
     "restore_aggregate_package",
-    "restore_execution_checkpoint_v2",
-    "restore_migration_descriptor_v2",
-    "seal_aggregate_v2",
+    "restore_execution_checkpoint_v1",
+    "restore_migration_descriptor_v1",
+    "seal_aggregate_v1",
     "seal_execution_checkpoint",
     "serialize_aggregate",
     "serialize_execution_checkpoint",
     "step",
-    "step_checkpoint_v2",
+    "step_checkpoint_v1",
     "sqlite_execution_store_factory",
     "validate",
     "validate_execution_checkpoint_member",

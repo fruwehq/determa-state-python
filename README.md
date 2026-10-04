@@ -4,19 +4,23 @@ Python implementation of [Determa State](https://github.com/fruwehq/determa-stat
 a language-agnostic statechart engine with a shared normative conformance suite.
 
 This implementation supports Determa State `format: 1` at specification
-commit `6796b554b976627c68fc746ec5629629aaf2b38e`. Correctness is determined by
-98 format-1 core cases, 162 version-2 vectors, 138 durable-host vectors, and 381 generated version-2 artifacts
-at conformance commit `a586417292d0a5cac8d07e1164669688c407a7e1`.
+commit `6bd25e3fcdf068af861aa289903a8489bd8f0139`. Correctness is determined by
+98 format-1 core cases, 162 version-1 vectors, 142 durable-host vectors, and 403
+manifest artifacts at conformance commit `710d5e9bcf517e8a8cc8d7087123bda37a362d6b`.
 
-The package metadata is `0.3.0`. Artifact and checkpoint schema version 2 is the
+The package metadata is `0.3.0`. Artifact and checkpoint schema version 1 is the
 only supported portable artifact format. Machine YAML remains `format: 1`.
 
-## Release 0.3.0
+## Unreleased 0.3.0
 
 This release adds portable event deferral to the queue-bearing aggregate and uses schema
-version 2 as the sole portable aggregate, migration, and execution-checkpoint contract.
+version 1 as the sole portable aggregate, migration, and execution-checkpoint contract.
 The synchronous host can persist accepted work and restore ready and deferred mailboxes
 across restarts.
+The version-1 checkpoint host returns exact receipt evidence for admission, processing,
+and terminal replay. The closed extension failure-code vocabulary is available for
+the shared registry; extension negotiation is not a claimed host capability in this
+implementation slice.
 
 ## Install
 
@@ -152,7 +156,7 @@ definitions.
 
 ## Persist And Migrate
 
-`serialize_aggregate` produces the canonical schema-v2 aggregate artifact. Restoration
+`serialize_aggregate` produces the canonical schema-v1 aggregate artifact. Restoration
 resolves its exact validated definition by fingerprint and fails closed when the
 definition is absent or untrusted:
 
@@ -163,7 +167,7 @@ restored = ds.restore_aggregate(encoded, resolver)
 ```
 
 `restore_aggregate_package` verifies a self-contained transport package and seeds a
-mutable resolver without replacing existing content. `migrate_aggregate_v2` applies an
+mutable resolver without replacing existing content. `migrate_aggregate_v1` applies an
 exact trusted descriptor route as a pure operation. Failed migrations do not mutate the
 supplied artifact or resolver.
 
@@ -183,7 +187,7 @@ store.setup_schema()  # always explicit
 resolver = ds.MemoryArtifactResolver(definitions={bundle.fingerprint: bundle})
 host = ds.ExecutionHost(store, resolver)
 
-created = host.create_v2(
+created = host.create_v1(
     bundle,
     machine_id="counter",
     root_instance_id="counter-42",
@@ -255,9 +259,9 @@ configuration. Root checkpoint deletion is unsupported.
 - explicit sends, isolated lifecycle-bound components, and deterministic routing;
 - owned spawn, nominal instance references, binding, cancellation, completion,
   failure propagation, and cleanup cascades;
-- atomic RTC rollback, deterministic identities/counters, pure inspection, and
+- atomic RTC rollback, deterministic identities/counters, and
   incompatible or malformed prior-state rejection;
-- schema-v2 aggregate serialization/restoration, portable typed values, package
+- schema-v1 aggregate serialization/restoration, portable typed values, package
   attachments, exact definition resolution, trusted lazy migration, deterministic
   audits, and resource limits;
 - strict portable execution-checkpoint parsing, canonical digests, semantic

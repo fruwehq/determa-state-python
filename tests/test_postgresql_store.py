@@ -49,7 +49,7 @@ def test_postgresql_cas_and_shared_native_transaction() -> None:
     store.setup_schema()
     resolver = _resolver()
     host = ExecutionHost(store, resolver)
-    host.create_v2(load_bundle(MACHINE), "counter", "root", "create", {})
+    host.create_v1(load_bundle(MACHINE), "counter", "root", "create", {})
     checkpoint = host.read_checkpoint("root")
     assert checkpoint is not None
     document = checkpoint.document
@@ -57,7 +57,7 @@ def test_postgresql_cas_and_shared_native_transaction() -> None:
 
     def process(operation_id: str) -> str:
         try:
-            ExecutionHost(store, resolver).maintenance_migration_v2(
+            ExecutionHost(store, resolver).maintenance_migration_v1(
                 "root",
                 operation_id,
                 aggregate["validated_bundle_fingerprint"],
@@ -82,8 +82,8 @@ def test_postgresql_cas_and_shared_native_transaction() -> None:
             f"INSERT INTO {application_table} (root_instance_id) VALUES (%s)",
             ("shared-root",),
         )
-        staged = execution.create_v2(load_bundle(MACHINE), "counter", "create", {})
-        assert staged == StagedExecutionResult("create_v2")
+        staged = execution.create_v1(load_bundle(MACHINE), "counter", "create", {})
+        assert staged == StagedExecutionResult("create_v1")
 
     committed = host.run_shared_transaction("shared-root", commit_callback)
     assert committed["result"] == "committed"
@@ -94,7 +94,7 @@ def test_postgresql_cas_and_shared_native_transaction() -> None:
             value = value.decode("ascii")
         assert value == "shared-root"
 
-    host.create_v2(
+    host.create_v1(
         load_bundle(MACHINE),
         "counter",
         "migration-root",
@@ -110,14 +110,14 @@ def test_postgresql_cas_and_shared_native_transaction() -> None:
             f"INSERT INTO {application_table} (root_instance_id) VALUES (%s)",
             ("migration-root",),
         )
-        staged = execution.maintenance_migration_v2(
+        staged = execution.maintenance_migration_v1(
             "postgresql-empty-migration",
             migration_aggregate["validated_bundle_fingerprint"],
             [],
             expected_revision=migration_checkpoint.document["revision"],
             expected_checkpoint_digest=migration_checkpoint.document["execution_checkpoint_digest"],
         )
-        assert staged == StagedExecutionResult("maintenance_migration_v2")
+        assert staged == StagedExecutionResult("maintenance_migration_v1")
 
     migration_result = host.run_shared_transaction("migration-root", migrate_callback)
     assert migration_result["receipt"]["result_code"] == "migration_no_operation"
@@ -128,7 +128,7 @@ def test_postgresql_cas_and_shared_native_transaction() -> None:
             f"INSERT INTO {application_table} (root_instance_id) VALUES (%s)",
             ("rolled-back-root",),
         )
-        execution.create_v2(load_bundle(MACHINE), "counter", "create", {})
+        execution.create_v1(load_bundle(MACHINE), "counter", "create", {})
         raise RuntimeError("application rollback")
 
     with pytest.raises(RuntimeError, match="application rollback"):
@@ -252,7 +252,7 @@ def test_postgresql_persists_policy_and_forbids_native_deletion() -> None:
         _resolver(),
         profile="exactly_once_committed_processing",
     )
-    host.create_v2(load_bundle(MACHINE), "counter", "bank-root", "create", {})
+    host.create_v1(load_bundle(MACHINE), "counter", "bank-root", "create", {})
 
     with psycopg.connect(store.conninfo) as connection:
         with pytest.raises(psycopg.Error, match="execution_store_immutable"):
@@ -262,7 +262,7 @@ def test_postgresql_persists_policy_and_forbids_native_deletion() -> None:
             )
     assert host.read_checkpoint("bank-root") is not None
     with pytest.raises(ExecutionHostError) as recreate:
-        host.create_v2(load_bundle(MACHINE), "counter", "bank-root", "replacement", {})
+        host.create_v1(load_bundle(MACHINE), "counter", "bank-root", "replacement", {})
     assert recreate.value.code == "creation_id_conflict"
 
     def native_delete(connection, execution) -> None:
