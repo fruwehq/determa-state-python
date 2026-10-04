@@ -11,19 +11,23 @@ package so it can coexist with the umbrella `determa` launcher.
 The implementation is conformant only when it passes the language-neutral suite.
 The implementation uses these immutable inputs:
 
-- specification: `6207362e879ccca70f709e1eb4cc90448d910c0b`;
-- conformance: `e499a99c3ced88f29008049ea9dddcc17a0d9f51` (99 format-1
+- specification: `86bb88dd21cb1f799eefe5020b6e49dabf6e7225`;
+- conformance: `bbb215961448ad691189c41072d8ea03f76f9372` (99 format-1
   core cases, 162 version-1 vectors, 142 durable-host vectors, 49 core inspection
   vectors, 47 extension negotiation vectors, 7 optional native-provider vectors,
-  and 420 JSON artifacts).
+  30 runtime-provider vectors, and 476 JSON artifacts).
 
 The package metadata is `0.3.0`.
 
 ## Boundaries
 
-The pure public API is `load_bundle`, `create`, `admit`, and `step`, plus validation
+The portable public API is `load_bundle`, `create`, `admit`, and `step`, plus validation
 and error types exported by `determa.state`. Creation, admission, and stepping operate
 only on queue-bearing aggregate state; the mailbox-free engine helpers are private.
+Optional native runtime slots use explicit `RuntimeProviderRegistry` and
+`SourceClosure` installation, and optional source compilation uses
+`compile_language_source`. Those embedded calls disclose their effective capability
+profile and may perform native I/O before an aggregate commit.
 Portable artifacts and checkpoints support
 schema version 1 only. The optional synchronous `ExecutionHost` and execution-store
 APIs wrap that core without changing its exact `format: 1` machine grammar. Do not

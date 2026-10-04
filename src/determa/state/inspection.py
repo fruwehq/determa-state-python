@@ -186,15 +186,18 @@ def inspect_candidate(
     if not semantic_enabled:
         return _failure("inspection_capability_unavailable")
     # Inspect every potentially reached guard before evaluating any of them.
+    runtime_providers = restored.bundle.runtime_providers
     for node in nodes:
         declaration = (node.raw.get("on_events") or {}).get(envelope["event"])
         branches = (
             declaration if isinstance(declaration, list) else [declaration] if declaration else []
         )
-        if any(
-            not isinstance(branch.get("guard"), str) for branch in branches if "guard" in branch
-        ):
-            return _failure("inspection_capability_unavailable")
+        for branch in branches:
+            guard = branch.get("guard")
+            if guard is None or isinstance(guard, str):
+                continue
+            if runtime_providers is None or not runtime_providers.can_inspect(guard["provider"]):
+                return _failure("inspection_capability_unavailable")
     from .inspection_cel import InspectionLimit, safe_evaluate, value_units
 
     evidence: list[dict[str, Any]] = []
@@ -212,7 +215,7 @@ def inspect_candidate(
             if guard is None:
                 return _success(request, fingerprint, ["handled_now"], levels, evidence)
             locator = branch_info["guard_locator"]
-            assert locator is not None and isinstance(guard, str)
+            assert locator is not None
             if guard_count == 0:
                 return _failure("inspection_limit_exceeded", locator)
             guard_count -= 1
@@ -223,19 +226,39 @@ def inspect_candidate(
             visible_units = sum(value_units(value) for value in variables.values())
             activation = {**variables, "event": {"payload": candidate["payload"]}}
             try:
-                value, cost = safe_evaluate(
-                    guard,
-                    activation,
-                    remaining,
-                    snapshot_units=value_units(
-                        {
-                            **candidate,
-                            "source": envelope["source"],
-                            "cause_id": envelope["cause_id"],
-                        }
+                if isinstance(guard, str):
+                    value, cost = safe_evaluate(
+                        guard,
+                        activation,
+                        remaining,
+                        snapshot_units=value_units(
+                            {
+                                **candidate,
+                                "source": envelope["source"],
+                                "cause_id": envelope["cause_id"],
+                            }
+                        )
+                        + visible_units,
                     )
-                    + visible_units,
-                )
+                else:
+                    assert runtime_providers is not None
+                    from .runtime_providers import RuntimeProviderError
+                    from .wire import typed_value
+
+                    binding = guard["provider"]
+                    snapshot: dict[str, Any] = {}
+                    if "event" in binding["input_types"]:
+                        snapshot["event"] = copy.deepcopy(envelope)
+                    if "variables" in binding["input_types"]:
+                        snapshot["variables"] = typed_value(variables)
+                    try:
+                        value, _charged, cost = runtime_providers.inspect_guard(
+                            binding, snapshot, guard_count + 1, remaining
+                        )
+                    except (ValueError, RuntimeProviderError) as exc:
+                        if str(exc) == "inspection_limit_exceeded":
+                            return _failure("inspection_limit_exceeded", locator)
+                        return _failure("inspection_guard_failure", locator)
             except InspectionLimit:
                 return _failure("inspection_limit_exceeded", locator)
             except Exception:

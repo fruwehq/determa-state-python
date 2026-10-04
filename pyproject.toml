@@ -73,6 +73,10 @@ packages = ["src/determa"]
 "src/determa/state/data/extension-capability-report-v1.schema.json" = "determa/state/data/extension-capability-report-v1.schema.json"
 "src/determa/state/data/extension-capability-requirement-v1.schema.json" = "determa/state/data/extension-capability-requirement-v1.schema.json"
 "src/determa/state/data/inspection-v1.schema.json" = "determa/state/data/inspection-v1.schema.json"
+"src/determa/state/data/runtime-action-output-v1.schema.json" = "determa/state/data/runtime-action-output-v1.schema.json"
+"src/determa/state/data/runtime-provider-descriptor-v1.schema.json" = "determa/state/data/runtime-provider-descriptor-v1.schema.json"
+"src/determa/state/data/language-source-v1.schema.json" = "determa/state/data/language-source-v1.schema.json"
+"src/determa/state/data/compilation-manifest-v1.schema.json" = "determa/state/data/compilation-manifest-v1.schema.json"
 
 [tool.ruff]
 line-length = 100

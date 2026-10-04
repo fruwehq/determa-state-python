@@ -1753,17 +1753,59 @@ class _Execution:
 
     def evaluate(
         self,
-        expression: str,
+        expression: Any,
         activation: dict[str, Any],
         pointer: str,
         *,
         guard: bool = False,
     ) -> Any:
+        if isinstance(expression, dict) and "provider" in expression:
+            from .runtime_providers import RuntimeProviderError
+
+            registry = self.bundle.runtime_providers
+            if registry is None:
+                raise RuntimeProviderError("runtime_provider_unavailable")
+            try:
+                return registry.invoke_guard(
+                    expression["provider"],
+                    self.provider_snapshot(activation, expression["provider"]),
+                )
+            except RuntimeProviderError as exc:
+                if exc.code == "runtime_provider_output_invalid":
+                    raise StepFault(FaultCode.GUARD_FAULT, pointer) from exc
+                raise
+            except Exception as exc:
+                raise StepFault(FaultCode.GUARD_FAULT, pointer) from exc
         try:
             return cel.evaluate(expression, activation)
         except CelError as exc:
             code = FaultCode.GUARD_FAULT if guard else FaultCode.ACTION_FAULT
             raise StepFault(code, pointer) from exc
+
+    def provider_snapshot(
+        self, activation: dict[str, Any], binding: dict[str, Any]
+    ) -> dict[str, Any]:
+        from .wire import typed_value
+
+        result: dict[str, Any] = {}
+        inputs = binding["input_types"]
+        if "event" in inputs and self.event is not None:
+            event = copy.deepcopy(self.event)
+            event["payload"] = typed_value(event["payload"])
+            result["event"] = event
+        if "variables" in inputs:
+            result["variables"] = typed_value(
+                {
+                    name: value
+                    for name, value in activation.items()
+                    if name not in {"event", "owner", "env"}
+                }
+            )
+        if "owner" in inputs and "owner" in activation:
+            result["owner"] = typed_value(activation["owner"])
+        if "env" in inputs and "env" in activation:
+            result["env"] = typed_value(activation["env"])
+        return result
 
     def allocate_components(
         self, runtime: dict[str, Any], machine: MachineModel, state: StateNode
@@ -2004,7 +2046,30 @@ class _Execution:
     ) -> None:
         for index, action in enumerate(actions):
             action_pointer = f"{pointer}/{index}"
-            if "assign" in action:
+            if "provider_actions" in action:
+                from .runtime_providers import RuntimeProviderError
+
+                registry = self.bundle.runtime_providers
+                if registry is None:
+                    raise RuntimeProviderError("runtime_provider_unavailable")
+                try:
+                    proposals = registry.invoke_actions(
+                        action["provider_actions"],
+                        self.provider_snapshot(
+                            self.activation(runtime, machine, state, event_visible=event_visible),
+                            action["provider_actions"],
+                        ),
+                    )
+                    self.run_provider_proposals(runtime, machine, state, proposals, action_pointer)
+                except RuntimeProviderError as exc:
+                    if exc.code == "runtime_provider_output_invalid":
+                        raise StepFault(FaultCode.ACTION_FAULT, action_pointer) from exc
+                    raise
+                except StepFault as exc:
+                    raise StepFault(FaultCode.ACTION_FAULT, action_pointer) from exc
+                except Exception as exc:
+                    raise StepFault(FaultCode.ACTION_FAULT, action_pointer) from exc
+            elif "assign" in action:
                 name, expression = next(iter(action["assign"].items()))
                 value = self.evaluate(
                     expression,
@@ -2051,6 +2116,43 @@ class _Execution:
             elif "stop" in action:
                 raise _StopRuntime
 
+    def run_provider_proposals(
+        self,
+        runtime: dict[str, Any],
+        machine: MachineModel,
+        state: StateNode,
+        proposals: list[dict[str, Any]],
+        pointer: str,
+    ) -> None:
+        from .errors import DetermaError
+        from .runtime_providers import RuntimeProviderError
+        from .wire import decoded_typed_value
+
+        for proposal in proposals:
+            try:
+                if "assign" in proposal:
+                    assignment = proposal["assign"]
+                    name = assignment["variable"]
+                    scope_path, declaration = self.variable_slot(runtime, state, name)
+                    if declaration.get("external"):
+                        raise StepFault(FaultCode.ACTION_FAULT, pointer)
+                    value = decoded_typed_value(assignment["value"])
+                    runtime["scopes"][scope_path][name] = _normalize_value(
+                        value, str(declaration["type"])
+                    )
+                elif "send" in proposal:
+                    self.send(
+                        runtime,
+                        machine,
+                        state,
+                        proposal["send"],
+                        pointer,
+                        event_visible=self.event is not None,
+                        literal_values=True,
+                    )
+            except (DetermaError, ValueError, KeyError, TypeError) as exc:
+                raise RuntimeProviderError("runtime_provider_output_invalid") from exc
+
     def send(
         self,
         runtime: dict[str, Any],
@@ -2060,13 +2162,23 @@ class _Execution:
         pointer: str,
         *,
         event_visible: bool,
+        literal_values: bool = False,
     ) -> None:
         activation = self.activation(runtime, machine, state, event_visible=event_visible)
         declaration = self.event_declaration(runtime, send["event"])
         payload_values: dict[str, Any] = {}
         payload_expressions = send.get("payload") or {}
         normalized_payload: dict[str, Any]
-        if send["event"] == "env":
+        if literal_values:
+            from .wire import decoded_typed_value
+
+            if send["event"] == "env" or declaration is None:
+                raise StepFault(FaultCode.ACTION_FAULT, pointer)
+            decoded = decoded_typed_value(send["payload"])
+            if not isinstance(decoded, dict):
+                raise StepFault(FaultCode.ACTION_FAULT, pointer)
+            payload_values = decoded
+        elif send["event"] == "env":
             changed_expression = payload_expressions["changed"]
             payload_values["changed"] = self.evaluate(
                 changed_expression, activation, f"{pointer}/payload/changed"
@@ -2080,7 +2192,11 @@ class _Execution:
                     f"{pointer}/payload/{_escape_pointer(name)}",
                 )
         correlation = None
-        if "correlation_id" in send:
+        if "correlation_id" in send and literal_values:
+            from .wire import decoded_typed_value
+
+            correlation = decoded_typed_value(send["correlation_id"])
+        elif "correlation_id" in send:
             correlation = self.evaluate(
                 send["correlation_id"], activation, f"{pointer}/correlation_id"
             )
@@ -2090,7 +2206,12 @@ class _Execution:
             value = None
             if "instance" in target_spec:
                 suffix = f"/targets/{index}/instance" if "targets" in send else "/to/instance"
-                value = self.evaluate(target_spec["instance"], activation, f"{pointer}{suffix}")
+                if literal_values:
+                    from .wire import decoded_typed_value
+
+                    value = decoded_typed_value(target_spec["instance"])
+                else:
+                    value = self.evaluate(target_spec["instance"], activation, f"{pointer}{suffix}")
             evaluated_targets.append((target_spec, value))
         if send["event"] == "env":
             if not isinstance(payload_values["changed"], dict):
@@ -2112,6 +2233,16 @@ class _Execution:
             self.resolve_send_target(runtime, target_spec, value, pointer, index, "targets" in send)
             for index, (target_spec, value) in enumerate(evaluated_targets)
         ]
+        if (
+            literal_values
+            and declaration is not None
+            and any(
+                declaration["direction"] != ("output" if target == "external" else "internal")
+                or (target == "external" and not isinstance(correlation, str))
+                for target in resolved
+            )
+        ):
+            raise StepFault(FaultCode.ACTION_FAULT, pointer)
         for index, target in enumerate(resolved):
             if target == "external":
                 sequence = int(self.state["next_output_sequence"])
