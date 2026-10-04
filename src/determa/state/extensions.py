@@ -550,7 +550,15 @@ def _bundled_factory_matches_source(name: str, factory: Any) -> bool:
             source = source_path.read_bytes()
             tree = ast.parse(source)
             for node in tree.body:
-                if isinstance(node, ast.ImportFrom) and node.level:
+                if isinstance(node, ast.Import):
+                    for alias in node.names:
+                        imported = importlib.import_module(alias.name)
+                        if alias.asname is None and "." in alias.name:
+                            imported = importlib.import_module(alias.name.split(".", 1)[0])
+                        bound_name = alias.asname or alias.name.split(".", 1)[0]
+                        if vars(origin).get(bound_name) is not imported:
+                            return None
+                elif isinstance(node, ast.ImportFrom) and node.module != "__future__":
                     imported = importlib.import_module(
                         "." * node.level + (node.module or ""), origin.__package__
                     )

@@ -10,6 +10,7 @@ import pytest
 import determa.state.extensions as extensions
 import determa.state.stores as bundled_stores
 import determa.state.stores.memory as memory_module
+import determa.state.stores.sqlite as sqlite_module
 from determa.state.extensions import (
     ExtensionError,
     ExtensionRegistry,
@@ -380,6 +381,58 @@ def test_bundled_wrapper_and_transaction_callbacks_match_source(
     registry = bundled_extension_registry(include_postgresql=False)
     with pytest.raises(ExtensionError, match="extension_identity_mismatch"):
         registry.negotiate(record, configuration)
+
+
+def test_bundled_absolute_imports_match_installed_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+    original_rlock = memory_module.threading.RLock
+
+    class SubstituteThreading:
+        @staticmethod
+        def RLock() -> object:
+            nonlocal calls
+            calls += 1
+            return original_rlock()
+
+    monkeypatch.setattr(memory_module, "threading", SubstituteThreading)
+    registry = bundled_extension_registry(include_postgresql=False)
+    memory_record = next(
+        item
+        for item in registry.descriptors
+        if item["provider_reference"]["identifier"] == "determa.store.memory"
+    )
+    with pytest.raises(ExtensionError, match="extension_identity_mismatch"):
+        registry.negotiate(
+            memory_record, {"instance_id": "primary", "uri": "memory:", "store_configuration": {}}
+        )
+    assert calls == 0
+
+    original_path = sqlite_module.Path
+
+    def substitute_path(value: str) -> object:
+        nonlocal calls
+        calls += 1
+        return original_path(value)
+
+    monkeypatch.setattr(sqlite_module, "Path", substitute_path)
+    registry = bundled_extension_registry(include_postgresql=False)
+    sqlite_record = next(
+        item
+        for item in registry.descriptors
+        if item["provider_reference"]["identifier"] == "determa.store.sqlite"
+    )
+    with pytest.raises(ExtensionError, match="extension_identity_mismatch"):
+        registry.negotiate(
+            sqlite_record,
+            {
+                "instance_id": "primary",
+                "uri": "sqlite:///tmp/b1-imports.sqlite",
+                "store_configuration": {},
+            },
+        )
+    assert calls == 0
 
 
 def test_requested_profile_cannot_skip_composition() -> None:
