@@ -87,21 +87,20 @@ def test_static_checker_accepts_only_declared_profile_overloads(
         "flag": cel.BOOL,
         "numbers": cel.StaticType("list", element=cel.INT),
         "attributes": cel.MAP,
-        "reference": cel.StaticType(
-            "instance_reference", machine_id="worker", nullable=True
-        ),
-        "other_reference": cel.StaticType(
-            "instance_reference", machine_id="worker", nullable=True
-        ),
+        "reference": cel.StaticType("instance_reference", machine_id="worker", nullable=True),
+        "other_reference": cel.StaticType("instance_reference", machine_id="worker", nullable=True),
     }
     event_fields = {"required": cel.STRING, "optional": cel.STRING}
 
-    assert cel.check_expression(
-        expression,
-        scope,
-        expected=expected,
-        event_fields=event_fields,
-    ) == expected
+    assert (
+        cel.check_expression(
+            expression,
+            scope,
+            expected=expected,
+            event_fields=event_fields,
+        )
+        == expected
+    )
 
 
 @pytest.mark.parametrize(
@@ -135,12 +134,8 @@ def test_static_checker_rejects_unavailable_symbols_and_overloads(expression: st
         "floating_value": cel.FLOAT,
         "text": cel.STRING,
         "numbers": cel.StaticType("list", element=cel.INT),
-        "reference": cel.StaticType(
-            "instance_reference", machine_id="worker", nullable=True
-        ),
-        "other_reference": cel.StaticType(
-            "instance_reference", machine_id="worker", nullable=True
-        ),
+        "reference": cel.StaticType("instance_reference", machine_id="worker", nullable=True),
+        "other_reference": cel.StaticType("instance_reference", machine_id="worker", nullable=True),
     }
 
     with pytest.raises(cel.CelProfileError):

@@ -28,9 +28,7 @@ def package_version(path: Path = VERSION_SOURCE) -> str:
         and isinstance(statement.value.value, str)
     ]
     if len(values) != 1:
-        raise ValueError(
-            f"{path} must contain exactly one literal __version__ assignment"
-        )
+        raise ValueError(f"{path} must contain exactly one literal __version__ assignment")
     version = values[0]
     if STABLE_VERSION_PATTERN.fullmatch(version) is None:
         raise ValueError(f"package version must be an exact stable X.Y.Z version, got {version!r}")

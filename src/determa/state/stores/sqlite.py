@@ -45,9 +45,7 @@ def _schema_tokens(source: str) -> list[str]:
 
 
 class _SQLiteTransaction(ExecutionStoreTransaction):
-    def __init__(
-        self, connection: sqlite3.Connection, root_instance_id: str
-    ) -> None:
+    def __init__(self, connection: sqlite3.Connection, root_instance_id: str) -> None:
         self._connection = connection
         self._root_instance_id = root_instance_id
 
@@ -173,12 +171,8 @@ class SQLiteExecutionStore(ExecutionStore):
         ]
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(
-            self.path, timeout=self.timeout, isolation_level=None
-        )
-        journal_mode = connection.execute(
-            f"PRAGMA journal_mode = {self.journal_mode}"
-        ).fetchone()
+        connection = sqlite3.connect(self.path, timeout=self.timeout, isolation_level=None)
+        journal_mode = connection.execute(f"PRAGMA journal_mode = {self.journal_mode}").fetchone()
         connection.execute(f"PRAGMA synchronous = {self.synchronous}")
         actual_synchronous = connection.execute("PRAGMA synchronous").fetchone()
         expected_synchronous = {"FULL": 2}[self.synchronous]
@@ -216,14 +210,11 @@ class SQLiteExecutionStore(ExecutionStore):
         ):
             raise ExecutionStoreError("execution_store_schema_mismatch")
         indexes = [
-            (row[2], row[3], row[4])
-            for row in connection.execute(f"PRAGMA index_list({table})")
+            (row[2], row[3], row[4]) for row in connection.execute(f"PRAGMA index_list({table})")
         ]
         if indexes != [(1, "pk", 0)]:
             raise ExecutionStoreError("execution_store_schema_mismatch")
-        foreign_keys = connection.execute(
-            f"PRAGMA foreign_key_list({table})"
-        ).fetchall()
+        foreign_keys = connection.execute(f"PRAGMA foreign_key_list({table})").fetchall()
         if foreign_keys:
             raise ExecutionStoreError("execution_store_schema_mismatch")
 
@@ -272,11 +263,7 @@ class SQLiteExecutionStore(ExecutionStore):
             raise ExecutionStoreError("execution_store_schema_mismatch")
         for name, table, source in rows:
             expected_source = expected.get(name)
-            expected_table = (
-                _TABLE
-                if name == _CHECKPOINT_DELETE_TRIGGER
-                else _METADATA_TABLE
-            )
+            expected_table = _TABLE if name == _CHECKPOINT_DELETE_TRIGGER else _METADATA_TABLE
             if (
                 table != expected_table
                 or not isinstance(source, str)
@@ -330,8 +317,7 @@ class SQLiteExecutionStore(ExecutionStore):
             """,
         )
         rows = connection.execute(
-            f"SELECT schema_key, schema_value FROM {_METADATA_TABLE} "
-            "ORDER BY schema_key"
+            f"SELECT schema_key, schema_value FROM {_METADATA_TABLE} ORDER BY schema_key"
         ).fetchall()
         if rows != self._metadata_rows():
             raise ExecutionStoreError("execution_store_schema_mismatch")
@@ -372,8 +358,7 @@ class SQLiteExecutionStore(ExecutionStore):
             tables = {
                 row[0]
                 for row in connection.execute(
-                    "SELECT name FROM sqlite_master "
-                    "WHERE type = 'table' AND name IN (?, ?)",
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?, ?)",
                     (_TABLE, _METADATA_TABLE),
                 )
             }
@@ -397,8 +382,7 @@ class SQLiteExecutionStore(ExecutionStore):
                     """
                 )
                 connection.executemany(
-                    f"INSERT INTO {_METADATA_TABLE} (schema_key, schema_value) "
-                    "VALUES (?, ?)",
+                    f"INSERT INTO {_METADATA_TABLE} (schema_key, schema_value) VALUES (?, ?)",
                     self._metadata_rows(),
                 )
                 connection.execute(
@@ -457,9 +441,7 @@ def _single_query(query: Mapping[str, list[str]], key: str, default: str) -> str
     return values[0]
 
 
-def sqlite_execution_store_factory(
-    uri: str, configuration: Mapping[str, Any]
-) -> ExecutionStore:
+def sqlite_execution_store_factory(uri: str, configuration: Mapping[str, Any]) -> ExecutionStore:
     """Create the ordinary bundled SQLite adapter."""
     parsed = urlsplit(uri)
     if (

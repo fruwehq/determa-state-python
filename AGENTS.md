@@ -69,6 +69,7 @@ Layout:
 ```sh
 python -m pip install -e '.[dev]'
 ruff check .
+ruff format --check .
 mypy src/determa
 pytest -q
 DETERMA_CONFORMANCE_DIR=/path/to/conformance \
@@ -79,7 +80,7 @@ pytest conformance -q
 DETERMA_POSTGRESQL_DSN=postgresql://... pytest tests/test_postgresql_store.py -q
 ```
 
-`make check` runs lint, type checking, and unit tests. `make conformance` fetches or
+`make check` runs lint, formatting, type checking, and unit tests. `make conformance` fetches or
 reuses the immutable inputs recorded in `conformance/pins.py`.
 
 ## Release

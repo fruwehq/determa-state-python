@@ -25,9 +25,7 @@ def test_nonportable_categories_are_not_exported() -> None:
 
 
 def test_public_code_definitions_are_immutable_strings() -> None:
-    code_types = [
-        getattr(ds, name) for name in ds.__all__ if name.endswith("Code")
-    ]
+    code_types = [getattr(ds, name) for name in ds.__all__ if name.endswith("Code")]
     assert code_types
     for code_type in code_types:
         member = next(iter(code_type))

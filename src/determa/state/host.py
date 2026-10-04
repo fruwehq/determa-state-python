@@ -72,12 +72,7 @@ def _checkpoint_number(value: Any) -> int:
         or len(value) > _MAX_DECIMAL_DIGITS
         or (
             value != "0"
-            and (
-                not value
-                or value[0] == "0"
-                or not value.isascii()
-                or not value.isdigit()
-            )
+            and (not value or value[0] == "0" or not value.isascii() or not value.isdigit())
         )
     ):
         raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
@@ -104,11 +99,7 @@ def creation_request_digest(
     """Compute one canonical creation operation identity."""
     validated = bundle if isinstance(bundle, Bundle) else load_bundle(bundle)
     machine = next(
-        (
-            item
-            for item in validated.raw["machines"]
-            if item["machine_id"] == machine_id
-        ),
+        (item for item in validated.raw["machines"] if item["machine_id"] == machine_id),
         None,
     )
     machine_version = "0" if machine is None else str(machine["version"])
@@ -228,25 +219,20 @@ def _required_backup_artifacts(
             for key, member in item.items():
                 if key in _BACKUP_DEFINITION_DIGEST_FIELDS and isinstance(member, str):
                     definitions.add(member)
-                elif key in _BACKUP_DESCRIPTOR_DIGEST_FIELDS and isinstance(
-                    member, str
-                ):
+                elif key in _BACKUP_DESCRIPTOR_DIGEST_FIELDS and isinstance(member, str):
                     descriptors.add(member)
-                elif key == "migration_descriptor_digest_route" and isinstance(
-                    member, Sequence
-                ) and not isinstance(member, str | bytes):
-                    descriptors.update(
-                        digest for digest in member if isinstance(digest, str)
-                    )
+                elif (
+                    key == "migration_descriptor_digest_route"
+                    and isinstance(member, Sequence)
+                    and not isinstance(member, str | bytes)
+                ):
+                    descriptors.update(digest for digest in member if isinstance(digest, str))
                 visit(member)
         elif isinstance(item, Sequence) and not isinstance(item, str | bytes):
             for member in item:
                 visit(member)
 
-    if (
-        isinstance(value, Mapping)
-        and value.get("execution_checkpoint_schema_version") == 2
-    ):
+    if isinstance(value, Mapping) and value.get("execution_checkpoint_schema_version") == 2:
         aggregate = value.get("root_record", {}).get("aggregate_state")
         if aggregate is not None:
             visit(aggregate)
@@ -262,13 +248,7 @@ def _required_backup_artifacts(
                 )
             outcome = receipt.get("outcome")
             if isinstance(outcome, Mapping) and "migration_descriptor_digest" in outcome:
-                visit(
-                    {
-                        "migration_descriptor_digest": outcome[
-                            "migration_descriptor_digest"
-                        ]
-                    }
-                )
+                visit({"migration_descriptor_digest": outcome["migration_descriptor_digest"]})
     else:
         visit(value)
     return frozenset(definitions), frozenset(descriptors)
@@ -289,9 +269,8 @@ def _validate_required_backup_artifacts(
     definitions, descriptors = _required_backup_artifacts(value)
     try:
         for fingerprint in definitions:
-            if (
-                fingerprint not in trusted_artifact_digests
-                or not resolver.definition_is_trusted(fingerprint)
+            if fingerprint not in trusted_artifact_digests or not resolver.definition_is_trusted(
+                fingerprint
             ):
                 raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
             source = resolver.resolve_definition(fingerprint)
@@ -310,9 +289,7 @@ def _validate_required_backup_artifacts(
             descriptor_source = resolver.resolve_migration_descriptor(digest)
             if descriptor_source is None:
                 raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
-            descriptor, _ = load_json_artifact(
-                descriptor_source, "migration_descriptor_v2"
-            )
+            descriptor, _ = load_json_artifact(descriptor_source, "migration_descriptor_v2")
             if migration_descriptor_digest(descriptor) != digest:
                 raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
     except DetermaError as exc:
@@ -330,9 +307,7 @@ def validate_host_profile(
     """Validate one composed checkpoint-host profile without name inference."""
     capabilities = store.capabilities
     checkpoint_retention_mode = store.checkpoint_retention_mode
-    durable = bool(
-        {DURABLE_SINGLE_WRITER, DURABLE_CONCURRENT}.intersection(capabilities)
-    )
+    durable = bool({DURABLE_SINGLE_WRITER, DURABLE_CONCURRENT}.intersection(capabilities))
     common = durable and ROOT_IDENTITY_RETENTION in capabilities
     atomic = "atomic_accept_process" in host_features
     valid = False
@@ -431,9 +406,7 @@ class ExecutionHost:
         *,
         required_capabilities: set[str] | frozenset[str] = frozenset(),
         profile: str | None = None,
-        host_features: set[str] | frozenset[str] = frozenset(
-            {"atomic_accept_process"}
-        ),
+        host_features: set[str] | frozenset[str] = frozenset({"atomic_accept_process"}),
         fault_injector: FaultInjector | None = None,
     ) -> None:
         if not required_capabilities.issubset(store.capabilities):
@@ -457,9 +430,7 @@ class ExecutionHost:
         configuration: Mapping[str, Any] | None = None,
         required_capabilities: set[str] | frozenset[str] = frozenset(),
         profile: str | None = None,
-        host_features: set[str] | frozenset[str] = frozenset(
-            {"atomic_accept_process"}
-        ),
+        host_features: set[str] | frozenset[str] = frozenset({"atomic_accept_process"}),
         fault_injector: FaultInjector | None = None,
     ) -> ExecutionHost:
         store = registry.resolve(
@@ -535,9 +506,7 @@ class ExecutionHost:
         ):
             if store_transaction.root_instance_id != root_instance_id:
                 raise ExecutionHostError("transaction_root_mismatch")
-            shared = SharedExecutionTransaction(
-                self._bound(store_transaction), root_instance_id
-            )
+            shared = SharedExecutionTransaction(self._bound(store_transaction), root_instance_id)
             try:
                 callback(native_transaction, shared)
                 response = shared._finish()
@@ -561,9 +530,7 @@ class ExecutionHost:
     def _stage_insert(
         self, transaction: ExecutionStoreTransaction, candidate: dict[str, Any]
     ) -> None:
-        self._restore(
-            serialize_execution_checkpoint(candidate), candidate["root_instance_id"]
-        )
+        self._restore(serialize_execution_checkpoint(candidate), candidate["root_instance_id"])
         self._fault("before_commit")
         if not transaction.insert(serialize_execution_checkpoint(candidate)):
             raise ExecutionHostError(HostCode.CHECKPOINT_REVISION_CONFLICT)
@@ -574,9 +541,7 @@ class ExecutionHost:
         previous: Mapping[str, Any],
         candidate: dict[str, Any],
     ) -> None:
-        self._restore(
-            serialize_execution_checkpoint(candidate), candidate["root_instance_id"]
-        )
+        self._restore(serialize_execution_checkpoint(candidate), candidate["root_instance_id"])
         self._fault("before_commit")
         if not transaction.replace(
             previous["revision"],
@@ -612,9 +577,7 @@ class ExecutionHost:
             or len(checkpoint_members) != len(checkpoint_digests)
             or not all(isinstance(item, bytes) for item in checkpoint_members)
             or not all(isinstance(item, str) and item for item in checkpoint_digests)
-            or not all(
-                isinstance(item, str) and item for item in trusted_artifact_digests
-            )
+            or not all(isinstance(item, str) and item for item in trusted_artifact_digests)
             or set(consistency_point) != {"scope_id", "root_instance_ids"}
             or not isinstance(consistency_point["scope_id"], str)
             or not consistency_point["scope_id"]
@@ -632,9 +595,7 @@ class ExecutionHost:
             raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
 
         restored_members = []
-        for source, digest in zip(
-            checkpoint_members, checkpoint_digests, strict=True
-        ):
+        for source, digest in zip(checkpoint_members, checkpoint_digests, strict=True):
             restored = self._restore(source, checkpoint_metadata(source)[0])
             if (
                 restored.document["execution_checkpoint_digest"] != digest
@@ -642,13 +603,10 @@ class ExecutionHost:
             ):
                 raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
             restored_members.append(restored)
-        root_instance_ids = [
-            restored.document["root_instance_id"] for restored in restored_members
-        ]
-        if (
-            list(consistency_point["root_instance_ids"]) != root_instance_ids
-            or len(root_instance_ids) != len(set(root_instance_ids))
-        ):
+        root_instance_ids = [restored.document["root_instance_id"] for restored in restored_members]
+        if list(consistency_point["root_instance_ids"]) != root_instance_ids or len(
+            root_instance_ids
+        ) != len(set(root_instance_ids)):
             raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
 
         trusted = set(trusted_artifact_digests)
@@ -659,9 +617,7 @@ class ExecutionHost:
                 restored.document,
             )
         if action == "backup":
-            for source, root_instance_id in zip(
-                checkpoint_members, root_instance_ids, strict=True
-            ):
+            for source, root_instance_id in zip(checkpoint_members, root_instance_ids, strict=True):
                 with self._transaction(root_instance_id) as transaction:
                     if transaction.load() != source:
                         raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
@@ -744,14 +700,12 @@ class ExecutionHost:
             candidate = self._v2_committed_checkpoint(result)
             if (
                 candidate is not None
-                and candidate["execution_checkpoint_digest"]
-                != prior["execution_checkpoint_digest"]
+                and candidate["execution_checkpoint_digest"] != prior["execution_checkpoint_digest"]
             ):
                 self._stage_replace(transaction, prior, candidate)
         if (
             candidate is not None
-            and candidate["execution_checkpoint_digest"]
-            != prior["execution_checkpoint_digest"]
+            and candidate["execution_checkpoint_digest"] != prior["execution_checkpoint_digest"]
         ):
             self._after_commit()
         return result
@@ -782,14 +736,12 @@ class ExecutionHost:
             candidate = self._v2_committed_checkpoint(result)
             if (
                 candidate is not None
-                and candidate["execution_checkpoint_digest"]
-                != prior["execution_checkpoint_digest"]
+                and candidate["execution_checkpoint_digest"] != prior["execution_checkpoint_digest"]
             ):
                 self._stage_replace(transaction, prior, candidate)
         if (
             candidate is not None
-            and candidate["execution_checkpoint_digest"]
-            != prior["execution_checkpoint_digest"]
+            and candidate["execution_checkpoint_digest"] != prior["execution_checkpoint_digest"]
         ):
             self._after_commit()
         return result
@@ -816,9 +768,7 @@ class ExecutionHost:
                 prior,
                 delivery,
                 self.artifact_resolver,
-                target_validated_bundle_fingerprint=(
-                    target_validated_bundle_fingerprint
-                ),
+                target_validated_bundle_fingerprint=(target_validated_bundle_fingerprint),
                 migration_descriptor_digest_route=migration_descriptor_digest_route,
                 expected_revision=expected_revision,
                 expected_checkpoint_digest=expected_checkpoint_digest,
@@ -854,15 +804,9 @@ class ExecutionHost:
                 expected_revision=expected_revision,
                 expected_checkpoint_digest=expected_checkpoint_digest,
             )
-            if (
-                candidate["execution_checkpoint_digest"]
-                != prior["execution_checkpoint_digest"]
-            ):
+            if candidate["execution_checkpoint_digest"] != prior["execution_checkpoint_digest"]:
                 self._stage_replace(transaction, prior, candidate)
-        if (
-            candidate["execution_checkpoint_digest"]
-            != prior["execution_checkpoint_digest"]
-        ):
+        if candidate["execution_checkpoint_digest"] != prior["execution_checkpoint_digest"]:
             self._after_commit()
         return candidate
 
@@ -881,8 +825,8 @@ class ExecutionHost:
 
         for entry in entries:
             receipt_sequence = checkpoint["next_operation_receipt_sequence"]
-            checkpoint["next_operation_receipt_sequence"] = (
-                _increment_checkpoint_number(receipt_sequence)
+            checkpoint["next_operation_receipt_sequence"] = _increment_checkpoint_number(
+                receipt_sequence
             )
             event_id = entry["envelope"]["event_id"]
             _terminalize_mailbox_reference(checkpoint, entry, receipt_sequence)
@@ -977,12 +921,10 @@ class ExecutionHost:
             migrated = migration["aggregate_state"]
             candidate = _mutate(prior)
             candidate["root_record"]["aggregate_state"] = migrated
-            candidate["migration_audit_records"].extend(
-                copy.deepcopy(migration["audit_records"])
-            )
+            candidate["migration_audit_records"].extend(copy.deepcopy(migration["audit_records"]))
             receipt_sequence = candidate["next_operation_receipt_sequence"]
-            candidate["next_operation_receipt_sequence"] = (
-                _increment_checkpoint_number(receipt_sequence)
+            candidate["next_operation_receipt_sequence"] = _increment_checkpoint_number(
+                receipt_sequence
             )
             migration_sequences = [
                 item["migration_sequence"] for item in migration["audit_records"]
@@ -995,14 +937,10 @@ class ExecutionHost:
                 "committed_revision": candidate["revision"],
                 "source_aggregate_state_digest": source_aggregate_state_digest,
                 "target_validated_bundle_fingerprint": target_validated_bundle_fingerprint,
-                "resulting_aggregate_state_digest": migrated[
-                    "aggregate_state_digest"
-                ],
+                "resulting_aggregate_state_digest": migrated["aggregate_state_digest"],
                 "migration_sequences": migration_sequences,
                 "result_code": (
-                    "migration_applied"
-                    if migration_sequences
-                    else "migration_no_operation"
+                    "migration_applied" if migration_sequences else "migration_no_operation"
                 ),
             }
             candidate["operation_receipts"].append(receipt)
@@ -1022,9 +960,7 @@ class ExecutionHost:
                         for runtime in migrated["runtimes"]
                         if runtime["runtime_id"] == migrated["root_runtime_id"]
                     ),
-                    migration_descriptor_digest=disposition[
-                        "migration_descriptor_digest"
-                    ],
+                    migration_descriptor_digest=disposition["migration_descriptor_digest"],
                 )
             _synchronize_mailbox_references(candidate)
             candidate = seal_execution_checkpoint(candidate)
@@ -1071,9 +1007,7 @@ class ExecutionHost:
             from .queueing import _lifecycle_runtime_order, restore_aggregate_v2
 
             restored_aggregate = restore_aggregate_v2(aggregate, self.artifact_resolver)
-            runtime_by_id = {
-                runtime["runtime_id"]: runtime for runtime in aggregate["runtimes"]
-            }
+            runtime_by_id = {runtime["runtime_id"]: runtime for runtime in aggregate["runtimes"]}
             entries = [
                 entry
                 for runtime_id in _lifecycle_runtime_order(
@@ -1134,9 +1068,7 @@ class ExecutionHost:
                 raise ExecutionHostError(HostCode.EFFECT_ID_CONFLICT)
             if item["delivery_state"] == desired:
                 return {"result": "committed", "record": copy.deepcopy(item)}
-            self._check_expected(
-                checkpoint, expected_revision, expected_checkpoint_digest
-            )
+            self._check_expected(checkpoint, expected_revision, expected_checkpoint_digest)
             candidate = _mutate(checkpoint)
             candidate_item = next(
                 value
@@ -1194,9 +1126,7 @@ class ExecutionHost:
             )
             if pending is None:
                 raise ExecutionHostError(HostCode.EFFECT_ID_CONFLICT)
-            self._check_expected(
-                checkpoint, expected_revision, expected_checkpoint_digest
-            )
+            self._check_expected(checkpoint, expected_revision, expected_checkpoint_digest)
             candidate = _mutate(checkpoint)
             candidate_pending = next(
                 value
@@ -1256,9 +1186,7 @@ class ExecutionHost:
             )
             if terminal is None:
                 raise ExecutionHostError(HostCode.EFFECT_ID_CONFLICT)
-            self._check_expected(
-                checkpoint, expected_revision, expected_checkpoint_digest
-            )
+            self._check_expected(checkpoint, expected_revision, expected_checkpoint_digest)
             candidate = _mutate(checkpoint)
             candidate_terminal = next(
                 record
@@ -1304,15 +1232,12 @@ class ExecutionHost:
                 raise ExecutionHostError(PreAcceptanceCode.WRONG_ROOT)
             checkpoint = self._restore(source, root_instance_id).document
             if any(
-                emission.get("kind") == "external_outbox"
-                and emission.get("effect_id") == effect_id
+                emission.get("kind") == "external_outbox" and emission.get("effect_id") == effect_id
                 for receipt in checkpoint["operation_receipts"]
                 for emission in receipt.get("emission_references", [])
             ):
                 raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
-            self._check_expected(
-                checkpoint, expected_revision, expected_checkpoint_digest
-            )
+            self._check_expected(checkpoint, expected_revision, expected_checkpoint_digest)
             candidate = _mutate(checkpoint)
             prior_count = len(candidate["terminal_outbox_records"]) + len(
                 candidate["outbox_effect_tombstones"]
@@ -1363,10 +1288,7 @@ class ExecutionHost:
         target = copy.deepcopy(dict(target_replay_retention))
         if not validate_execution_checkpoint_member("replayRetention", target):
             raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
-        if (
-            PERMANENT_RECEIPT_RETENTION in self.store.capabilities
-            and target["mode"] != "permanent"
-        ):
+        if PERMANENT_RECEIPT_RETENTION in self.store.capabilities and target["mode"] != "permanent":
             raise ExecutionHostError(AdapterCode.ADAPTER_CAPABILITY_MISMATCH)
         with self._transaction(root_instance_id) as transaction:
             source = transaction.load()
@@ -1391,17 +1313,14 @@ class ExecutionHost:
                     raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
                 if current_cutoff is not None and (
                     target_cutoff is None
-                    or _checkpoint_number(target_cutoff)
-                    < _checkpoint_number(current_cutoff)
+                    or _checkpoint_number(target_cutoff) < _checkpoint_number(current_cutoff)
                 ):
                     raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
                 if target_cutoff is not None and _checkpoint_number(
                     target_cutoff
                 ) >= _checkpoint_number(checkpoint["next_operation_receipt_sequence"]):
                     raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
-            self._check_expected(
-                checkpoint, expected_revision, expected_checkpoint_digest
-            )
+            self._check_expected(checkpoint, expected_revision, expected_checkpoint_digest)
             candidate = _mutate(checkpoint)
             candidate["replay_retention"] = target
             if target_cutoff is not None:
@@ -1444,9 +1363,7 @@ class ExecutionHost:
                 self._stage_replace(transaction, checkpoint, candidate)
             except Exception as exc:
                 if getattr(exc, "code", None) == HostCode.INVALID_EXECUTION_CHECKPOINT:
-                    raise ExecutionHostError(
-                        HostCode.INVALID_EXECUTION_CHECKPOINT
-                    ) from exc
+                    raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT) from exc
                 raise
             response = {
                 "result": "committed",
@@ -1454,6 +1371,7 @@ class ExecutionHost:
             }
         self._after_commit()
         return response
+
 
 class SharedExecutionTransaction:
     """Root-bound staging surface for one host-owned shared transaction."""
@@ -1485,9 +1403,7 @@ class SharedExecutionTransaction:
             "tombstoned",
         }:
             failure = self._response.get("failure", {})
-            raise ExecutionHostError(
-                failure.get("code", "shared_transaction_operation_failed")
-            )
+            raise ExecutionHostError(failure.get("code", "shared_transaction_operation_failed"))
         return self._response
 
     def _deactivate(self) -> None:
@@ -1559,9 +1475,7 @@ class SharedExecutionTransaction:
             lambda: self._host.process_delivery_v2(
                 self.root_instance_id,
                 delivery,
-                target_validated_bundle_fingerprint=(
-                    target_validated_bundle_fingerprint
-                ),
+                target_validated_bundle_fingerprint=(target_validated_bundle_fingerprint),
                 migration_descriptor_digest_route=migration_descriptor_digest_route,
                 expected_revision=expected_revision,
                 expected_checkpoint_digest=expected_checkpoint_digest,
@@ -1719,6 +1633,7 @@ class SharedExecutionTransaction:
                 expected_checkpoint_digest=expected_checkpoint_digest,
             ),
         )
+
 
 def _target_root_instance_id(target: Mapping[str, Any]) -> str:
     member = next(iter(target.values()))

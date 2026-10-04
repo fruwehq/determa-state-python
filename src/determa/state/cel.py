@@ -106,9 +106,7 @@ def type_from_declaration(
     if kind == "instance_reference":
         return StaticType(
             kind,
-            machine_id=(
-                str(declaration["machine_id"]) if declaration.get("machine_id") else None
-            ),
+            machine_id=(str(declaration["machine_id"]) if declaration.get("machine_id") else None),
             nullable=bool(declaration.get("nullable")),
         )
     declared = type_from_name(kind)
@@ -194,11 +192,7 @@ def _assignable(actual: StaticType, expected: StaticType) -> bool:
         return expected.machine_id is None or actual.machine_id == expected.machine_id
     if expected.kind == "float" and actual.kind == "int":
         return True
-    if (
-        expected.kind == "instance_reference"
-        and expected.nullable
-        and actual.kind == "null"
-    ):
+    if expected.kind == "instance_reference" and expected.nullable and actual.kind == "null":
         return True
     return False
 
@@ -213,9 +207,7 @@ def _references_compatible(left: StaticType, right: StaticType) -> bool:
     if left.kind != "instance_reference" or right.kind != "instance_reference":
         return False
     return (
-        left.machine_id is None
-        or right.machine_id is None
-        or left.machine_id == right.machine_id
+        left.machine_id is None or right.machine_id is None or left.machine_id == right.machine_id
     )
 
 
@@ -248,11 +240,7 @@ def _unwrap(node: Any) -> Any:
         "primary",
         "paren_expr",
     }
-    while (
-        hasattr(node, "children")
-        and _rule(node) in wrappers
-        and len(node.children) == 1
-    ):
+    while hasattr(node, "children") and _rule(node) in wrappers and len(node.children) == 1:
         child = node.children[0]
         if not hasattr(child, "data"):
             break
@@ -402,9 +390,7 @@ class _Checker:
             return StaticType("list", element=element)
         return left
 
-    def _numeric(
-        self, left: StaticType, right: StaticType, *, modulo: bool = False
-    ) -> StaticType:
+    def _numeric(self, left: StaticType, right: StaticType, *, modulo: bool = False) -> StaticType:
         permitted = {"int"} if modulo else {"int", "float"}
         _profile(left.kind == right.kind and left.kind in permitted)
         return left
@@ -459,9 +445,7 @@ class _Checker:
                 fields=tuple(cast(Mapping[str, StaticType], self.event_fields).items()),
                 record_name="event_payload",
             )
-            return StaticType(
-                "record", fields=(("payload", payload),), record_name="event"
-            )
+            return StaticType("record", fields=(("payload", payload),), record_name="event")
         if name == "owner":
             _expect(self.owner_fields is not None, "owner is unavailable in this context")
             variables = StaticType(
@@ -469,9 +453,7 @@ class _Checker:
                 fields=tuple(cast(Mapping[str, StaticType], self.owner_fields).items()),
                 record_name="owner_variables",
             )
-            return StaticType(
-                "record", fields=(("variables", variables),), record_name="owner"
-            )
+            return StaticType("record", fields=(("variables", variables),), record_name="owner")
         result = self.scope.get(name)
         _expect(result is not None, f"unknown CEL activation name: {name}")
         return cast(StaticType, result)
@@ -503,9 +485,7 @@ class _Checker:
             key = _string_literal_value(key_node)
             if key is not None:
                 fields.append((key, value_type))
-        return StaticType(
-            "map", element=_merge_elements(values), fields=tuple(fields)
-        )
+        return StaticType("map", element=_merge_elements(values), fields=tuple(fields))
 
     def _check_member_dot(self, node: Any) -> StaticType:
         base = self.check(node.children[0])
@@ -724,9 +704,7 @@ def _portable_membership(item: Any, container: Any) -> Any:
             any(_portable_equal_value(item, candidate) for candidate in container)
         )
     if kind == "map":
-        return celtypes.BoolType(
-            any(_portable_equal_value(item, key) for key in container)
-        )
+        return celtypes.BoolType(any(_portable_equal_value(item, key) for key in container))
     raise TypeError("in requires a list or string-keyed map")
 
 

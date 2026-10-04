@@ -1,4 +1,4 @@
-.PHONY: test conformance postgresql-test lint typecheck check all sync-schema
+.PHONY: test conformance postgresql-test lint format-check typecheck check all sync-schema
 
 # Unit tests — the implementation's own suite. Hermetic and offline.
 test:
@@ -22,10 +22,13 @@ sync-schema:
 lint:
 	ruff check .
 
+format-check:
+	ruff format --check .
+
 typecheck:
 	mypy src/determa
 
 # Everything a PR needs to pass locally (unit gate), plus conformance.
-check: lint typecheck test
+check: lint format-check typecheck test
 
 all: check conformance

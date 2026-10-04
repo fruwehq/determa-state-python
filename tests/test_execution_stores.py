@@ -86,9 +86,7 @@ def test_shared_adapter_contract_round_trip(tmp_path: Path, index: int) -> None:
     host = _create(store)
     restored = host.read_checkpoint("root")
     assert restored is not None
-    replay = host.create_v2(
-        load_bundle(MACHINE), "counter", "root", "root-create", {}
-    )
+    replay = host.create_v2(load_bundle(MACHINE), "counter", "root", "root-create", {})
     assert replay["receipt"]["receipt_sequence"] == "0"
 
 
@@ -111,9 +109,7 @@ def test_adapters_commit_and_replay_keyed_v2_maintenance_receipts(
         aggregate["validated_bundle_fingerprint"],
         [],
         expected_revision=checkpoint.document["revision"],
-        expected_checkpoint_digest=checkpoint.document[
-            "execution_checkpoint_digest"
-        ],
+        expected_checkpoint_digest=checkpoint.document["execution_checkpoint_digest"],
     )
     replay = host.maintenance_migration_v2(
         "root",
@@ -121,9 +117,7 @@ def test_adapters_commit_and_replay_keyed_v2_maintenance_receipts(
         aggregate["validated_bundle_fingerprint"],
         [],
         expected_revision=checkpoint.document["revision"],
-        expected_checkpoint_digest=checkpoint.document[
-            "execution_checkpoint_digest"
-        ],
+        expected_checkpoint_digest=checkpoint.document["execution_checkpoint_digest"],
     )
 
     assert replay == committed
@@ -162,9 +156,7 @@ def test_host_rejects_checkpoint_loaded_under_another_root_key() -> None:
     source_host = _create(source_store)
     checkpoint = source_host.read_checkpoint("root")
     assert checkpoint is not None
-    mismatched_store = MemoryExecutionStore(
-        {"other-root": checkpoint.canonical_bytes}
-    )
+    mismatched_store = MemoryExecutionStore({"other-root": checkpoint.canonical_bytes})
     mismatched_host = ExecutionHost(mismatched_store, _resolver())
     with pytest.raises(ExecutionHostError) as error:
         mismatched_host.read_checkpoint("other-root")
@@ -178,9 +170,7 @@ def test_host_rejects_checkpoint_loaded_under_another_root_key() -> None:
         lambda path: SQLiteExecutionStore(path / "store.sqlite"),
     ],
 )
-def test_persistent_adapters_require_explicit_schema_setup(
-    tmp_path: Path, store_factory
-) -> None:
+def test_persistent_adapters_require_explicit_schema_setup(tmp_path: Path, store_factory) -> None:
     store = store_factory(tmp_path)
     host = ExecutionHost(store, _resolver())
     with pytest.raises(ExecutionStoreError) as error:
@@ -195,9 +185,7 @@ def test_persistent_adapters_require_explicit_schema_setup(
         lambda path: SQLiteExecutionStore(path / "store.sqlite"),
     ],
 )
-def test_file_and_sqlite_survive_adapter_restart(
-    tmp_path: Path, store_factory
-) -> None:
+def test_file_and_sqlite_survive_adapter_restart(tmp_path: Path, store_factory) -> None:
     first = store_factory(tmp_path)
     first.setup_schema()
     _create(first)
@@ -208,9 +196,7 @@ def test_file_and_sqlite_survive_adapter_restart(
 
 
 @pytest.mark.parametrize("index", range(3))
-def test_concurrent_stale_writer_cannot_overwrite(
-    tmp_path: Path, index: int
-) -> None:
+def test_concurrent_stale_writer_cannot_overwrite(tmp_path: Path, index: int) -> None:
     store = _factories(tmp_path)[index]()
     store.setup_schema()
     host = _create(store)
@@ -227,9 +213,7 @@ def test_concurrent_stale_writer_cannot_overwrite(
                 aggregate["validated_bundle_fingerprint"],
                 [],
                 expected_revision=document["revision"],
-                expected_checkpoint_digest=document[
-                    "execution_checkpoint_digest"
-                ],
+                expected_checkpoint_digest=document["execution_checkpoint_digest"],
             )
         except ExecutionHostError as exc:
             return exc.code
@@ -257,9 +241,7 @@ def test_registry_checks_configuration_before_capabilities() -> None:
 
     registry.register("custom", invalid)
     with pytest.raises(ExecutionStoreError) as error:
-        registry.resolve(
-            "custom:", required_capabilities={DURABLE_SINGLE_WRITER}
-        )
+        registry.resolve("custom:", required_capabilities={DURABLE_SINGLE_WRITER})
     assert error.value.code == "invalid_adapter_configuration"
 
 
@@ -269,15 +251,15 @@ def test_bundled_adapters_use_public_registration_and_exact_capabilities(
     registry = bundled_execution_store_registry()
     assert registry.identifiers == ("file", "memory", "postgresql", "sqlite")
     assert registry.resolve("memory:").capabilities == frozenset({EPHEMERAL})
-    assert registry.resolve(
-        f"file://{tmp_path / 'files'}"
-    ).capabilities == frozenset({RESTART_PERSISTENT})
-    assert DURABLE_SINGLE_WRITER in registry.resolve(
-        f"sqlite://{tmp_path / 'store.sqlite'}"
-    ).capabilities
+    assert registry.resolve(f"file://{tmp_path / 'files'}").capabilities == frozenset(
+        {RESTART_PERSISTENT}
+    )
+    assert (
+        DURABLE_SINGLE_WRITER
+        in registry.resolve(f"sqlite://{tmp_path / 'store.sqlite'}").capabilities
+    )
     configured_sqlite = registry.resolve(
-        f"sqlite://{tmp_path / 'strict.sqlite'}"
-        "?replay_retention=permanent&outbox_retention=strict"
+        f"sqlite://{tmp_path / 'strict.sqlite'}?replay_retention=permanent&outbox_retention=strict"
     )
     assert configured_sqlite.capabilities == frozenset({DURABLE_SINGLE_WRITER})
     assert configured_sqlite.checkpoint_retention_mode == "unverified"
@@ -292,8 +274,7 @@ def test_bundled_adapters_use_public_registration_and_exact_capabilities(
         PERMANENT_OUTBOX_TERMINAL_RETENTION,
     }.issubset(configured_sqlite.capabilities)
     reopened_sqlite = registry.resolve(
-        f"sqlite://{tmp_path / 'strict.sqlite'}"
-        "?replay_retention=permanent&outbox_retention=strict"
+        f"sqlite://{tmp_path / 'strict.sqlite'}?replay_retention=permanent&outbox_retention=strict"
     )
     reopened_sqlite.validate_schema()
     with pytest.raises(ExecutionStoreError) as sqlite_policy_mismatch:
@@ -317,9 +298,7 @@ def test_unknown_adapter_and_capability_mismatch_are_closed() -> None:
         registry.resolve("absent:")
     assert unknown.value.code == "unknown_adapter"
     with pytest.raises(ExecutionStoreError) as mismatch:
-        registry.resolve(
-            "memory:", required_capabilities={DURABLE_SINGLE_WRITER}
-        )
+        registry.resolve("memory:", required_capabilities={DURABLE_SINGLE_WRITER})
     assert mismatch.value.code == "adapter_capability_mismatch"
 
 
@@ -369,9 +348,7 @@ def test_sqlite_rejects_malformed_or_wrong_version_schema(tmp_path: Path) -> Non
     versioned = SQLiteExecutionStore(versioned_path)
     versioned.setup_schema()
     with sqlite3.connect(versioned_path) as connection:
-        connection.execute(
-            "DROP TRIGGER determa_execution_metadata_forbid_update"
-        )
+        connection.execute("DROP TRIGGER determa_execution_metadata_forbid_update")
         connection.execute(
             "UPDATE determa_execution_store_metadata SET schema_value = '3' "
             "WHERE schema_key = 'execution_checkpoint_schema_version'"
@@ -397,8 +374,7 @@ def test_sqlite_persists_policy_and_forbids_native_root_or_policy_mutation(
     with sqlite3.connect(path) as connection:
         with pytest.raises(sqlite3.IntegrityError, match="execution_store_immutable"):
             connection.execute(
-                "DELETE FROM determa_execution_checkpoints "
-                "WHERE root_instance_id = ?",
+                "DELETE FROM determa_execution_checkpoints WHERE root_instance_id = ?",
                 ("bank-root",),
             )
         with pytest.raises(sqlite3.IntegrityError, match="execution_store_immutable"):
@@ -410,9 +386,7 @@ def test_sqlite_persists_policy_and_forbids_native_root_or_policy_mutation(
 
     assert host.read_checkpoint("bank-root") is not None
     with pytest.raises(ExecutionHostError) as recreate:
-        host.create_v2(
-            load_bundle(MACHINE), "counter", "bank-root", "replacement", {}
-        )
+        host.create_v2(load_bundle(MACHINE), "counter", "bank-root", "replacement", {})
     assert recreate.value.code == "creation_id_conflict"
 
     reopened = SQLiteExecutionStore(
@@ -457,9 +431,7 @@ def test_sqlite_health_requires_immutable_policy_and_root_guards(
         PERMANENT_OUTBOX_TERMINAL_RETENTION,
     }.issubset(store.capabilities)
     with sqlite3.connect(path) as connection:
-        connection.execute(
-            "DROP TRIGGER determa_execution_checkpoints_forbid_delete"
-        )
+        connection.execute("DROP TRIGGER determa_execution_checkpoints_forbid_delete")
     assert store.health() == {"healthy": False, "schema_ready": False}
     assert _STRONG_RETENTION_CAPABILITIES.isdisjoint(store.capabilities)
     assert store.checkpoint_retention_mode == "unverified"
@@ -511,17 +483,13 @@ def test_configured_sqlite_satisfies_bank_and_outbox_profiles(
             "retain_unresolved_outbox",
         },
     )
-    checkpoint = host.create_v2(
-        load_bundle(MACHINE), "counter", "bank-root", "create", {}
-    )
+    checkpoint = host.create_v2(load_bundle(MACHINE), "counter", "bank-root", "create", {})
     assert checkpoint["result"] == "committed"
     current = host.read_checkpoint("bank-root")
     assert current is not None
     expected = {
         "expected_revision": current.document["revision"],
-        "expected_checkpoint_digest": current.document[
-            "execution_checkpoint_digest"
-        ],
+        "expected_checkpoint_digest": current.document["execution_checkpoint_digest"],
     }
     with pytest.raises(ExecutionHostError) as retention_error:
         host.update_replay_retention(

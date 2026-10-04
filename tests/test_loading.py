@@ -282,9 +282,7 @@ def test_checked_in_format_1_example_is_valid() -> None:
         ("true", "string(null)"),
     ],
 )
-def test_bundle_loading_rejects_invalid_cel_overload_types(
-    guard: str, assignment: str
-) -> None:
+def test_bundle_loading_rejects_invalid_cel_overload_types(guard: str, assignment: str) -> None:
     source = f"""
 format: 1
 namespace: example.invalid_cel_types

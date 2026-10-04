@@ -94,9 +94,7 @@ def _conformance_definitions() -> dict[str, Any]:
     return definitions
 
 
-def _resolver(
-    path: Path, request: dict[str, Any] | None = None
-) -> MemoryArtifactResolver:
+def _resolver(path: Path, request: dict[str, Any] | None = None) -> MemoryArtifactResolver:
     request = request or {}
     specification = request.get("artifact_resolver") or request.get("definition_resolver")
     if specification is None:
@@ -111,9 +109,7 @@ def _resolver(
                 descriptors[migration_descriptor_digest(document)] = document
             except ArtifactError:
                 continue
-        return MemoryArtifactResolver(
-            definitions=definitions, migration_descriptors=descriptors
-        )
+        return MemoryArtifactResolver(definitions=definitions, migration_descriptors=descriptors)
     definitions = {
         item["validated_bundle_fingerprint"]: (path / item["bundle_file"]).read_text(
             encoding="utf-8"
@@ -178,9 +174,7 @@ def _invoke(
             return restored_package.aggregate.aggregate_envelope
         if request["intent"] != "restore_and_apply_migration_route":
             raise AssertionError("unsupported restore-package intent")
-        descriptor = resolver.resolve_migration_descriptor(
-            restored_package.migration_route[-1]
-        )
+        descriptor = resolver.resolve_migration_descriptor(restored_package.migration_route[-1])
         assert descriptor is not None
         target, _ = load_json_artifact(descriptor, "migration_descriptor_v2")
         return migrate_aggregate_v2(
@@ -211,9 +205,7 @@ def _invoke(
             resolver,
             maintenance_mode=request["maintenance_mode"],
         )
-        admitted = admit_aggregate_v2(
-            migrated["aggregate_state"], [request["delivery"]], resolver
-        )
+        admitted = admit_aggregate_v2(migrated["aggregate_state"], [request["delivery"]], resolver)
         if admitted["result"] != "accepted":
             processing = {
                 "core_step_result_format": "determa.core_step_result",
@@ -290,9 +282,7 @@ def _invoke(
     raise AssertionError(f"unsupported version-2 operation: {operation}")
 
 
-def _assert_checkpoint_unchanged(
-    item: Version2Vector, observation: dict[str, Any]
-) -> None:
+def _assert_checkpoint_unchanged(item: Version2Vector, observation: dict[str, Any]) -> None:
     store = observation.get("store")
     root_instance_id = observation.get("root_instance_id")
     assert isinstance(store, MemoryExecutionStore)
@@ -322,9 +312,7 @@ def run_version2_vector(item: Version2Vector) -> None:
         actual = None
     if expected["result"] == "failure":
         assert code == expected["code"]
-        if vector["operation"] == "checkpoint_migrate_v2" and expected.get(
-            "unchanged_file"
-        ):
+        if vector["operation"] == "checkpoint_migrate_v2" and expected.get("unchanged_file"):
             _assert_checkpoint_unchanged(item, observation)
     else:
         assert code is None
@@ -358,10 +346,7 @@ def validate_version2_artifact(path: Path, artifact: dict[str, Any]) -> None:
             restore_aggregate_package(source, resolver)
         elif artifact["kind"] == "migration_descriptor_v2":
             document, _ = load_json_artifact(source, artifact["kind"])
-            if (
-                migration_descriptor_digest(document)
-                != document["migration_descriptor_digest"]
-            ):
+            if migration_descriptor_digest(document) != document["migration_descriptor_digest"]:
                 raise ArtifactError("migration_descriptor_digest_mismatch")
         elif artifact["kind"] == "core_step_result_v2":
             load_json_artifact(source, artifact["kind"])

@@ -175,16 +175,13 @@ def _rewrite_sdist(path: Path, schema: str) -> None:
 
 def _duplicate_wheel_member(path: Path, *, metadata: bool) -> None:
     with zipfile.ZipFile(path, "a") as archive:
+
         def selected(member: zipfile.ZipInfo) -> bool:
             if metadata:
                 return member.filename.endswith(".dist-info/METADATA")
             return member.filename == SCHEMA_RELATIVE_PATHS[0]
 
-        name = next(
-            member.filename
-            for member in archive.infolist()
-            if selected(member)
-        )
+        name = next(member.filename for member in archive.infolist() if selected(member))
         with warnings.catch_warnings():
             warnings.simplefilter("ignore", UserWarning)
             archive.writestr(name, b"concealed duplicate corruption")
@@ -198,6 +195,7 @@ def _duplicate_sdist_member(path: Path, *, metadata: bool) -> None:
             extracted = source.extractfile(member) if member.isfile() else None
             contents = extracted.read() if extracted is not None else None
             destination.addfile(member, io.BytesIO(contents) if contents is not None else None)
+
         def selected(member: tarfile.TarInfo) -> bool:
             if metadata:
                 return member.name.endswith("/PKG-INFO")

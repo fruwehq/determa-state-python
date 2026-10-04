@@ -146,8 +146,7 @@ def _check_shape_limits(
         or max(item[3] for item in metrics) > limits.maximum_string_utf8_bytes
         or len(aggregate["runtimes"]) > limits.maximum_runtimes
         or any(
-            len(runtime["active_state_activations"])
-            > limits.maximum_active_states_per_runtime
+            len(runtime["active_state_activations"]) > limits.maximum_active_states_per_runtime
             for runtime in aggregate["runtimes"]
         )
         or any(
@@ -172,9 +171,7 @@ def _descriptor_static_requirements(
     if rule_count > limits.maximum_descriptor_rules:
         raise ArtifactError(PersistenceCode.MIGRATION_RESOURCE_LIMIT_EXCEEDED)
     expressions = {
-        rule["expression"]
-        for rule in descriptor["mappings"]["variables"]
-        if "expression" in rule
+        rule["expression"] for rule in descriptor["mappings"]["variables"] if "expression" in rule
     }
     expression_bytes = sum(len(expression.encode("utf-8")) for expression in expressions)
     ast_nodes = sum(_ast_nodes(cel._tree(expression)) for expression in expressions)
@@ -192,10 +189,7 @@ def _descriptor_static_requirements(
 def _pointer_parts(pointer: str) -> list[str]:
     if not pointer.startswith("/"):
         raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)
-    return [
-        item.replace("~1", "/").replace("~0", "~")
-        for item in pointer[1:].split("/")
-    ]
+    return [item.replace("~1", "/").replace("~0", "~") for item in pointer[1:].split("/")]
 
 
 def _pointer_get(document: Any, pointer: str) -> Any:
@@ -325,15 +319,11 @@ def _validate_descriptor_semantics(
         raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)
     mappings = descriptor["mappings"]
     if descriptor["mode"] == "compatible":
-        if (
-            descriptor["source_aggregate_shape_fingerprint"]
-            != descriptor["target_aggregate_shape_fingerprint"]
-            or any(mappings.values())
-        ):
+        if descriptor["source_aggregate_shape_fingerprint"] != descriptor[
+            "target_aggregate_shape_fingerprint"
+        ] or any(mappings.values()):
             raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)
-    _unique_mapping(
-        mappings["machines"], "source_definition_pointer", "target_definition_pointer"
-    )
+    _unique_mapping(mappings["machines"], "source_definition_pointer", "target_definition_pointer")
     _unique_mapping(
         mappings["components"],
         "source_component_definition_pointer",
@@ -361,13 +351,8 @@ def _validate_descriptor_semantics(
     consumed: set[str] = set()
     produced: set[str] = set()
     for rule in mappings["variables"]:
-        sources = (
-            rule.get("source_declaration_pointers")
-            or (
-                [rule["source_declaration_pointer"]]
-                if "source_declaration_pointer" in rule
-                else []
-            )
+        sources = rule.get("source_declaration_pointers") or (
+            [rule["source_declaration_pointer"]] if "source_declaration_pointer" in rule else []
         )
         target = rule.get("target_declaration_pointer")
         if any(source in consumed for source in sources) or (
@@ -405,9 +390,7 @@ def _validate_descriptor_semantics(
     _descriptor_static_requirements(descriptor, limits)
 
 
-def _resolve_descriptor(
-    resolver: ArtifactResolver, digest: str
-) -> tuple[dict[str, Any], bytes]:
+def _resolve_descriptor(resolver: ArtifactResolver, digest: str) -> tuple[dict[str, Any], bytes]:
     source = resolver.resolve_migration_descriptor(digest)
     if source is None:
         raise ArtifactError(PersistenceCode.MIGRATION_ROUTE_MISMATCH)
@@ -456,9 +439,7 @@ def _compatible_candidate(
     candidate["validated_bundle_fingerprint"] = target_bundle.fingerprint
     candidate["namespace"] = target_bundle.namespace
     for runtime in candidate["runtimes"]:
-        runtime["current_definition"]["validated_bundle_fingerprint"] = (
-            target_bundle.fingerprint
-        )
+        runtime["current_definition"]["validated_bundle_fingerprint"] = target_bundle.fingerprint
         runtime["current_definition"]["machine"]["namespace"] = target_bundle.namespace
     candidate["migration_sequence"] = str(decimal(candidate["migration_sequence"]) + 1)
     candidate["aggregate_state_digest"] = aggregate_state_digest(candidate)
@@ -509,9 +490,7 @@ def _mapped_active(
     targets: list[str] = []
     for leaf in runtime["active_leaf_state_definition_pointers"]:
         matching = [
-            rule
-            for rule in active_rules
-            if rule["source_leaf_state_definition_pointer"] == leaf
+            rule for rule in active_rules if rule["source_leaf_state_definition_pointer"] == leaf
         ]
         if len(matching) != 1:
             raise ArtifactError(
@@ -531,9 +510,7 @@ def _mapped_active(
     pointer_map: dict[str, str] = {}
     for rule in counter_rules:
         if rule["operation"] == "map":
-            pointer_map[rule["source_definition_pointer"]] = rule[
-                "target_definition_pointer"
-            ]
+            pointer_map[rule["source_definition_pointer"]] = rule["target_definition_pointer"]
     target_ancestors = _active_ancestor_pointers(target_machine, targets)
     activations: list[dict[str, Any]] = []
     for target in target_ancestors:
@@ -560,7 +537,7 @@ def _target_variable_pointers(
     result: dict[str, str] = {}
     for activation in active_activations:
         state = states[activation["state_definition_pointer"]]
-        for name in (state.raw.get("variables") or {}):
+        for name in state.raw.get("variables") or {}:
             pointer = f"{state.pointer}/variables/{_escape_pointer(name)}"
             result[pointer] = activation["activation_sequence"]
     return result
@@ -588,13 +565,8 @@ def _transform_variables(
     for rule in descriptor["mappings"]["variables"]:
         operation = rule["operation"]
         target = rule.get("target_declaration_pointer")
-        sources = (
-            rule.get("source_declaration_pointers")
-            or (
-                [rule["source_declaration_pointer"]]
-                if "source_declaration_pointer" in rule
-                else []
-            )
+        sources = rule.get("source_declaration_pointers") or (
+            [rule["source_declaration_pointer"]] if "source_declaration_pointer" in rule else []
         )
         applicable_sources = [source_values.get(pointer) for pointer in sources]
         if operation == "drop":
@@ -652,9 +624,7 @@ def _transform_history(
     target_machine: MachineModel,
     descriptor: dict[str, Any],
 ) -> list[dict[str, Any]]:
-    source = {
-        item["history_declaration_pointer"]: item for item in runtime["history"]
-    }
+    source = {item["history_declaration_pointer"]: item for item in runtime["history"]}
     consumed: set[str] = set()
     produced: dict[str, dict[str, Any]] = {}
     for rule in descriptor["mappings"]["history"]:
@@ -702,9 +672,7 @@ def _component_counter_transform(
     items: list[dict[str, Any]], component_rules: list[dict[str, Any]]
 ) -> list[dict[str, Any]]:
     mapping = {
-        rule["source_component_definition_pointer"]: rule[
-            "target_component_definition_pointer"
-        ]
+        rule["source_component_definition_pointer"]: rule["target_component_definition_pointer"]
         for rule in component_rules
     }
     result = []
@@ -755,8 +723,7 @@ def _transform_candidate(
         mappings["machines"], "source_definition_pointer", "target_definition_pointer"
     )
     component_mapping = {
-        rule["source_component_definition_pointer"]: rule
-        for rule in mappings["components"]
+        rule["source_component_definition_pointer"]: rule for rule in mappings["components"]
     }
     owned_mapping = {
         (rule["source_spawn_action_pointer"], rule["source_machine_id"]): rule
@@ -817,9 +784,7 @@ def _transform_candidate(
         runtime["active_leaf_state_definition_pointers"] = leaves
         runtime["active_state_activations"] = activations
         runtime["variables"] = variables
-        runtime["history"] = _transform_history(
-            runtime, target_machine_model, descriptor
-        )
+        runtime["history"] = _transform_history(runtime, target_machine_model, descriptor)
         runtime["next_state_activation_sequences"] = _counter_transform(
             runtime["next_state_activation_sequences"], mappings["counters"]
         )
@@ -830,17 +795,12 @@ def _transform_candidate(
         total_transformed_bytes += transformed_bytes
         total_evaluation_steps += evaluation_steps
     requirements = descriptor["resource_requirements"]
-    if (
-        total_transformed_bytes
-        > min(
-            limits.maximum_transformed_output_bytes,
-            decimal(requirements["maximum_transformed_output_bytes"]),
-        )
-        or total_evaluation_steps
-        > min(
-            limits.maximum_cel_evaluation_steps,
-            decimal(requirements["maximum_cel_evaluation_steps"]),
-        )
+    if total_transformed_bytes > min(
+        limits.maximum_transformed_output_bytes,
+        decimal(requirements["maximum_transformed_output_bytes"]),
+    ) or total_evaluation_steps > min(
+        limits.maximum_cel_evaluation_steps,
+        decimal(requirements["maximum_cel_evaluation_steps"]),
     ):
         raise ArtifactError(PersistenceCode.MIGRATION_RESOURCE_LIMIT_EXCEEDED)
     root = next(
@@ -851,9 +811,7 @@ def _transform_candidate(
     candidate["validated_bundle_fingerprint"] = target_bundle.fingerprint
     candidate["namespace"] = target_bundle.namespace
     candidate["root_machine_id"] = root["current_definition"]["machine"]["machine_id"]
-    candidate["root_machine_version"] = root["current_definition"]["machine"][
-        "machine_version"
-    ]
+    candidate["root_machine_version"] = root["current_definition"]["machine"]["machine_version"]
     candidate["migration_sequence"] = str(decimal(candidate["migration_sequence"]) + 1)
     candidate["aggregate_state_digest"] = aggregate_state_digest(candidate)
     return candidate
@@ -882,9 +840,7 @@ def _apply_descriptor(
     candidate = (
         _compatible_candidate(source, target_bundle)
         if descriptor["mode"] == "compatible"
-        else _transform_candidate(
-            source, source_bundle, target_bundle, descriptor, limits
-        )
+        else _transform_candidate(source, source_bundle, target_bundle, descriptor, limits)
     )
     restore_aggregate(canonical_bytes(candidate), artifact_resolver)
     return candidate
@@ -932,8 +888,7 @@ def migrate_aggregate(
         ]
         descriptors = [item[0] for item in descriptors_with_bytes]
         if (
-            descriptors[0]["source_validated_bundle_fingerprint"]
-            != restored.bundle.fingerprint
+            descriptors[0]["source_validated_bundle_fingerprint"] != restored.bundle.fingerprint
             or descriptors[-1]["target_validated_bundle_fingerprint"]
             != target_validated_bundle_fingerprint
             or any(
@@ -944,8 +899,7 @@ def migrate_aggregate(
         ):
             raise ArtifactError(PersistenceCode.MIGRATION_ROUTE_MISMATCH)
         fingerprints = [descriptors[0]["source_validated_bundle_fingerprint"]] + [
-            descriptor["target_validated_bundle_fingerprint"]
-            for descriptor in descriptors
+            descriptor["target_validated_bundle_fingerprint"] for descriptor in descriptors
         ]
         if len(set(fingerprints)) != len(fingerprints):
             raise ArtifactError(PersistenceCode.MIGRATION_ROUTE_MISMATCH)
@@ -958,9 +912,7 @@ def migrate_aggregate(
             )
             for index, fingerprint in enumerate(fingerprints)
         ]
-        _check_shape_limits(
-            restored.aggregate_envelope, definitions, descriptors, limits
-        )
+        _check_shape_limits(restored.aggregate_envelope, definitions, descriptors, limits)
         candidate = copy.deepcopy(restored.aggregate_envelope)
         audits: list[dict[str, Any]] = []
         for index, descriptor in enumerate(descriptors):
@@ -986,13 +938,9 @@ def migrate_aggregate(
                     "target_validated_bundle_fingerprint": descriptor[
                         "target_validated_bundle_fingerprint"
                     ],
-                    "migration_descriptor_digest": descriptor[
-                        "migration_descriptor_digest"
-                    ],
+                    "migration_descriptor_digest": descriptor["migration_descriptor_digest"],
                     "source_aggregate_state_digest": before_digest,
-                    "target_aggregate_state_digest": candidate[
-                        "aggregate_state_digest"
-                    ],
+                    "target_aggregate_state_digest": candidate["aggregate_state_digest"],
                     "result_code": "migration_applied",
                 }
             )

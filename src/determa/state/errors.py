@@ -28,9 +28,7 @@ class ValidationError(DetermaError):
         self.code = normalized_code
         self.path = path
         self.message = message or normalized_code
-        self.errors = [
-            ErrorRecord(code=normalized_code, path=path, message=self.message)
-        ]
+        self.errors = [ErrorRecord(code=normalized_code, path=path, message=self.message)]
         super().__init__(self.message)
 
 
