@@ -12,6 +12,7 @@ import yaml
 from jsonschema import Draft202012Validator
 from referencing import Resource
 
+import determa.state.checkpoint_v1 as checkpoint_module
 from determa.state import (
     PORTABLE_CODE_SETS,
     ExecutionHost,
@@ -27,6 +28,7 @@ from determa.state.host import (
     _required_backup_artifacts,
     _validate_required_backup_artifacts,
 )
+from determa.state.persistence import PersistenceHost
 from determa.state.validator import schema as bundled_schema
 from determa.state.wire import (
     _schema_registry,
@@ -35,7 +37,11 @@ from determa.state.wire import (
     migration_descriptor_digest,
 )
 
-from .durable_host import durable_host_vectors, run_durable_host_vector
+from .durable_host import (
+    _BrokerAcknowledgementAdapter,
+    durable_host_vectors,
+    run_durable_host_vector,
+)
 from .harness import CORE_DIR, CoreCase, conformance_root, core_cases, run_case
 from .version1 import (
     _assert_checkpoint_unchanged,
@@ -472,6 +478,74 @@ def test_durable_host_rejects_malformed_outbox_response(
         return forged
 
     monkeypatch.setattr(ExecutionHost, "update_pending_outbox", malformed_response)
+    with pytest.raises(AssertionError):
+        run_durable_host_vector(item)
+
+
+@pytest.mark.parametrize("sabotage", ["core_call", "checkpoint_mutation"])
+def test_contract_gate_observes_production_effects(
+    monkeypatch: pytest.MonkeyPatch, sabotage: str
+) -> None:
+    item = next(
+        item for item in durable_host_vectors() if item.vector["name"] == "permanent_backup"
+    )
+    original = ExecutionHost.validate_backup_restore_v1
+
+    def altered(self, **kwargs):
+        response = original(self, **kwargs)
+        source = json.loads(kwargs["checkpoint_members"][0])
+        root_id = source["root_instance_id"]
+        if sabotage == "core_call":
+            probe = load_bundle(
+                "format: 1\nnamespace: test.contract_probe\nmachines:\n"
+                "  - machine_id: probe\n    version: 1\n    root:\n      type: final\n"
+            )
+            checkpoint_module.create_aggregate_v1(probe, "probe", "probe-root", "probe-create")
+        else:
+            source["unexpected_store_change"] = True
+            assert isinstance(self.store, MemoryExecutionStore)
+            self.store._records[root_id] = json.dumps(source).encode("utf-8")
+        return response
+
+    monkeypatch.setattr(ExecutionHost, "validate_backup_restore_v1", altered)
+    with pytest.raises(AssertionError):
+        run_durable_host_vector(item)
+
+
+def test_contract_gate_observes_unexpected_acknowledgement(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = next(
+        item for item in durable_host_vectors() if item.vector["name"] == "permanent_backup"
+    )
+    monkeypatch.setattr(_BrokerAcknowledgementAdapter, "acknowledged", lambda *_: True)
+    with pytest.raises(AssertionError):
+        run_durable_host_vector(item)
+
+
+def test_persistence_no_response_requires_call_to_abort(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = next(
+        item
+        for item in durable_host_vectors()
+        if item.vector["name"] == "persistence_crash_after_commit"
+    )
+    original = PersistenceHost.process_v1
+
+    def unexpected_reply(self, request):
+        try:
+            return original(self, request)
+        except ExecutionHostError as error:
+            assert error.code == "response_lost_after_commit"
+            return {
+                "result": "committed",
+                "mutation": "atomic",
+                "core_calls": self.core_calls,
+                "broker_acknowledged": True,
+            }
+
+    monkeypatch.setattr(PersistenceHost, "process_v1", unexpected_reply)
     with pytest.raises(AssertionError):
         run_durable_host_vector(item)
 

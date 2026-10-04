@@ -135,6 +135,107 @@ def _delivery(
     }
 
 
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    [
+        ("event_id", "another-event"),
+        ("envelope_digest", "sha256:" + "0" * 64),
+        ("acceptance_sequence", "9"),
+        ("queue_sequence", "9"),
+        ("target_runtime_id", "another-runtime"),
+    ],
+)
+def test_host_process_ready_rejects_wrong_pending_identity_before_core(
+    monkeypatch: pytest.MonkeyPatch, changed_field: str, changed_value: str
+) -> None:
+    host, _store = _host()
+    bundle = load_bundle(MACHINE)
+    host.create_v1(bundle, "counter", "root", "create", {})
+    created = host.read_checkpoint("root")
+    assert created is not None
+    delivery = _delivery(created.document, "increment", "event-1", {"amount": 1})
+    host.admit_v1(
+        "root",
+        [delivery],
+        expected_revision=created.document["revision"],
+        expected_checkpoint_digest=created.document["execution_checkpoint_digest"],
+    )
+    before = host.read_checkpoint("root")
+    assert before is not None
+    aggregate = before.document["root_record"]["aggregate_state"]
+    target_runtime_id = aggregate["root_runtime_id"]
+    entry = next(
+        runtime["ready_mailbox"][0]
+        for runtime in aggregate["runtimes"]
+        if runtime["runtime_id"] == target_runtime_id
+    )
+    identity = {
+        "event_id": entry["envelope"]["event_id"],
+        "envelope_digest": entry["envelope_digest"],
+        "acceptance_sequence": entry["acceptance_sequence"],
+        "queue_sequence": entry["queue_sequence"],
+    }
+    if changed_field == "target_runtime_id":
+        target_runtime_id = changed_value
+    else:
+        identity[changed_field] = changed_value
+
+    def unexpected_core_call(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("core must not run for a mismatched request")
+
+    monkeypatch.setattr(checkpoint_v1, "step_aggregate_v1", unexpected_core_call)
+    with pytest.raises(ExecutionHostError) as error:
+        host.process_ready_v1(
+            "root",
+            target_runtime_id,
+            expected_revision=before.document["revision"],
+            expected_checkpoint_digest=before.document["execution_checkpoint_digest"],
+            **identity,
+        )
+    assert error.value.code == "event_id_conflict"
+    after = host.read_checkpoint("root")
+    assert after is not None
+    assert after.source_bytes == before.source_bytes
+
+
+@pytest.mark.parametrize(
+    "missing_field",
+    ["event_id", "envelope_digest", "acceptance_sequence", "queue_sequence"],
+)
+def test_host_process_ready_requires_complete_identity(
+    monkeypatch: pytest.MonkeyPatch, missing_field: str
+) -> None:
+    host, _store = _host()
+    bundle = load_bundle(MACHINE)
+    host.create_v1(bundle, "counter", "root", "create", {})
+    before = host.read_checkpoint("root")
+    assert before is not None
+    target_runtime_id = before.document["root_record"]["aggregate_state"]["root_runtime_id"]
+    identity = {
+        "event_id": "event-1",
+        "envelope_digest": "sha256:" + "0" * 64,
+        "acceptance_sequence": "0",
+        "queue_sequence": "0",
+    }
+    del identity[missing_field]
+
+    def unexpected_core_call(*_args: object, **_kwargs: object) -> None:
+        raise AssertionError("core must not run without complete identity")
+
+    monkeypatch.setattr(checkpoint_v1, "step_aggregate_v1", unexpected_core_call)
+    with pytest.raises(TypeError):
+        host.process_ready_v1(
+            "root",
+            target_runtime_id,
+            expected_revision=before.document["revision"],
+            expected_checkpoint_digest=before.document["execution_checkpoint_digest"],
+            **identity,
+        )
+    after = host.read_checkpoint("root")
+    assert after is not None
+    assert after.source_bytes == before.source_bytes
+
+
 def test_v1_is_the_only_supported_checkpoint_schema() -> None:
     checkpoint, resolver = _created_checkpoint()
     checkpoint["execution_checkpoint_schema_version"] = 2

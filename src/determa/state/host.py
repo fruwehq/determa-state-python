@@ -803,37 +803,67 @@ class ExecutionHost:
         *,
         expected_revision: str,
         expected_checkpoint_digest: str,
-        event_id: str | None = None,
-        envelope_digest: str | None = None,
-        acceptance_sequence: str | None = None,
-        queue_sequence: str | None = None,
+        event_id: str,
+        envelope_digest: str,
+        acceptance_sequence: str,
+        queue_sequence: str,
     ) -> dict[str, Any]:
         """Process one v1 ready head inside the store transaction."""
-        from .checkpoint_v1 import step_checkpoint_v1
+        from .checkpoint_v1 import _check_cas, step_checkpoint_v1
 
+        if not all(
+            isinstance(value, str) and value
+            for value in (event_id, envelope_digest, acceptance_sequence, queue_sequence)
+        ):
+            raise ExecutionHostError("event_id_conflict")
         with self._transaction(root_instance_id) as transaction:
             source = transaction.load()
             if source is None:
                 raise ExecutionHostError(PreAcceptanceCode.WRONG_ROOT)
             prior = self._restore(source, root_instance_id).document
-            if event_id is not None:
-                terminal = next(
+            terminal = next(
+                (
+                    receipt
+                    for receipt in prior["operation_receipts"]
+                    if receipt["operation_kind"] == "event_terminal"
+                    and receipt["event_id"] == event_id
+                ),
+                None,
+            )
+            if terminal is not None:
+                if (
+                    terminal["request_digest"] != envelope_digest
+                    or terminal["acceptance_sequence"] != acceptance_sequence
+                    or terminal["final_queue_sequence"] != queue_sequence
+                ):
+                    raise ExecutionHostError("event_id_conflict")
+                return copy.deepcopy(terminal)
+            _check_cas(prior, expected_revision, expected_checkpoint_digest)
+            aggregate = prior["root_record"].get("aggregate_state")
+            if aggregate is not None:
+                runtime = next(
                     (
-                        receipt
-                        for receipt in prior["operation_receipts"]
-                        if receipt["operation_kind"] == "event_terminal"
-                        and receipt["event_id"] == event_id
+                        entry
+                        for entry in aggregate["runtimes"]
+                        if entry["runtime_id"] == target_runtime_id
                     ),
                     None,
                 )
-                if terminal is not None:
+                if runtime is not None and runtime["ready_mailbox"]:
+                    selected = runtime["ready_mailbox"][0]
                     if (
-                        terminal["request_digest"] != envelope_digest
-                        or terminal["acceptance_sequence"] != acceptance_sequence
-                        or terminal["final_queue_sequence"] != queue_sequence
+                        selected["envelope"]["event_id"] != event_id
+                        or selected["envelope_digest"] != envelope_digest
+                        or selected["acceptance_sequence"] != acceptance_sequence
+                        or selected["queue_sequence"] != queue_sequence
                     ):
                         raise ExecutionHostError("event_id_conflict")
-                    return copy.deepcopy(terminal)
+                elif any(
+                    entry["envelope"]["event_id"] == event_id
+                    for candidate_runtime in aggregate["runtimes"]
+                    for entry in candidate_runtime["ready_mailbox"]
+                ):
+                    raise ExecutionHostError("event_id_conflict")
             result = step_checkpoint_v1(
                 prior,
                 target_runtime_id,
@@ -1565,6 +1595,10 @@ class SharedExecutionTransaction:
         *,
         expected_revision: str,
         expected_checkpoint_digest: str,
+        event_id: str,
+        envelope_digest: str,
+        acceptance_sequence: str,
+        queue_sequence: str,
     ) -> StagedExecutionResult:
         return self._stage(
             "process_ready_v1",
@@ -1573,6 +1607,10 @@ class SharedExecutionTransaction:
                 target_runtime_id,
                 expected_revision=expected_revision,
                 expected_checkpoint_digest=expected_checkpoint_digest,
+                event_id=event_id,
+                envelope_digest=envelope_digest,
+                acceptance_sequence=acceptance_sequence,
+                queue_sequence=queue_sequence,
             ),
         )
 

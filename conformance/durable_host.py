@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -362,10 +363,10 @@ def _invoke_checkpoint(
             response = host.process_ready_v1(
                 root_instance_id,
                 _runtime_id_for_target(request["target"]),
-                event_id=request.get("event_id"),
-                envelope_digest=request.get("envelope_digest"),
-                acceptance_sequence=request.get("acceptance_sequence"),
-                queue_sequence=request.get("queue_sequence"),
+                event_id=request["event_id"],
+                envelope_digest=request["envelope_digest"],
+                acceptance_sequence=request["acceptance_sequence"],
+                queue_sequence=request["queue_sequence"],
                 **expected,
             )
         elif operation == "checkpoint_prune_v1":
@@ -438,23 +439,14 @@ def _register_declared(
     return registered
 
 
-def _validated_result() -> dict[str, Any]:
-    return {
-        "result": "validated",
-        "mutation": "none",
-        "core_calls": 0,
-        "broker_acknowledged": False,
-    }
-
-
 def _invoke_contract(
-    item: DurableHostVector, request: dict[str, Any]
-) -> tuple[dict[str, Any], dict[str, Any]]:
+    item: DurableHostVector, request: dict[str, Any], observation: dict[str, Any]
+) -> dict[str, Any]:
     operation = item.vector["operation"]
     if operation == "checkpoint_inject_store_v1":
         store = _StaticStore(request["capabilities"])
         ExecutionHost(store, MemoryArtifactResolver())
-        return _validated_result(), injected_store_reference(
+        return injected_store_reference(
             store,
             request["store_adapter_identifier"],
             request["store_uri"],
@@ -464,7 +456,7 @@ def _invoke_contract(
         registry = ExecutionStoreRegistry()
         _register_declared(registry, request["existing_registrations"])
         raw = _register_declared(registry, [request["registration"]])[0]
-        return _validated_result(), raw
+        return raw
     if operation == "checkpoint_resolve_adapter_v1":
         registry = ExecutionStoreRegistry()
         _register_declared(registry, request["registrations"])
@@ -474,7 +466,7 @@ def _invoke_contract(
             required_capabilities=frozenset(request["requested_capabilities"]),
             adapter_identifier=request.get("adapter_identifier"),
         )
-        return _validated_result(), raw
+        return raw
     if operation == "checkpoint_validate_capabilities_v1":
         raw = validate_host_profile_report(
             _StaticStore(request["store_capabilities"], request["retention_mode"]),
@@ -484,7 +476,7 @@ def _invoke_contract(
             declared_capabilities=request["store_capabilities"],
             declared_host_guarantees=request["host_guarantees"],
         )
-        return _validated_result(), raw
+        return raw
     if operation == "checkpoint_scope_operation_v1":
         scope = request["scope"]
         raw = select_scope_record(
@@ -493,7 +485,7 @@ def _invoke_contract(
             request["effect_id"],
             request["store_records"],
         )
-        return _validated_result(), raw
+        return raw
     if operation == "checkpoint_backup_restore_v1":
         source_name = item.vector.get("checkpoint_before")
         if source_name is None:
@@ -501,7 +493,9 @@ def _invoke_contract(
         source = (item.path / source_name).read_bytes()
         checkpoint = restore_execution_checkpoint_v1(source, _resolver(item.path, request))
         root_instance_id = checkpoint.document["root_instance_id"]
-        store = MemoryExecutionStore({root_instance_id: source})
+        store = observation["store"]
+        assert isinstance(store, MemoryExecutionStore)
+        assert observation["root_instance_id"] == root_instance_id
         host = ExecutionHost(store, _resolver(item.path, request))
         raw = host.validate_backup_restore_v1(
             action=request["action"],
@@ -515,8 +509,38 @@ def _invoke_contract(
                 "root_instance_ids": [root_instance_id],
             },
         )
-        return _validated_result(), raw
+        return raw
     raise AssertionError(f"unsupported durable-host contract operation: {operation}")
+
+
+@contextmanager
+def _observe_contract_core_calls(observation: dict[str, Any]) -> Any:
+    originals = (
+        checkpoint_module.create_aggregate_v1,
+        checkpoint_module.admit_aggregate_v1,
+        checkpoint_module.step_aggregate_v1,
+    )
+
+    def observe(original: Any) -> Any:
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            observation["core_calls"] += 1
+            return original(*args, **kwargs)
+
+        return wrapped
+
+    (
+        checkpoint_module.create_aggregate_v1,
+        checkpoint_module.admit_aggregate_v1,
+        checkpoint_module.step_aggregate_v1,
+    ) = tuple(observe(original) for original in originals)
+    try:
+        yield
+    finally:
+        (
+            checkpoint_module.create_aggregate_v1,
+            checkpoint_module.admit_aggregate_v1,
+            checkpoint_module.step_aggregate_v1,
+        ) = originals
 
 
 def run_durable_host_vector(item: DurableHostVector) -> None:
@@ -538,9 +562,30 @@ def run_durable_host_vector(item: DurableHostVector) -> None:
             "checkpoint_scope_operation_v1",
             "checkpoint_validate_capabilities_v1",
         }:
-            actual, raw_response = _invoke_contract(item, request)
+            if before_bytes is not None:
+                root_instance_id = json.loads(before_bytes)["root_instance_id"]
+                contract_store = MemoryExecutionStore({root_instance_id: before_bytes})
+                observation["store"] = contract_store
+                observation["root_instance_id"] = root_instance_id
+                observation["initial_source"] = _store_bytes(contract_store, root_instance_id)
+            with _observe_contract_core_calls(observation):
+                raw_response = _invoke_contract(item, request, observation)
             assert _same_typed_json(raw_response, _raw_response(item)["body"])
-            stored = before_bytes
+            observed_store = observation.get("store")
+            observed_root = observation.get("root_instance_id")
+            stored = (
+                _store_bytes(observed_store, observed_root)
+                if isinstance(observed_store, MemoryExecutionStore)
+                and isinstance(observed_root, str)
+                else None
+            )
+            initial = observation.get("initial_source")
+            actual = {
+                "result": "validated",
+                "mutation": "none" if _same_document(stored, initial) else "atomic",
+                "core_calls": observation["core_calls"],
+                "broker_acknowledged": broker.acknowledged(request),
+            }
         else:
             response, stored, core_calls = _invoke_checkpoint(item, request, observation)
             _validate_public_response(item, request, response)
@@ -586,9 +631,13 @@ def run_durable_host_vector(item: DurableHostVector) -> None:
         )
         actual = {
             "result": result,
-            "mutation": ("atomic" if code == "response_lost_after_commit" else "none"),
+            "mutation": (
+                "none"
+                if _same_document(stored, observation.get("initial_source", before_bytes))
+                else "atomic"
+            ),
             "core_calls": core_calls,
-            "broker_acknowledged": False,
+            "broker_acknowledged": broker.acknowledged(request),
             "code": code,
         }
     result_reference = item.vector["result"]
