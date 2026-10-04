@@ -113,9 +113,7 @@ envelope = ds.portable_envelope(
 delivery = {
     "delivery_mode": "input",
     "envelope": envelope,
-    "envelope_digest": ds.delivery_request_digest(
-        "counter-42", "input", envelope
-    ),
+    "envelope_digest": ds.delivery_request_digest("counter-42", "input", envelope),
 }
 admitted = ds.admit(
     state,
@@ -128,9 +126,7 @@ assert result["status"] == "running"
 assert result["disposition"] == "handled"
 state = result["state"]
 root = next(
-    runtime
-    for runtime in state["runtimes"]
-    if runtime["runtime_id"] == state["root_runtime_id"]
+    runtime for runtime in state["runtimes"] if runtime["runtime_id"] == state["root_runtime_id"]
 )
 count = next(
     variable

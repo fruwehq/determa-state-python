@@ -368,8 +368,7 @@ def test_external_action_ordinals_are_private_core_evidence_for_checkpoint_recei
     )
     assert len(core_result["emissions"]) == 2
     assert all(
-        "_determa_v2_emission_index" not in emission
-        for emission in core_result["emissions"]
+        "_determa_v2_emission_index" not in emission for emission in core_result["emissions"]
     )
 
     admitted_checkpoint = checkpoint_v2.admit_checkpoint_v2(

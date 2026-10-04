@@ -688,9 +688,7 @@ def _enqueue_emissions(
                     provenance.get("emission_index"), int
                 ):
                     raise ArtifactError(PersistenceFailureCode.INVALID_AGGREGATE_STATE)
-                projected_emission["_determa_v2_emission_index"] = str(
-                    provenance["emission_index"]
-                )
+                projected_emission["_determa_v2_emission_index"] = str(provenance["emission_index"])
             projected.append(projected_emission)
             continue
         target = cast(Mapping[str, Any], emission["target"])
@@ -735,9 +733,7 @@ def _enqueue_emissions(
             projected.append(
                 {
                     "kind": "internal_mailbox",
-                    "emission_index": str(
-                        emission.get("_determa_v2_emission_index", 0)
-                    ),
+                    "emission_index": str(emission.get("_determa_v2_emission_index", 0)),
                     "event_id": emission["event_id"],
                     "acceptance_sequence": acceptance,
                     "queue_sequence": queue,
@@ -749,9 +745,7 @@ def _enqueue_emissions(
             projected.append(
                 {
                     "kind": "internal_disposed",
-                    "emission_index": str(
-                        emission.get("_determa_v2_emission_index", 0)
-                    ),
+                    "emission_index": str(emission.get("_determa_v2_emission_index", 0)),
                     "event_id": emission["event_id"],
                     "acceptance_sequence": acceptance,
                     "lifecycle_disposition_index": disposition_index,
@@ -1147,8 +1141,7 @@ def migrate_aggregate_v2(
     if len({item["migration_descriptor_digest"] for item in descriptors}) != len(descriptors):
         raise ArtifactError(PersistenceFailureCode.MIGRATION_ROUTE_MISMATCH)
     fingerprints = [descriptors[0]["source_validated_bundle_fingerprint"]] + [
-        descriptor["target_validated_bundle_fingerprint"]
-        for descriptor in descriptors
+        descriptor["target_validated_bundle_fingerprint"] for descriptor in descriptors
     ]
     if (
         fingerprints[0] != restored.aggregate_envelope["validated_bundle_fingerprint"]

@@ -59,9 +59,7 @@ def _request(item: DurableHostVector) -> dict[str, Any]:
     reference = item.vector.get("request")
     if reference is None:
         return copy.deepcopy(item.vector["raw_admission_request"])
-    return copy.deepcopy(
-        _pointer(_json(item.path / reference["file"]), reference["pointer"])
-    )
+    return copy.deepcopy(_pointer(_json(item.path / reference["file"]), reference["pointer"]))
 
 
 def _fault_injector(boundary: str | None) -> Any:
@@ -149,8 +147,7 @@ def _checkpoint_replayed(
         return (
             retention["mode"] == request["target_mode"]
             and retention["policy_identifier"] == request["policy_identifier"]
-            and retention["pruned_through_receipt_sequence"]
-            == request["cutoff_receipt_sequence"]
+            and retention["pruned_through_receipt_sequence"] == request["cutoff_receipt_sequence"]
         )
     if operation == "checkpoint_tombstone_v2":
         return checkpoint["root_record"]["status"] == "tombstone"
@@ -180,9 +177,7 @@ def _checkpoint_replayed(
 
 
 def _replay_evidence(checkpoint: dict[str, Any], event_id: str) -> dict[str, Any]:
-    for runtime in checkpoint["root_record"].get("aggregate_state", {}).get(
-        "runtimes", []
-    ):
+    for runtime in checkpoint["root_record"].get("aggregate_state", {}).get("runtimes", []):
         for mailbox, location in (
             ("ready_mailbox", "ready"),
             ("deferred_mailbox", "deferred"),
@@ -199,8 +194,7 @@ def _replay_evidence(checkpoint: dict[str, Any], event_id: str) -> dict[str, Any
         (
             receipt
             for receipt in checkpoint["operation_receipts"]
-            if receipt["operation_kind"] == "acceptance"
-            and receipt["event_id"] == event_id
+            if receipt["operation_kind"] == "acceptance" and receipt["event_id"] == event_id
         ),
         None,
     )
@@ -208,8 +202,7 @@ def _replay_evidence(checkpoint: dict[str, Any], event_id: str) -> dict[str, Any
         (
             receipt
             for receipt in checkpoint["operation_receipts"]
-            if receipt["operation_kind"] == "event_terminal"
-            and receipt["event_id"] == event_id
+            if receipt["operation_kind"] == "event_terminal" and receipt["event_id"] == event_id
         ),
         None,
     )
@@ -271,9 +264,7 @@ def _validate_public_response(
         assert set(response) == {"result", "checkpoint", "members"}
         assert response["result"] == "batch"
         assert response["checkpoint"] == checkpoint
-        event_ids = [
-            delivery["envelope"]["event_id"] for delivery in _deliveries(request)
-        ]
+        event_ids = [delivery["envelope"]["event_id"] for delivery in _deliveries(request)]
         assert [member.get("event_id") for member in response["members"]] == event_ids
         for member in response["members"]:
             if member.get("disposition") == "accepted":
@@ -287,18 +278,14 @@ def _validate_public_response(
                     entry["envelope"]["event_id"] == member["event_id"]
                     and entry["acceptance_sequence"] == member["acceptance_sequence"]
                     and entry["queue_sequence"] == member["queue_sequence"]
-                    for runtime in checkpoint["root_record"]["aggregate_state"][
-                        "runtimes"
-                    ]
+                    for runtime in checkpoint["root_record"]["aggregate_state"]["runtimes"]
                     for mailbox in ("ready_mailbox", "deferred_mailbox")
                     for entry in runtime[mailbox]
                 )
             else:
                 assert set(member) == {"event_id", "disposition", "evidence"}
                 assert member["disposition"] == "replay"
-                assert member["evidence"] == _replay_evidence(
-                    checkpoint, member["event_id"]
-                )
+                assert member["evidence"] == _replay_evidence(checkpoint, member["event_id"])
         return
     if operation == "checkpoint_tombstone_v2":
         assert set(response) == {"result", "tombstone"}
@@ -413,9 +400,7 @@ def _invoke_checkpoint(
                 request["bindings"],
             )
         elif operation == "checkpoint_admit_v2":
-            response = host.admit_v2(
-                root_instance_id, _deliveries(request), **expected
-            )
+            response = host.admit_v2(root_instance_id, _deliveries(request), **expected)
         elif operation == "checkpoint_step_v2":
             response = host.process_ready_v2(
                 root_instance_id,
@@ -451,9 +436,7 @@ def _invoke_checkpoint(
                 root_instance_id, request["effect_id"], outcome, **expected
             )
         elif operation == "checkpoint_compact_outbox_v2":
-            response = host.compact_outbox(
-                root_instance_id, request["effect_id"], **expected
-            )
+            response = host.compact_outbox(root_instance_id, request["effect_id"], **expected)
         elif operation == "checkpoint_delete_retained_record_v2":
             response = host.delete_retained_record(root_instance_id, **expected)
         else:
@@ -502,9 +485,7 @@ def _validated_result() -> dict[str, Any]:
 def _invoke_contract(item: DurableHostVector, request: dict[str, Any]) -> dict[str, Any]:
     operation = item.vector["operation"]
     if operation == "checkpoint_inject_store_v2":
-        ExecutionHost(
-            _StaticStore(request["capabilities"]), MemoryArtifactResolver()
-        )
+        ExecutionHost(_StaticStore(request["capabilities"]), MemoryArtifactResolver())
         return _validated_result()
     if operation == "checkpoint_register_adapter_v2":
         registry = ExecutionStoreRegistry()
@@ -545,9 +526,7 @@ def _invoke_contract(item: DurableHostVector, request: dict[str, Any]) -> dict[s
         if source_name is None:
             raise ExecutionHostError("invalid_execution_checkpoint")
         source = (item.path / source_name).read_bytes()
-        checkpoint = restore_execution_checkpoint_v2(
-            source, _resolver(item.path, request)
-        )
+        checkpoint = restore_execution_checkpoint_v2(source, _resolver(item.path, request))
         root_instance_id = checkpoint.document["root_instance_id"]
         store = MemoryExecutionStore({root_instance_id: source})
         host = ExecutionHost(store, _resolver(item.path, request))
@@ -597,9 +576,7 @@ def run_durable_host_vector(item: DurableHostVector) -> None:
                 broker.acknowledge(request)
             actual = {
                 "result": result,
-                "mutation": (
-                    "none" if _same_document(stored, initial_source) else "atomic"
-                ),
+                "mutation": ("none" if _same_document(stored, initial_source) else "atomic"),
                 "core_calls": core_calls,
                 "broker_acknowledged": broker.acknowledged(request),
             }
@@ -609,22 +586,24 @@ def run_durable_host_vector(item: DurableHostVector) -> None:
         root_instance_id = observation.get("root_instance_id")
         stored = (
             _store_bytes(store, root_instance_id)
-            if isinstance(store, MemoryExecutionStore)
-            and isinstance(root_instance_id, str)
+            if isinstance(store, MemoryExecutionStore) and isinstance(root_instance_id, str)
             else before_bytes
         )
         core_calls = getattr(error, "core_calls", observation["core_calls"])
         if hasattr(error, "stored"):
             stored = error.stored
-        result = "crashed" if code in {
-            "injected_pre_commit_failure",
-            "response_lost_after_commit",
-        } else "rejected"
+        result = (
+            "crashed"
+            if code
+            in {
+                "injected_pre_commit_failure",
+                "response_lost_after_commit",
+            }
+            else "rejected"
+        )
         actual = {
             "result": result,
-            "mutation": (
-                "atomic" if code == "response_lost_after_commit" else "none"
-            ),
+            "mutation": ("atomic" if code == "response_lost_after_commit" else "none"),
             "core_calls": core_calls,
             "broker_acknowledged": False,
             "code": code,

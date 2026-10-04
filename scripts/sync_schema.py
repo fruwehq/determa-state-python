@@ -35,8 +35,7 @@ def _fetch(name: str) -> str:
     if override:
         return (Path(override) / "schema" / name).read_text(encoding="utf-8")
     url = (
-        "https://raw.githubusercontent.com/fruwehq/determa-state-spec/"
-        f"{SPEC_COMMIT}/schema/{name}"
+        f"https://raw.githubusercontent.com/fruwehq/determa-state-spec/{SPEC_COMMIT}/schema/{name}"
     )
     try:
         with urllib.request.urlopen(url, timeout=10) as response:  # noqa: S310 (fixed host)

@@ -396,11 +396,9 @@ def _assert_emission(
 def _assert_partial(actual: Any, expected: Any, *, state: dict[str, Any] | None = None) -> None:
     if isinstance(expected, dict):
         if expected == {"normalized_double": "positive_zero"}:
-            assert (
-                type(actual) is float
-                and actual == 0.0
-                and math.copysign(1.0, actual) == 1.0
-            ), actual
+            assert type(actual) is float and actual == 0.0 and math.copysign(1.0, actual) == 1.0, (
+                actual
+            )
             return
         assert isinstance(actual, dict), (actual, expected)
         if set(expected) == {"instance_reference"}:

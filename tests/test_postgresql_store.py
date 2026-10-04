@@ -63,9 +63,7 @@ def test_postgresql_cas_and_shared_native_transaction() -> None:
                 aggregate["validated_bundle_fingerprint"],
                 [],
                 expected_revision=document["revision"],
-                expected_checkpoint_digest=document[
-                    "execution_checkpoint_digest"
-                ],
+                expected_checkpoint_digest=document["execution_checkpoint_digest"],
             )
         except ExecutionHostError as exc:
             return exc.code
@@ -77,26 +75,20 @@ def test_postgresql_cas_and_shared_native_transaction() -> None:
 
     application_table = f"determa_application_test_{uuid.uuid4().hex}"
     with psycopg.connect(store.conninfo) as connection:
-        connection.execute(
-            f"CREATE TABLE {application_table} (root_instance_id TEXT PRIMARY KEY)"
-        )
+        connection.execute(f"CREATE TABLE {application_table} (root_instance_id TEXT PRIMARY KEY)")
 
     def commit_callback(connection, execution) -> None:
         connection.execute(
             f"INSERT INTO {application_table} (root_instance_id) VALUES (%s)",
             ("shared-root",),
         )
-        staged = execution.create_v2(
-            load_bundle(MACHINE), "counter", "create", {}
-        )
+        staged = execution.create_v2(load_bundle(MACHINE), "counter", "create", {})
         assert staged == StagedExecutionResult("create_v2")
 
     committed = host.run_shared_transaction("shared-root", commit_callback)
     assert committed["result"] == "committed"
     with psycopg.connect(store.conninfo) as connection:
-        rows = connection.execute(
-            f"SELECT root_instance_id FROM {application_table}"
-        ).fetchall()
+        rows = connection.execute(f"SELECT root_instance_id FROM {application_table}").fetchall()
         value = rows[0][0]
         if isinstance(value, bytes):
             value = value.decode("ascii")
@@ -111,9 +103,7 @@ def test_postgresql_cas_and_shared_native_transaction() -> None:
     )
     migration_checkpoint = host.read_checkpoint("migration-root")
     assert migration_checkpoint is not None
-    migration_aggregate = migration_checkpoint.document["root_record"][
-        "aggregate_state"
-    ]
+    migration_aggregate = migration_checkpoint.document["root_record"]["aggregate_state"]
 
     def migrate_callback(connection, execution) -> None:
         connection.execute(
@@ -125,15 +115,11 @@ def test_postgresql_cas_and_shared_native_transaction() -> None:
             migration_aggregate["validated_bundle_fingerprint"],
             [],
             expected_revision=migration_checkpoint.document["revision"],
-            expected_checkpoint_digest=migration_checkpoint.document[
-                "execution_checkpoint_digest"
-            ],
+            expected_checkpoint_digest=migration_checkpoint.document["execution_checkpoint_digest"],
         )
         assert staged == StagedExecutionResult("maintenance_migration_v2")
 
-    migration_result = host.run_shared_transaction(
-        "migration-root", migrate_callback
-    )
+    migration_result = host.run_shared_transaction("migration-root", migrate_callback)
     assert migration_result["receipt"]["result_code"] == "migration_no_operation"
     assert host.read_checkpoint("migration-root").document["revision"] == "1"
 
@@ -149,20 +135,20 @@ def test_postgresql_cas_and_shared_native_transaction() -> None:
         host.run_shared_transaction("rolled-back-root", rollback_callback)
     assert host.read_checkpoint("rolled-back-root") is None
     with psycopg.connect(store.conninfo) as connection:
-        assert connection.execute(
-            f"SELECT root_instance_id FROM {application_table} "
-            "WHERE root_instance_id = %s",
-            ("rolled-back-root",),
-        ).fetchall() == []
+        assert (
+            connection.execute(
+                f"SELECT root_instance_id FROM {application_table} WHERE root_instance_id = %s",
+                ("rolled-back-root",),
+            ).fetchall()
+            == []
+        )
 
 
 def test_postgresql_rejects_a_malformed_existing_schema() -> None:
     psycopg = pytest.importorskip("psycopg")
     store = _store()
     with psycopg.connect(store.conninfo) as connection:
-        connection.execute(
-            f"CREATE TABLE {store.table_name} (root_instance_id TEXT PRIMARY KEY)"
-        )
+        connection.execute(f"CREATE TABLE {store.table_name} (root_instance_id TEXT PRIMARY KEY)")
     with pytest.raises(ExecutionStoreError) as error:
         store.setup_schema()
     assert error.value.code == "execution_store_schema_mismatch"
@@ -252,8 +238,7 @@ def test_postgresql_configured_permanent_strict_profile() -> None:
     )
 
 
-def test_postgresql_persists_policy_and_forbids_native_deletion(
-) -> None:
+def test_postgresql_persists_policy_and_forbids_native_deletion() -> None:
     psycopg = pytest.importorskip("psycopg")
     store = PostgreSQLExecutionStore(
         os.environ["DETERMA_POSTGRESQL_DSN"],
@@ -277,9 +262,7 @@ def test_postgresql_persists_policy_and_forbids_native_deletion(
             )
     assert host.read_checkpoint("bank-root") is not None
     with pytest.raises(ExecutionHostError) as recreate:
-        host.create_v2(
-            load_bundle(MACHINE), "counter", "bank-root", "replacement", {}
-        )
+        host.create_v2(load_bundle(MACHINE), "counter", "bank-root", "replacement", {})
     assert recreate.value.code == "creation_id_conflict"
 
     def native_delete(connection, execution) -> None:
@@ -335,9 +318,7 @@ def test_postgresql_health_requires_immutable_policy_and_root_guards() -> None:
         PERMANENT_OUTBOX_TERMINAL_RETENTION,
     }.issubset(store.capabilities)
     with psycopg.connect(store.conninfo) as connection:
-        connection.execute(
-            f"DROP TRIGGER determa_execution_store_immutable ON {store.table_name}"
-        )
+        connection.execute(f"DROP TRIGGER determa_execution_store_immutable ON {store.table_name}")
     assert store.health() == {"healthy": False, "schema_ready": False}
     assert _STRONG_RETENTION_CAPABILITIES.isdisjoint(store.capabilities)
     assert store.checkpoint_retention_mode == "unverified"

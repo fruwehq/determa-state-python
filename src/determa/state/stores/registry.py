@@ -50,9 +50,7 @@ class ExecutionStoreRegistry:
             raise
         except (TypeError, ValueError) as exc:
             raise ExecutionStoreError(AdapterCode.INVALID_ADAPTER_CONFIGURATION) from exc
-        if required_capabilities and not required_capabilities.issubset(
-            store.capabilities
-        ):
+        if required_capabilities and not required_capabilities.issubset(store.capabilities):
             raise ExecutionStoreError(AdapterCode.ADAPTER_CAPABILITY_MISMATCH)
         return store
 
@@ -74,12 +72,8 @@ def register_bundled_execution_stores(
         registry.register("postgresql", postgresql_execution_store_factory)
 
 
-def bundled_execution_store_registry(
-    *, include_postgresql: bool = True
-) -> ExecutionStoreRegistry:
+def bundled_execution_store_registry(*, include_postgresql: bool = True) -> ExecutionStoreRegistry:
     """Return a new registry populated only through public registration."""
     registry = ExecutionStoreRegistry()
-    register_bundled_execution_stores(
-        registry, include_postgresql=include_postgresql
-    )
+    register_bundled_execution_stores(registry, include_postgresql=include_postgresql)
     return registry

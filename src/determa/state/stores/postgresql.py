@@ -46,9 +46,7 @@ def _database_value(value: Any) -> Any:
 
 
 class _PostgreSQLTransaction(ExecutionStoreTransaction):
-    def __init__(
-        self, connection: Any, table_name: str, root_instance_id: str
-    ) -> None:
+    def __init__(self, connection: Any, table_name: str, root_instance_id: str) -> None:
         self._connection = connection
         self._table_name = table_name
         self._root_instance_id = root_instance_id
@@ -200,9 +198,7 @@ class PostgreSQLExecutionStore(ExecutionStore):
             """,
             (table_name,),
         ).fetchall()
-        normalized_columns = [
-            tuple(_database_value(value) for value in row) for row in columns
-        ]
+        normalized_columns = [tuple(_database_value(value) for value in row) for row in columns]
         if normalized_columns != expected_columns:
             raise ExecutionStoreError("execution_store_schema_mismatch")
         primary_key = connection.execute(
@@ -248,16 +244,12 @@ class PostgreSQLExecutionStore(ExecutionStore):
             """,
             (f"{self.guard_function}()", table_name),
         ).fetchall()
-        normalized_triggers = [
-            tuple(_database_value(value) for value in row) for row in triggers
-        ]
+        normalized_triggers = [tuple(_database_value(value) for value in row) for row in triggers]
         if (
             [_database_value(row[0]) for row in constraint_types] != ["p"]
             or index_count is None
             or index_count[0] != 1
-            or normalized_triggers != [
-                (_TRIGGER_NAME, expected_trigger_type, "A", True)
-            ]
+            or normalized_triggers != [(_TRIGGER_NAME, expected_trigger_type, "A", True)]
         ):
             raise ExecutionStoreError("execution_store_schema_mismatch")
 
@@ -273,8 +265,7 @@ class PostgreSQLExecutionStore(ExecutionStore):
         source = None if row is None else _database_value(row[0])
         if (
             not isinstance(source, str)
-            or " ".join(source.split())
-            != "BEGIN RAISE EXCEPTION 'execution_store_immutable'; END;"
+            or " ".join(source.split()) != "BEGIN RAISE EXCEPTION 'execution_store_immutable'; END;"
         ):
             raise ExecutionStoreError("execution_store_schema_mismatch")
 
@@ -303,12 +294,9 @@ class PostgreSQLExecutionStore(ExecutionStore):
             ],
         )
         rows = connection.execute(
-            f"SELECT schema_key, schema_value FROM {self.metadata_table} "
-            "ORDER BY schema_key"
+            f"SELECT schema_key, schema_value FROM {self.metadata_table} ORDER BY schema_key"
         ).fetchall()
-        normalized_rows = [
-            tuple(_database_value(value) for value in row) for row in rows
-        ]
+        normalized_rows = [tuple(_database_value(value) for value in row) for row in rows]
         if normalized_rows != self._metadata_rows():
             raise ExecutionStoreError("execution_store_schema_mismatch")
         self._validate_guard_function(connection)
@@ -326,9 +314,7 @@ class PostgreSQLExecutionStore(ExecutionStore):
         psycopg = _psycopg()
         with psycopg.connect(self.conninfo) as connection:
             self._validate_schema(connection)
-            yield _PostgreSQLTransaction(
-                connection, self.table_name, root_instance_id
-            )
+            yield _PostgreSQLTransaction(connection, self.table_name, root_instance_id)
 
     @contextmanager
     def shared_transaction(
@@ -340,9 +326,7 @@ class PostgreSQLExecutionStore(ExecutionStore):
             self._validate_schema(connection)
             yield (
                 connection,
-                _PostgreSQLTransaction(
-                    connection, self.table_name, root_instance_id
-                ),
+                _PostgreSQLTransaction(connection, self.table_name, root_instance_id),
             )
 
     def setup_schema(self) -> None:
@@ -397,8 +381,7 @@ class PostgreSQLExecutionStore(ExecutionStore):
                     """
                 )
                 connection.execute(
-                    f"ALTER TABLE {self.table_name} ENABLE ALWAYS TRIGGER "
-                    f"{_TRIGGER_NAME}"
+                    f"ALTER TABLE {self.table_name} ENABLE ALWAYS TRIGGER {_TRIGGER_NAME}"
                 )
                 connection.execute(
                     f"""
@@ -408,8 +391,7 @@ class PostgreSQLExecutionStore(ExecutionStore):
                     """
                 )
                 connection.execute(
-                    f"ALTER TABLE {self.metadata_table} ENABLE ALWAYS TRIGGER "
-                    f"{_TRIGGER_NAME}"
+                    f"ALTER TABLE {self.metadata_table} ENABLE ALWAYS TRIGGER {_TRIGGER_NAME}"
                 )
             self._validate_schema(connection)
 
@@ -438,14 +420,11 @@ def postgresql_execution_store_factory(
         "outbox_retention",
     }:
         raise ExecutionStoreError(AdapterCode.INVALID_ADAPTER_CONFIGURATION)
-    table_name = configuration.get(
-        "table_name", "determa_execution_checkpoints"
-    )
+    table_name = configuration.get("table_name", "determa_execution_checkpoints")
     replay_retention = configuration.get("replay_retention", "bounded")
     outbox_retention = configuration.get("outbox_retention", "none")
     if not all(
-        isinstance(value, str)
-        for value in (table_name, replay_retention, outbox_retention)
+        isinstance(value, str) for value in (table_name, replay_retention, outbox_retention)
     ):
         raise ExecutionStoreError(AdapterCode.INVALID_ADAPTER_CONFIGURATION)
     return PostgreSQLExecutionStore(

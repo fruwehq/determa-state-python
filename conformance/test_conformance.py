@@ -65,9 +65,9 @@ def _manifest_artifacts() -> list[tuple[Path, dict]]:
     return [
         (test_path.parent, artifact)
         for test_path in sorted(root.glob("**/test.yaml"))
-        for artifact in (
-            yaml.safe_load(test_path.read_text(encoding="utf-8")) or {}
-        ).get("artifacts", {}).get("documents", [])
+        for artifact in (yaml.safe_load(test_path.read_text(encoding="utf-8")) or {})
+        .get("artifacts", {})
+        .get("documents", [])
     ]
 
 
@@ -86,9 +86,7 @@ def _validate_manifest_artifact(path: Path, artifact: dict) -> None:
     schema_name = _CONFORMANCE_ARTIFACT_SCHEMAS[artifact["kind"]]
     schema_path = conformance_root() / "scripts" / "schemas" / schema_name
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
-    registry = _schema_registry().with_resource(
-        schema["$id"], Resource.from_contents(schema)
-    )
+    registry = _schema_registry().with_resource(schema["$id"], Resource.from_contents(schema))
     validator = Draft202012Validator(schema, registry=registry)
     try:
         document = json.loads((path / artifact["file"]).read_text(encoding="utf-8"))
@@ -132,9 +130,7 @@ def test_v2_maintenance_failure_requires_exact_unchanged_checkpoint(
         for item in version2_vectors()
         if item.vector["name"] == "native_v2_maintenance_stale_writer"
     )
-    before = json.loads(
-        (item.path / item.vector["checkpoint_before"]).read_text(encoding="utf-8")
-    )
+    before = json.loads((item.path / item.vector["checkpoint_before"]).read_text(encoding="utf-8"))
     initial = {} if stored is None else {before["root_instance_id"]: stored}
     observation = {
         "store": MemoryExecutionStore(initial),
@@ -222,9 +218,7 @@ def test_backup_manifest_requires_migration_recovery_route() -> None:
     }
     assert expected.issubset(required)
     root_instance_id = checkpoint["root_instance_id"]
-    host = ExecutionHost(
-        MemoryExecutionStore({root_instance_id: source}), _resolver(path)
-    )
+    host = ExecutionHost(MemoryExecutionStore({root_instance_id: source}), _resolver(path))
     arguments = {
         "action": "backup",
         "checkpoint_members": [source],
@@ -238,9 +232,7 @@ def test_backup_manifest_requires_migration_recovery_route() -> None:
             "root_instance_ids": [root_instance_id],
         },
     }
-    host.validate_backup_restore_v2(
-        **arguments, trusted_artifact_digests=sorted(required)
-    )
+    host.validate_backup_restore_v2(**arguments, trusted_artifact_digests=sorted(required))
     for omitted in expected:
         with pytest.raises(ExecutionHostError) as error:
             host.validate_backup_restore_v2(
@@ -261,9 +253,7 @@ def test_backup_manifest_requires_migration_recovery_route() -> None:
         ("descriptor", "mismatched"),
     ],
 )
-def test_backup_manifest_requires_restorable_artifacts(
-    artifact_kind: str, failure: str
-) -> None:
+def test_backup_manifest_requires_restorable_artifacts(artifact_kind: str, failure: str) -> None:
     path = (
         conformance_root()
         / "conformance"
@@ -353,30 +343,20 @@ def test_backup_manifest_requires_restorable_artifacts(
 
 
 def test_backup_manifest_includes_historical_fault_definition() -> None:
-    path = (
-        conformance_root()
-        / "conformance"
-        / "core"
-        / "118-version2-persistence"
-    )
+    path = conformance_root() / "conformance" / "core" / "118-version2-persistence"
     result = json.loads((path / "migration-historical-fault-result.json").read_text())
     runtime = result["aggregate_state"]["runtimes"][0]
     definitions, descriptors = _required_backup_artifacts(result)
     required = definitions | descriptors
 
     assert runtime["fault"]["definition_fingerprint"] in required
-    assert (
-        runtime["identity_origin"]["definition"]["validated_bundle_fingerprint"]
-        in required
-    )
+    assert runtime["identity_origin"]["definition"]["validated_bundle_fingerprint"] in required
     assert runtime["current_definition"]["validated_bundle_fingerprint"] in required
     assert result["audit_records"][0]["migration_descriptor_digest"] in required
 
     resolver = _resolver(path)
     _validate_required_backup_artifacts(resolver, set(required), result)
-    origin = runtime["identity_origin"]["definition"][
-        "validated_bundle_fingerprint"
-    ]
+    origin = runtime["identity_origin"]["definition"]["validated_bundle_fingerprint"]
     with pytest.raises(ExecutionHostError) as error:
         _validate_required_backup_artifacts(
             MemoryArtifactResolver(
@@ -385,8 +365,7 @@ def test_backup_manifest_includes_historical_fault_definition() -> None:
                     for fingerprint in definitions - {origin}
                 },
                 migration_descriptors={
-                    digest: resolver.resolve_migration_descriptor(digest)
-                    for digest in descriptors
+                    digest: resolver.resolve_migration_descriptor(digest) for digest in descriptors
                 },
             ),
             set(required),
@@ -400,9 +379,7 @@ def test_durable_host_rejects_malformed_outbox_response(
     monkeypatch: pytest.MonkeyPatch, malformation: str
 ) -> None:
     item = next(
-        item
-        for item in durable_host_vectors()
-        if item.vector["name"] == "outbox_retryable_failure"
+        item for item in durable_host_vectors() if item.vector["name"] == "outbox_retryable_failure"
     )
     original = ExecutionHost.update_pending_outbox
 
@@ -421,10 +398,7 @@ def test_durable_host_rejects_malformed_outbox_response(
 
 def test_portable_code_sets_match_authoritative_registry() -> None:
     vector_path = (
-        conformance_root()
-        / "conformance"
-        / "closed-code-registry"
-        / "vectors.generated.json"
+        conformance_root() / "conformance" / "closed-code-registry" / "vectors.generated.json"
     )
     vectors = json.loads(vector_path.read_text(encoding="utf-8"))
     expected = {

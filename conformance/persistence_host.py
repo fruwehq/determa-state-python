@@ -16,9 +16,7 @@ def _call_log(item: Any) -> list[str]:
     return _json(item.path / item.vector["call_log"])["calls"]
 
 
-def run_persistence_vector(
-    item: Any, request: dict[str, Any]
-) -> tuple[dict[str, Any], bytes]:
+def run_persistence_vector(item: Any, request: dict[str, Any]) -> tuple[dict[str, Any], bytes]:
     before = (item.path / item.vector["store_before"]).read_bytes()
     root_instance_id = _json(item.path / item.vector["store_before"])["checkpoint"][
         "root_instance_id"
@@ -44,11 +42,7 @@ def run_persistence_vector(
                     }
                     else "rejected"
                 ),
-                "mutation": (
-                    "atomic"
-                    if error.code == "response_lost_after_commit"
-                    else "none"
-                ),
+                "mutation": ("atomic" if error.code == "response_lost_after_commit" else "none"),
                 "core_calls": host.core_calls,
                 "broker_acknowledged": False,
                 "code": error.code,

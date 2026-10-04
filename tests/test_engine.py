@@ -63,6 +63,7 @@ def test_public_execution_api_is_queue_bearing_only() -> None:
         assert removed not in state.__all__
         assert not hasattr(state, removed)
 
+
 BINDING_BUNDLE = """
 format: 1
 namespace: example.binding
@@ -481,40 +482,44 @@ def test_normative_first_component_and_root_initialization_cause_vectors() -> No
     result = create(bundle, "turnstile", "turnstile-42", "create-7", {})
     state = result["state"]
     left = next(
-        runtime
-        for runtime in state["runtimes"].values()
-        if runtime.get("component_id") == "left"
+        runtime for runtime in state["runtimes"].values() if runtime.get("component_id") == "left"
     )
 
     assert left["runtime_id"] == (
         "sha256:43db74b6a8d6f31543f7d142fb5e25a49e33eb3bf548e7bfd20d59513778cbc3"
     )
-    assert _cause_id(
-        "root_initialization",
-        "turnstile-42",
-        state["root_runtime_id"],
-        state["root_runtime_id"],
-        "create-7",
-        0,
-        "/machines/0/root",
-        0,
-    ) == "sha256:c9e8e89a01362f40e9a74c01392d09abe2323f31c8f14f22e05bfcaf6dfac0ab"
+    assert (
+        _cause_id(
+            "root_initialization",
+            "turnstile-42",
+            state["root_runtime_id"],
+            state["root_runtime_id"],
+            "create-7",
+            0,
+            "/machines/0/root",
+            0,
+        )
+        == "sha256:c9e8e89a01362f40e9a74c01392d09abe2323f31c8f14f22e05bfcaf6dfac0ab"
+    )
 
 
 def test_identity_counter_operands_use_canonical_decimal_above_javascript_range() -> None:
     bundle = load_bundle(FINGERPRINT_BUNDLE)
     state = create(bundle, "turnstile", "turnstile-42", "create-7", {})["state"]
 
-    assert _cause_id(
-        "root_initialization",
-        "turnstile-42",
-        state["root_runtime_id"],
-        state["root_runtime_id"],
-        "create-7",
-        9007199254740993,
-        "/machines/0/root",
-        9007199254740995,
-    ) == "sha256:2df23aef5335fe81713038d71e9d1d3f5c91512d995b2175070b8ab77e20da2b"
+    assert (
+        _cause_id(
+            "root_initialization",
+            "turnstile-42",
+            state["root_runtime_id"],
+            state["root_runtime_id"],
+            "create-7",
+            9007199254740993,
+            "/machines/0/root",
+            9007199254740995,
+        )
+        == "sha256:2df23aef5335fe81713038d71e9d1d3f5c91512d995b2175070b8ab77e20da2b"
+    )
 
 
 def test_exact_internal_event_and_external_effect_identity_vectors() -> None:
@@ -538,9 +543,7 @@ def test_exact_internal_event_and_external_effect_identity_vectors() -> None:
     assert result["emissions"] == [
         {
             "event": "internal_notice",
-            "event_id": (
-                "sha256:521c9fa9e3f1d6ba7187b89f97d9a26bd118213e1ebec9a662bcaf27f96f0e9c"
-            ),
+            "event_id": ("sha256:521c9fa9e3f1d6ba7187b89f97d9a26bd118213e1ebec9a662bcaf27f96f0e9c"),
             "target": _root_target(state),
             "payload": {"value": 1},
         },
@@ -593,9 +596,7 @@ def test_dispatch_allocates_unbounded_logical_counters_with_canonical_id_operand
     result_root = result["state"]["runtimes"][state["root_runtime_id"]]
     assert result_root["state_activation_sequence"]["group"] == group_activation
     spawned = next(
-        runtime
-        for runtime in result["state"]["runtimes"].values()
-        if runtime["role"] == "spawned"
+        runtime for runtime in result["state"]["runtimes"].values() if runtime["role"] == "spawned"
     )
     first = next(
         runtime
@@ -805,9 +806,7 @@ def test_recursive_malformed_prior_state_is_rejected_atomically(corruption: str)
         if runtime["role"] == "spawned" and runtime["machine_id"] == "grandchild"
     )
     component = next(
-        runtime
-        for runtime in prior["runtimes"].values()
-        if runtime["role"] == "component"
+        runtime for runtime in prior["runtimes"].values() if runtime["role"] == "component"
     )
     if corruption == "contained_runtime_identity":
         grandchild["runtime_id"] = "corrupt-runtime-id"
@@ -1065,9 +1064,7 @@ def test_holder_association_survives_reference_clear_and_reuse() -> None:
     )
     prepared_state = prepared["state"]
     children = [
-        runtime
-        for runtime in prepared_state["runtimes"].values()
-        if runtime["role"] == "spawned"
+        runtime for runtime in prepared_state["runtimes"].values() if runtime["role"] == "spawned"
     ]
     assert _root_variables(prepared_state)["child_reference"] is None
     assert len(children) == 2
@@ -1131,9 +1128,7 @@ def test_running_descendants_of_faulted_runtime_are_frozen_and_owner_can_cancel(
         if runtime["role"] == "spawned" and runtime["machine_id"] == "grandchild"
     )
     components = [
-        runtime
-        for runtime in state["runtimes"].values()
-        if runtime["role"] == "component"
+        runtime for runtime in state["runtimes"].values() if runtime["role"] == "component"
     ]
     component = components[0]
     state = dispatch(
@@ -1284,9 +1279,7 @@ def test_runtime_completion_uses_canonical_component_and_holder_order() -> None:
     )
 
     assert result["status"] == "completed"
-    assert [
-        emission["payload"]["marker"] for emission in result["emissions"]
-    ] == [
+    assert [emission["payload"]["marker"] for emission in result["emissions"]] == [
         *(f"component-{index}" for index in range(10, -1, -1)),
         "a-spawn",
         "z-spawn",

@@ -121,9 +121,6 @@ def checkpoint_metadata(source: bytes) -> tuple[str, str, str]:
         digest = document["execution_checkpoint_digest"]
     except (ArtifactError, KeyError, TypeError) as exc:
         raise ExecutionStoreError("invalid_execution_checkpoint") from exc
-    if not all(
-        isinstance(value, str)
-        for value in (root_instance_id, revision, digest)
-    ):
+    if not all(isinstance(value, str) for value in (root_instance_id, revision, digest)):
         raise ExecutionStoreError("invalid_execution_checkpoint")
     return root_instance_id, revision, digest

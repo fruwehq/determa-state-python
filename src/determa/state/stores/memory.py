@@ -18,9 +18,7 @@ from .base import (
 
 
 class _MemoryTransaction(ExecutionStoreTransaction):
-    def __init__(
-        self, records: dict[str, bytes], root_instance_id: str
-    ) -> None:
+    def __init__(self, records: dict[str, bytes], root_instance_id: str) -> None:
         self._records = records
         self._root_instance_id = root_instance_id
         self._current = records.get(root_instance_id)
@@ -52,10 +50,7 @@ class _MemoryTransaction(ExecutionStoreTransaction):
             return False
         root_instance_id, revision, digest = checkpoint_metadata(self._current)
         candidate_root, _, _ = checkpoint_metadata(checkpoint)
-        if (
-            root_instance_id != self._root_instance_id
-            or candidate_root != self._root_instance_id
-        ):
+        if root_instance_id != self._root_instance_id or candidate_root != self._root_instance_id:
             raise ExecutionStoreError("transaction_root_mismatch")
         if (revision, digest) != (
             expected_revision,
@@ -102,9 +97,7 @@ class MemoryExecutionStore(ExecutionStore):
         return {"healthy": True, "record_count": len(self._records)}
 
 
-def memory_execution_store_factory(
-    uri: str, configuration: Mapping[str, Any]
-) -> ExecutionStore:
+def memory_execution_store_factory(uri: str, configuration: Mapping[str, Any]) -> ExecutionStore:
     """Create the ordinary bundled memory adapter."""
     if uri != "memory:" or configuration:
         from .base import ExecutionStoreError

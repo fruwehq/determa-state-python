@@ -65,8 +65,7 @@ class _DocumentCheckpointTransaction(ExecutionStoreTransaction):
         current = self.document["checkpoint"]
         if (
             current["revision"] != expected_revision
-            or current["execution_checkpoint_digest"]
-            != expected_checkpoint_digest
+            or current["execution_checkpoint_digest"] != expected_checkpoint_digest
         ):
             return False
         root_instance_id, _revision, _digest = checkpoint_metadata(checkpoint)
@@ -114,9 +113,7 @@ class MemoryDurableHostStore(DurableHostStore):
             self._documents[root_instance_id] = canonical_bytes(document)
 
     @contextmanager
-    def transaction(
-        self, root_instance_id: str
-    ) -> Iterator[ExecutionStoreTransaction]:
+    def transaction(self, root_instance_id: str) -> Iterator[ExecutionStoreTransaction]:
         with self.host_transaction(root_instance_id) as (_document, transaction):
             yield transaction
 
@@ -169,8 +166,7 @@ class SQLiteDurableHostStore(DurableHostStore):
         try:
             connection.execute("BEGIN IMMEDIATE")
             row = connection.execute(
-                "SELECT document FROM determa_durable_host_documents "
-                "WHERE root_instance_id = ?",
+                "SELECT document FROM determa_durable_host_documents WHERE root_instance_id = ?",
                 (root_instance_id,),
             ).fetchone()
             if row is None:
@@ -179,8 +175,7 @@ class SQLiteDurableHostStore(DurableHostStore):
             transaction = _DocumentCheckpointTransaction(document)
             yield document, transaction
             connection.execute(
-                "UPDATE determa_durable_host_documents SET document = ? "
-                "WHERE root_instance_id = ?",
+                "UPDATE determa_durable_host_documents SET document = ? WHERE root_instance_id = ?",
                 (canonical_bytes(document), root_instance_id),
             )
             connection.commit()
@@ -191,17 +186,14 @@ class SQLiteDurableHostStore(DurableHostStore):
             connection.close()
 
     @contextmanager
-    def transaction(
-        self, root_instance_id: str
-    ) -> Iterator[ExecutionStoreTransaction]:
+    def transaction(self, root_instance_id: str) -> Iterator[ExecutionStoreTransaction]:
         with self.host_transaction(root_instance_id) as (_document, transaction):
             yield transaction
 
     def snapshot(self, root_instance_id: str) -> bytes:
         with sqlite3.connect(self.path) as connection:
             row = connection.execute(
-                "SELECT document FROM determa_durable_host_documents "
-                "WHERE root_instance_id = ?",
+                "SELECT document FROM determa_durable_host_documents WHERE root_instance_id = ?",
                 (root_instance_id,),
             ).fetchone()
         if row is None:
@@ -251,17 +243,13 @@ class PersistenceHost:
         if scope["authorization"] != "authorized":
             raise ExecutionHostError("invalid_store_scope")
         self.calls.append("resolve_artifacts")
-        target = request.get("transaction_inputs", {}).get(
-            "target_validated_bundle_fingerprint"
-        )
+        target = request.get("transaction_inputs", {}).get("target_validated_bundle_fingerprint")
         if target is not None:
             source = self.execution_host.artifact_resolver.resolve_definition(target)
             if source is None:
                 raise ArtifactError("definition_unavailable")
         self.calls.append("validate_capabilities")
-        if not set(request.get("store_capabilities", [])).issubset(
-            self.store.capabilities
-        ):
+        if not set(request.get("store_capabilities", [])).issubset(self.store.capabilities):
             raise ExecutionHostError(AdapterCode.ADAPTER_CAPABILITY_MISMATCH)
         if "host_profile" in request:
             validate_host_profile(
@@ -302,11 +290,7 @@ class PersistenceHost:
         with self.store.host_transaction(root_instance_id) as (document, transaction):
             self.calls.extend(["read_checkpoint", "check_replay"])
             prior = next(
-                (
-                    item
-                    for item in document["inbox"]
-                    if item["event_id"] == event_id
-                ),
+                (item for item in document["inbox"] if item["event_id"] == event_id),
                 None,
             )
             released = (
@@ -359,9 +343,7 @@ class PersistenceHost:
             document["application_rows"].update(
                 request["transaction_inputs"].get("application_writes", {})
             )
-            self.calls.extend(
-                ["stage_checkpoint", "stage_inbox", "stage_outbox", "stage_audit"]
-            )
+            self.calls.extend(["stage_checkpoint", "stage_inbox", "stage_outbox", "stage_audit"])
             if policy == "inject_pre_commit":
                 self.calls.append("rollback")
                 raise ExecutionHostError("injected_pre_commit_failure")

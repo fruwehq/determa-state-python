@@ -165,9 +165,7 @@ def _assigned_variable_names(machine: MachineModel) -> set[str]:
             action_lists.append(initial.get("action") or [])
         for transition_or_list in (state.raw.get("on_events") or {}).values():
             transitions = (
-                transition_or_list
-                if isinstance(transition_or_list, list)
-                else [transition_or_list]
+                transition_or_list if isinstance(transition_or_list, list) else [transition_or_list]
             )
             action_lists.extend(transition.get("action") or [] for transition in transitions)
         for actions in action_lists:
@@ -433,9 +431,7 @@ def _validate_transition(
             if declaration.get("external") is True
         )
         event_fields = {
-            "changed": cel.StaticType(
-                "map", element=cel.DYNAMIC, fields=external_fields
-            )
+            "changed": cel.StaticType("map", element=cel.DYNAMIC, fields=external_fields)
         }
     guard = transition.get("guard")
     if guard is not None:
@@ -726,6 +722,7 @@ def _validate_send(
                 allow_event=allow_event,
                 allow_owner=False,
             )
+
 
 def _validate_bindings(
     bindings: dict[str, Any],

@@ -130,8 +130,7 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
     if (
         aggregate is not None
         and revision == 0
-        and creation.get("resulting_aggregate_state_digest")
-        != aggregate["aggregate_state_digest"]
+        and creation.get("resulting_aggregate_state_digest") != aggregate["aggregate_state_digest"]
     ):
         raise _invalid()
 
@@ -390,8 +389,10 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
     )
     if any(item["root_runtime_id"] != root_runtime_id for item in audits):
         raise _invalid()
-    if aggregate is not None and audit_sequences and max(audit_sequences) > decimal(
-        aggregate["migration_sequence"]
+    if (
+        aggregate is not None
+        and audit_sequences
+        and max(audit_sequences) > decimal(aggregate["migration_sequence"])
     ):
         raise _invalid()
 
@@ -426,11 +427,9 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
         else:
             if (
                 not linked
-                or [item["migration_sequence"] for item in linked]
-                != sequences_for_receipt
+                or [item["migration_sequence"] for item in linked] != sequences_for_receipt
                 or any(
-                    decimal(right["migration_sequence"])
-                    != decimal(left["migration_sequence"]) + 1
+                    decimal(right["migration_sequence"]) != decimal(left["migration_sequence"]) + 1
                     for left, right in zip(linked, linked[1:], strict=False)
                 )
                 or linked[0]["source_aggregate_state_digest"]
@@ -438,8 +437,7 @@ def _validate_checkpoint_semantics(document: dict[str, Any]) -> None:
                 or linked[-1]["target_aggregate_state_digest"]
                 != receipt["resulting_aggregate_state_digest"]
                 or any(
-                    left["target_aggregate_state_digest"]
-                    != right["source_aggregate_state_digest"]
+                    left["target_aggregate_state_digest"] != right["source_aggregate_state_digest"]
                     or left["target_validated_bundle_fingerprint"]
                     != right["source_validated_bundle_fingerprint"]
                     for left, right in zip(linked, linked[1:], strict=False)
@@ -939,12 +937,8 @@ def step_checkpoint_v2(
     references: list[dict[str, Any]] = []
     for emission_index, emission in enumerate(result["emissions"]):
         if "kind" not in emission:
-            action_emission_index = int(
-                emission.get("_determa_v2_emission_index", emission_index)
-            )
-            _append_external_intent(
-                candidate, references, emission, action_emission_index
-            )
+            action_emission_index = int(emission.get("_determa_v2_emission_index", emission_index))
+            _append_external_intent(candidate, references, emission, action_emission_index)
             continue
         if emission["kind"] != "internal_disposed":
             references.append(copy.deepcopy(emission))

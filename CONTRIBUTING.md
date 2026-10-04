@@ -22,6 +22,7 @@ Run the implementation gates and the full format-1 conformance suite before revi
 
 ```sh
 ruff check .
+ruff format --check .
 mypy src/determa
 pytest -q
 pytest conformance -q

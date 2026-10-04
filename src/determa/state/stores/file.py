@@ -60,10 +60,7 @@ class _FileTransaction(ExecutionStoreTransaction):
             return False
         root_instance_id, revision, digest = checkpoint_metadata(self._current)
         candidate_root, _, _ = checkpoint_metadata(checkpoint)
-        if (
-            root_instance_id != self._root_instance_id
-            or candidate_root != self._root_instance_id
-        ):
+        if root_instance_id != self._root_instance_id or candidate_root != self._root_instance_id:
             raise ExecutionStoreError("transaction_root_mismatch")
         if (revision, digest) != (
             expected_revision,
@@ -167,9 +164,7 @@ class FileExecutionStore(ExecutionStore):
         return {"healthy": ready, "schema_ready": ready}
 
 
-def file_execution_store_factory(
-    uri: str, configuration: Mapping[str, Any]
-) -> ExecutionStore:
+def file_execution_store_factory(uri: str, configuration: Mapping[str, Any]) -> ExecutionStore:
     """Create the ordinary bundled file adapter."""
     parsed = urlsplit(uri)
     if parsed.scheme != "file" or parsed.netloc not in {"", "localhost"}:
