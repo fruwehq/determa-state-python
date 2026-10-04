@@ -1349,9 +1349,7 @@ class ExecutionHost:
             if source is None:
                 raise ExecutionHostError(PreAcceptanceCode.WRONG_ROOT)
             checkpoint = self._restore(source, root_instance_id).document
-            self._check_expected(
-                checkpoint, expected_revision, expected_checkpoint_digest
-            )
+            self._check_expected(checkpoint, expected_revision, expected_checkpoint_digest)
             raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
 
     def update_replay_retention(

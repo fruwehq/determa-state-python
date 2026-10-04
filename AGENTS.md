@@ -12,7 +12,7 @@ The implementation is conformant only when it passes the language-neutral suite.
 The implementation uses these immutable inputs:
 
 - specification: `6796b554b976627c68fc746ec5629629aaf2b38e`;
-- conformance: `99a4d9ad5256f7330e75b06d48f340cc7239a40d` (98 format-1
+- conformance: `a586417292d0a5cac8d07e1164669688c407a7e1` (98 format-1
   core cases, 162 version-2 vectors, 138 durable-host vectors, and 381 generated
   version-2 artifacts).
 

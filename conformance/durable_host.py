@@ -589,9 +589,7 @@ def run_durable_host_vector(item: DurableHostVector) -> None:
             stored = before_bytes
         else:
             response, stored, core_calls = _invoke_checkpoint(item, request, observation)
-            _validate_public_response(
-                item, request, response
-            )
+            _validate_public_response(item, request, response)
             initial_source = observation.get("initial_source", before_bytes)
             replayed = _checkpoint_replayed(item, request, response, initial_source)
             result = "replayed" if replayed else "committed"
