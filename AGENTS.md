@@ -16,7 +16,7 @@ The implementation uses these immutable inputs:
   core cases, 162 version-2 vectors, 138 durable-host vectors, and 381 generated
   version-2 artifacts).
 
-The package metadata remains `0.2.0`.
+The package metadata is `0.3.0`.
 
 ## Boundaries
 
