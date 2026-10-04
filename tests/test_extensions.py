@@ -87,9 +87,9 @@ def test_strict_registration_and_duplicate_preserve_first() -> None:
 def test_bundled_store_uses_public_registration_and_current_health() -> None:
     registry = bundled_extension_registry(include_postgresql=False)
     descriptor = next(
-        entry[0]
-        for entry in registry._entries.values()
-        if entry[0]["provider_reference"]["identifier"] == "determa.store.memory"
+        item
+        for item in registry.descriptors
+        if item["provider_reference"]["identifier"] == "determa.store.memory"
     )
     configuration = {"instance_id": "primary", "uri": "memory:", "store_configuration": {}}
     requirement = {

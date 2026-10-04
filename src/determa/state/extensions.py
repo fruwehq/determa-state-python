@@ -54,7 +54,7 @@ OperationalEvaluator = Callable[[Any, str, Sequence[str]], frozenset[str]]
 
 
 def _check(name: str, document: Any, code: Code) -> dict[str, Any]:
-    if not isinstance(document, dict) or not _schema(name).is_valid(document):
+    if type(document) is not dict or not _schema(name).is_valid(document):
         raise ExtensionError(code)
     return copy.deepcopy(document)
 
@@ -65,17 +65,25 @@ def _reference_key(descriptor: Mapping[str, Any]) -> tuple[str, str, str]:
 
 
 def _validate_configuration(configuration: Any) -> dict[str, Any]:
-    if not isinstance(configuration, dict):
+    if type(configuration) is not dict:
         raise ExtensionError(Code.INVALID_EXTENSION_CONFIGURATION)
-    try:
-        # JSON configurations cannot carry duplicate keys, non-finite numbers, or
-        # implementation-specific object types across the public boundary.
-        result = json.loads(json.dumps(configuration, allow_nan=False))
-        if not isinstance(result, dict):
-            raise ExtensionError(Code.INVALID_EXTENSION_CONFIGURATION)
-        return result
-    except (TypeError, ValueError, OverflowError) as exc:
-        raise ExtensionError(Code.INVALID_EXTENSION_CONFIGURATION) from exc
+
+    def valid(value: Any) -> bool:
+        if value is None or type(value) in (str, bool, int):
+            return True
+        if type(value) is float:
+            import math
+
+            return math.isfinite(value)
+        if type(value) is list:
+            return all(valid(item) for item in value)
+        if type(value) is dict:
+            return all(type(key) is str and valid(item) for key, item in value.items())
+        return False
+
+    if not valid(configuration):
+        raise ExtensionError(Code.INVALID_EXTENSION_CONFIGURATION)
+    return copy.deepcopy(configuration)
 
 
 class ExtensionRegistry:
@@ -84,13 +92,26 @@ class ExtensionRegistry:
     def __init__(
         self,
         *,
-        source_verifier: Callable[[ExtensionProvider, Mapping[str, Any]], bool] | None = None,
+        source_verifier: Callable[[Any, Mapping[str, Any]], bool] | None = None,
     ) -> None:
         self._source_verifier = source_verifier
         self._entries: dict[
             tuple[str, str, str],
             tuple[dict[str, Any], ExtensionFactory, OperationalEvaluator | None],
         ] = {}
+
+    @property
+    def descriptors(self) -> tuple[dict[str, Any], ...]:
+        """Discover exact registered descriptors without opening providers."""
+        return tuple(copy.deepcopy(self._entries[key][0]) for key in sorted(self._entries))
+
+    def _verified_source(self, provider: Any, descriptor: Mapping[str, Any]) -> bool:
+        if self._source_verifier is None:
+            return False
+        try:
+            return self._source_verifier(provider, descriptor) is True
+        except Exception:
+            return False
 
     def register(
         self,
@@ -172,8 +193,10 @@ class ExtensionRegistry:
             raise ExtensionError(Code.EXTENSION_IDENTITY_MISMATCH)
         clean = _validate_configuration(configuration)
         try:
+            if not self._verified_source(factory, registered):
+                raise ExtensionError(Code.EXTENSION_IDENTITY_MISMATCH)
             provider = factory()
-            if self._source_verifier is None or not self._source_verifier(provider, registered):
+            if not self._verified_source(provider, registered):
                 raise ExtensionError(Code.EXTENSION_IDENTITY_MISMATCH)
             instance = provider.validate_configuration(clean)
         except (TypeError, ValueError, KeyError) as exc:
@@ -181,10 +204,16 @@ class ExtensionRegistry:
         return provider, instance
 
     def capabilities(self, provider: ExtensionProvider, instance: Any) -> list[str]:
-        return list(provider.capabilities(instance))
+        try:
+            return list(provider.capabilities(instance))
+        except Exception as exc:
+            raise ExtensionError(Code.INVALID_EXTENSION_CONFIGURATION) from exc
 
     def health(self, provider: ExtensionProvider, instance: Any) -> str:
-        return provider.health(instance)
+        try:
+            return provider.health(instance)
+        except Exception as exc:
+            raise ExtensionError(Code.INVALID_EXTENSION_CONFIGURATION) from exc
 
     def negotiate(
         self,
@@ -218,11 +247,7 @@ class ExtensionRegistry:
             "extension-descriptor", dict(descriptor), Code.INVALID_EXTENSION_DESCRIPTOR
         )
         registered, _, evaluator = self._entry(checked["category"], checked["provider_reference"])
-        if (
-            registered != checked
-            or self._source_verifier is None
-            or not self._source_verifier(provider, registered)
-        ):
+        if registered != checked or not self._verified_source(provider, registered):
             raise ExtensionError(Code.EXTENSION_IDENTITY_MISMATCH)
         clean = _validate_configuration(configuration)
         if not isinstance(clean.get("instance_id"), str):
@@ -239,7 +264,12 @@ class ExtensionRegistry:
         )
         if not set(report["claims"]).issubset(checked["supported_capabilities"]):
             raise ExtensionError(Code.INVALID_EXTENSION_CONFIGURATION)
-        proven = evaluator(instance, health, claims) if evaluator is not None else frozenset()
+        try:
+            proven = evaluator(instance, health, claims) if evaluator is not None else frozenset()
+        except ExtensionError:
+            raise
+        except Exception as exc:
+            raise ExtensionError(Code.EXTENSION_CAPABILITY_MISMATCH) from exc
         report["claims"] = [claim for claim in claims if claim in proven and health == "healthy"]
         if requirement is not None:
             requested = _check(
@@ -292,10 +322,14 @@ class ExtensionRegistry:
             ):
                 raise ExtensionError(Code.EXTENSION_CAPABILITY_MISMATCH)
         effective: dict[str, bool] = {}
+        if requested_profile not in (None, "automatic_retry_without_external_io"):
+            raise ExtensionError(Code.INVALID_EXTENSION_CONFIGURATION)
         if compose:
             full = compose_capabilities(
                 reports, host_guarantees or {}, weak_profile_opt_in=weak_profile_opt_in
             )
+            if any(name not in full for name in projection):
+                raise ExtensionError(Code.INVALID_EXTENSION_CONFIGURATION)
             effective = {name: full[name] for name in projection}
             if (
                 requested_profile == "automatic_retry_without_external_io"
@@ -384,7 +418,11 @@ def _bundled_source_digest() -> str:
     return "sha256:" + digest.hexdigest()
 
 
-def bundled_extension_registry(*, include_postgresql: bool = True) -> ExtensionRegistry:
+def bundled_extension_registry(
+    *,
+    include_postgresql: bool = True,
+    source_verifier: Callable[[Any, Mapping[str, Any]], bool] | None = None,
+) -> ExtensionRegistry:
     """Register bundled stores through the same public operation as custom providers.
 
     Claims requiring a category-specific proof are withheld until such proof is
@@ -397,16 +435,26 @@ def bundled_extension_registry(*, include_postgresql: bool = True) -> ExtensionR
         postgresql_execution_store_factory,
         sqlite_execution_store_factory,
     )
-    from .stores.base import STANDARD_CAPABILITIES
 
     digest = _bundled_source_digest()
 
-    def verify(provider: ExtensionProvider, descriptor: Mapping[str, Any]) -> bool:
-        return (
-            isinstance(provider, _BundledStoreProvider)
-            and descriptor["provider_reference"]["content_digest"] == _bundled_source_digest()
-            and provider.factory.__module__.startswith("determa.state.stores.")
+    def verify(provider: Any, descriptor: Mapping[str, Any]) -> bool:
+        reference = descriptor["provider_reference"]
+        installed = (
+            reference["identifier"]
+            in {
+                "determa.store.memory",
+                "determa.store.file",
+                "determa.store.sqlite",
+                "determa.store.postgresql",
+            }
+            and reference["content_digest"] == _bundled_source_digest()
         )
+        if isinstance(provider, _BundledStoreProvider):
+            return installed and provider.factory.__module__.startswith("determa.state.stores.")
+        if callable(provider) and getattr(provider, "__module__", None) == __name__:
+            return installed
+        return source_verifier is not None and source_verifier(provider, descriptor)
 
     registry = ExtensionRegistry(source_verifier=verify)
     stores = [
@@ -416,6 +464,25 @@ def bundled_extension_registry(*, include_postgresql: bool = True) -> ExtensionR
     ]
     if include_postgresql:
         stores.append(("postgresql", postgresql_execution_store_factory))
+    supported = {
+        "memory": {"ephemeral"},
+        "file": {"restart_persistent"},
+        "sqlite": {
+            "durable_single_writer",
+            "root_identity_retention",
+            "permanent_receipt_retention",
+            "permanent_outbox_terminal_retention",
+            "compact_effect_identity_retention",
+        },
+        "postgresql": {
+            "durable_concurrent",
+            "shared_application_transaction",
+            "root_identity_retention",
+            "permanent_receipt_retention",
+            "permanent_outbox_terminal_retention",
+            "compact_effect_identity_retention",
+        },
+    }
     for name, factory in stores:
         descriptor = {
             "category": "execution_store",
@@ -425,7 +492,7 @@ def bundled_extension_registry(*, include_postgresql: bool = True) -> ExtensionR
                 "content_digest": digest,
             },
             "interface_version": 1,
-            "supported_capabilities": sorted(STANDARD_CAPABILITIES),
+            "supported_capabilities": sorted(supported[name]),
         }
         evaluator: OperationalEvaluator | None = None
         if name == "memory":

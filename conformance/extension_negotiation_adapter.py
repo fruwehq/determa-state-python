@@ -81,9 +81,12 @@ def _public(
     value: dict[str, Any], module: Any, closure_request: dict[str, Any], closure_digest: str
 ) -> dict[str, Any]:
     def verify(provider: Any, descriptor: Any) -> bool:
-        if not isinstance(provider, _FixtureProvider) or provider.module is not module:
-            return False
         if descriptor["provider_reference"]["content_digest"] != closure_digest:
+            return False
+        if isinstance(provider, _FixtureProvider):
+            if provider.module is not module:
+                return False
+        elif not callable(provider):
             return False
         return _closure(closure_request)[1] == closure_digest
 
@@ -177,7 +180,7 @@ def _common(value: dict[str, Any]) -> dict[str, Any]:
     proofs = premise["proofs"]
     provider = _HypotheticalProvider()
     registry = ExtensionRegistry(
-        source_verifier=lambda candidate, _descriptor: candidate is provider
+        source_verifier=lambda candidate, _descriptor: candidate is provider or callable(candidate)
     )
 
     def proof_for(
