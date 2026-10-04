@@ -174,3 +174,16 @@ def test_source_order_claim_remains_unproved_on_public_path() -> None:
     }
     with pytest.raises(ExtensionError, match="extension_capability_mismatch"):
         registry.negotiate(record, configuration, requirement)
+
+
+def test_unhealthy_participant_blocks_profile_without_requirement() -> None:
+    registry = ExtensionRegistry(source_verifier=lambda _source, _descriptor: True)
+    record = descriptor()
+    registry.inject(record, Provider())
+    participant = {
+        "category": "execution_store",
+        "provider_reference": record["provider_reference"],
+        "configuration": {"instance_id": "primary", "claims": [], "health": "degraded"},
+    }
+    with pytest.raises(ExtensionError, match="extension_capability_mismatch"):
+        registry.evaluate_profile([participant], [])

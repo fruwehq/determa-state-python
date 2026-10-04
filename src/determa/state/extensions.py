@@ -324,6 +324,8 @@ class ExtensionRegistry:
                 participant["category"], participant["provider_reference"]
             )
             reports.append(self.negotiate(descriptor, participant["configuration"]))
+        if any(report["health"] != "healthy" for report in reports):
+            raise ExtensionError(Code.EXTENSION_CAPABILITY_MISMATCH)
         for requirement in requirements:
             self._entry(requirement["category"], requirement["provider_reference"])
             if not any(
