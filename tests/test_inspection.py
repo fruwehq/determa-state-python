@@ -85,6 +85,13 @@ def test_map_lookup_charges_all_entries_after_typed_record_selection() -> None:
     assert safe_evaluate("has(event.payload.mapped.foo)", bindings, 31) == (True, 31)
 
 
+def test_string_conversion_uses_canonical_values_and_fuel() -> None:
+    assert safe_evaluate('string(true) == "true"', {}, 21) == (True, 21)
+    assert safe_evaluate('string(1.0) == "1"', {}, 9) == (True, 9)
+    with pytest.raises(InspectionLimit):
+        safe_evaluate('string(true) == "true"', {}, 20)
+
+
 def test_inspection_is_read_only_on_queued_aggregate(monkeypatch: pytest.MonkeyPatch) -> None:
     aggregate, request, resolver = _case()
     envelope = copy.deepcopy(request["envelope"])

@@ -206,8 +206,14 @@ class _Interpreter:
                 )
                 return len(value)
             if name == "string":
-                result = cel._portable_string(value)
-                result = str(result)
+                if type(value) is bool:
+                    result = "true" if value else "false"
+                elif type(value) is int:
+                    result = str(value)
+                elif type(value) is float:
+                    result = cel._jcs_number(value)
+                else:
+                    result = value
                 self.charge(len(value) if isinstance(value, str) else 1)
                 if not isinstance(value, str):
                     self.charge(len(result))
