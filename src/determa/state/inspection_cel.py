@@ -258,7 +258,9 @@ def _node_count(node: Any) -> int:
     if not hasattr(node, "data"):
         return 0
     unwrapped = cel._unwrap(node)
-    if str(unwrapped.data).startswith(("unary_", "relation_", "addition_", "multiplication_")):
+    if str(unwrapped.data) in {"exprlist", "mapinits"} or str(unwrapped.data).startswith(
+        ("unary_", "relation_", "addition_", "multiplication_")
+    ):
         return sum(_node_count(child) for child in unwrapped.children)
     return 1 + sum(_node_count(child) for child in unwrapped.children)
 
