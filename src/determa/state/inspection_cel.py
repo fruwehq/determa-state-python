@@ -41,6 +41,14 @@ def _checked_number(value: Any) -> Any:
     return value
 
 
+def _integer_quotient(dividend: int, divisor: int) -> int:
+    """Divide signed integers toward zero without passing through floating point."""
+    if divisor == 0:
+        raise ZeroDivisionError("integer division by zero")
+    magnitude = abs(dividend) // abs(divisor)
+    return -magnitude if (dividend < 0) != (divisor < 0) else magnitude
+
+
 def _portable_equal(left: Any, right: Any) -> bool:
     """Portable recursive equality keeps booleans distinct from integers."""
     if type(left) is not type(right):
@@ -164,6 +172,11 @@ class _Interpreter:
                     self.charge()
                 return _checked_number(result)
             self.charge()
+            if operator in {"multiplication_div", "multiplication_mod"} and type(left) is int:
+                quotient = _integer_quotient(left, right)
+                return _checked_number(
+                    quotient if operator == "multiplication_div" else left - quotient * right
+                )
             return _checked_number(
                 {
                     "addition_sub": lambda: left - right,
@@ -231,7 +244,8 @@ class _Interpreter:
                     result = rfc8785.dumps(value).decode("utf-8")
                 else:
                     result = value
-                self.charge(len(value) if isinstance(value, str) else 1)
+                if isinstance(value, str):
+                    self.charge(len(value))
                 if not isinstance(value, str):
                     self.charge(len(result))
                 return result

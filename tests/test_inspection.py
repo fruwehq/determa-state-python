@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+from typing import Any
 
 import pytest
 
@@ -62,6 +63,55 @@ def _case() -> tuple[dict, dict, MemoryArtifactResolver]:
     return aggregate, request, resolver
 
 
+def _semantic_case(
+    guard: str,
+    *,
+    root_variables: dict | None = None,
+    child_variables: dict | None = None,
+    root_guard: str | None = None,
+) -> tuple[dict, dict, MemoryArtifactResolver]:
+    root: dict[str, Any] = {
+        "type": "composite",
+        "variables": root_variables or {},
+        "initial": {"transition_to": "child"},
+        "states": {
+            "child": {
+                "variables": child_variables or {},
+                "on_events": {"go": {"guard": guard}},
+            }
+        },
+    }
+    if root_guard is not None:
+        root["on_events"] = {"go": {"guard": root_guard}}
+    bundle = load_bundle(
+        {
+            "format": 1,
+            "namespace": "test.inspection.semantic",
+            "events": {"go": {"direction": "input"}},
+            "machines": [{"machine_id": "inspector", "root": root}],
+        }
+    )
+    resolver = MemoryArtifactResolver(definitions={bundle.fingerprint: bundle})
+    aggregate = create(bundle, "inspector", "root-1", "create-1", {})["state"]
+    runtime = aggregate["runtimes"][0]
+    request = {
+        "mode": "semantic",
+        "aggregate_state_digest": aggregate["aggregate_state_digest"],
+        "runtime_id": runtime["runtime_id"],
+        "runtime_incarnation": runtime["identity_origin"],
+        "envelope": {
+            "event": "go",
+            "event_id": "candidate-1",
+            "cause_id": "candidate-1",
+            "source": {"host": True},
+            "target": runtime["target_identity"],
+            "payload": typed_value({}),
+        },
+        "limits": {"maximum_guard_evaluations": "2", "maximum_evaluation_steps": "100"},
+    }
+    return aggregate, request, resolver
+
+
 @pytest.mark.parametrize(
     ("source", "budget", "result"),
     [
@@ -88,11 +138,11 @@ def test_map_lookup_charges_all_entries_after_typed_record_selection() -> None:
 @pytest.mark.parametrize(
     ("source", "steps"),
     [
-        ('string(true) == "true"', 21),
-        ('string(1.0) == "1"', 9),
-        ('string(-0.0) == "0"', 9),
-        ('string(0.000001) == "0.000001"', 37),
-        ('string(9223372036854775807) == "9223372036854775807"', 81),
+        ('string(true) == "true"', 20),
+        ('string(1.0) == "1"', 8),
+        ('string(-0.0) == "0"', 8),
+        ('string(0.000001) == "0.000001"', 36),
+        ('string(9223372036854775807) == "9223372036854775807"', 80),
     ],
 )
 def test_string_conversion_uses_canonical_values_and_fuel(source: str, steps: int) -> None:
@@ -104,6 +154,95 @@ def test_string_conversion_uses_canonical_values_and_fuel(source: str, steps: in
 def test_collection_equality_preserves_portable_scalar_types() -> None:
     assert safe_evaluate('{"x": true} == {"x": 1}', {}, 100)[0] is False
     assert safe_evaluate("true in [1]", {}, 100)[0] is False
+
+
+@pytest.mark.parametrize(
+    "guard",
+    [
+        "-3 / 2 == -1",
+        "-3 % 2 == -1",
+        "3 / -2 == -1",
+        "3 % -2 == 1",
+        "9223372036854775807 / 3 == 3074457345618258602",
+        "9223372036854775807 % 3 == 1",
+    ],
+)
+def test_semantic_integer_quotient_and_remainder_match_portable_cel(guard: str) -> None:
+    from determa.state.cel import evaluate
+
+    assert evaluate(guard, {}) is True
+    aggregate, request, resolver = _semantic_case(guard)
+    original = canonical_bytes(aggregate)
+    result = inspect_candidate(aggregate, request, resolver)
+    assert result["disposition"] == "handled_now"
+    assert result["guard_evidence"][0]["value"] is True
+    assert canonical_bytes(aggregate) == original
+
+
+@pytest.mark.parametrize("guard", ["1 / 0 == 0", "-9223372036854775808 / -1 == 0"])
+def test_semantic_integer_errors_have_no_partial_evidence(guard: str) -> None:
+    aggregate, request, resolver = _semantic_case(guard)
+    original = canonical_bytes(aggregate)
+    result = inspect_candidate(aggregate, request, resolver)
+    assert result == {
+        "code": "inspection_guard_failure",
+        "source_locator": "/machines/0/root/states/child/on_events/go/guard",
+    }
+    assert canonical_bytes(aggregate) == original
+
+
+def test_fuel_exhaustion_precedes_integer_division_error() -> None:
+    aggregate, request, resolver = _semantic_case("1 / 0 == 0")
+    request["limits"]["maximum_evaluation_steps"] = "4"
+    assert inspect_candidate(aggregate, request, resolver) == {
+        "code": "inspection_limit_exceeded",
+        "source_locator": "/machines/0/root/states/child/on_events/go/guard",
+    }
+    request["limits"]["maximum_evaluation_steps"] = "5"
+    assert inspect_candidate(aggregate, request, resolver) == {
+        "code": "inspection_guard_failure",
+        "source_locator": "/machines/0/root/states/child/on_events/go/guard",
+    }
+
+
+def test_shadowed_ancestor_value_is_not_guard_visible() -> None:
+    oversized = "x" * 65530
+    aggregate, request, resolver = _semantic_case(
+        "x == 'a'",
+        root_variables={"x": {"type": "string", "init": oversized}},
+        child_variables={"x": {"type": "string", "init": "a"}},
+    )
+    original = canonical_bytes(aggregate)
+    result = inspect_candidate(aggregate, request, resolver)
+    assert result["disposition"] == "handled_now"
+    assert canonical_bytes(aggregate) == original
+
+
+def test_all_unshadowed_visible_values_count_even_when_guard_does_not_read_them() -> None:
+    aggregate, request, resolver = _semantic_case(
+        "x == 'a'",
+        root_variables={"other": {"type": "string", "init": "x" * 65530}},
+        child_variables={"x": {"type": "string", "init": "a"}},
+    )
+    assert inspect_candidate(aggregate, request, resolver) == {
+        "code": "inspection_limit_exceeded",
+        "source_locator": "/machines/0/root/states/child/on_events/go/guard",
+    }
+
+
+def test_each_reached_guard_uses_its_own_lexical_visibility() -> None:
+    aggregate, request, resolver = _semantic_case(
+        "x == 'b'",
+        root_variables={"x": {"type": "string", "init": "x" * 65530}},
+        child_variables={"x": {"type": "string", "init": "a"}},
+        root_guard="x == 'a'",
+    )
+    original = canonical_bytes(aggregate)
+    assert inspect_candidate(aggregate, request, resolver) == {
+        "code": "inspection_limit_exceeded",
+        "source_locator": "/machines/0/root/on_events/go/guard",
+    }
+    assert canonical_bytes(aggregate) == original
 
 
 def test_inspection_is_read_only_on_queued_aggregate(monkeypatch: pytest.MonkeyPatch) -> None:

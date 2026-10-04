@@ -217,11 +217,10 @@ def inspect_candidate(
                 return _failure("inspection_limit_exceeded", locator)
             guard_count -= 1
             variables: dict[str, Any] = {}
-            all_visible_units = 0
             for scoped in reversed(node.ancestors(include_self=True)):
                 scope = native["scopes"].get(scoped.path, {})
-                all_visible_units += sum(value_units(value) for value in scope.values())
                 variables.update(scope)
+            visible_units = sum(value_units(value) for value in variables.values())
             activation = {**variables, "event": {"payload": candidate["payload"]}}
             try:
                 value, cost = safe_evaluate(
@@ -235,7 +234,7 @@ def inspect_candidate(
                             "cause_id": envelope["cause_id"],
                         }
                     )
-                    + all_visible_units,
+                    + visible_units,
                 )
             except InspectionLimit:
                 return _failure("inspection_limit_exceeded", locator)
