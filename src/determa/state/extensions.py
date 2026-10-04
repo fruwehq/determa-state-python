@@ -9,7 +9,9 @@ from __future__ import annotations
 import copy
 import json
 import re
+import weakref
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
 from typing import Any, Protocol
@@ -55,6 +57,17 @@ ExtensionFactory = Callable[[], ExtensionProvider]
 OperationalEvaluator = Callable[[Any, str, Sequence[str]], frozenset[str]]
 
 
+@dataclass(frozen=True, slots=True, weakref_slot=True)
+class ConfiguredExtension:
+    """A validated configured instance bound to exactly one registry."""
+
+    _token: object
+    _descriptor: dict[str, Any]
+    _configuration: dict[str, Any]
+    _provider: ExtensionProvider
+    _instance: Any
+
+
 def _check(name: str, document: Any, code: Code) -> dict[str, Any]:
     if type(document) is not dict or not _schema(name).is_valid(document):
         raise ExtensionError(code)
@@ -97,6 +110,10 @@ class ExtensionRegistry:
         source_verifier: Callable[[Any, Mapping[str, Any]], bool] | None = None,
     ) -> None:
         self._source_verifier = source_verifier
+        self._token = object()
+        self._handles: weakref.WeakValueDictionary[int, ConfiguredExtension] = (
+            weakref.WeakValueDictionary()
+        )
         self._entries: dict[
             tuple[str, str, str],
             tuple[dict[str, Any], ExtensionFactory, OperationalEvaluator | None],
@@ -188,7 +205,7 @@ class ExtensionRegistry:
 
     def validate_configuration(
         self, descriptor: Mapping[str, Any], configuration: Mapping[str, Any]
-    ) -> tuple[ExtensionProvider, Any]:
+    ) -> ConfiguredExtension:
         checked = _check("extension-descriptor", descriptor, Code.INVALID_EXTENSION_DESCRIPTOR)
         registered, factory, _ = self._entry(checked["category"], checked["provider_reference"])
         if registered != checked:
@@ -200,18 +217,65 @@ class ExtensionRegistry:
             provider = factory()
             if not self._verified_source(provider, registered):
                 raise ExtensionError(Code.EXTENSION_IDENTITY_MISMATCH)
-            instance = provider.validate_configuration(clean)
+            instance = provider.validate_configuration(copy.deepcopy(clean))
         except (TypeError, ValueError, KeyError) as exc:
             raise ExtensionError(Code.INVALID_EXTENSION_CONFIGURATION) from exc
-        return provider, instance
+        configured = ConfiguredExtension(self._token, registered, clean, provider, instance)
+        self._handles[id(configured)] = configured
+        self._bound(configured)
+        return configured
 
-    def capabilities(self, provider: ExtensionProvider, instance: Any) -> list[str]:
+    def _bound(
+        self, configured: ConfiguredExtension
+    ) -> tuple[dict[str, Any], ExtensionProvider, Any, OperationalEvaluator | None]:
+        if (
+            not isinstance(configured, ConfiguredExtension)
+            or configured._token is not self._token
+            or self._handles.get(id(configured)) is not configured
+        ):
+            raise ExtensionError(Code.EXTENSION_IDENTITY_MISMATCH)
+        descriptor, factory, evaluator = self._entry(
+            configured._descriptor["category"], configured._descriptor["provider_reference"]
+        )
+        if (
+            descriptor != configured._descriptor
+            or not self._verified_source(factory, descriptor)
+            or not self._verified_source(configured._provider, descriptor)
+        ):
+            raise ExtensionError(Code.EXTENSION_IDENTITY_MISMATCH)
+        instance = configured._instance
+        instance_id = (
+            instance.get("instance_id")
+            if isinstance(instance, Mapping)
+            else getattr(instance, "instance_id", None)
+        )
+        if instance_id != configured._configuration.get("instance_id"):
+            raise ExtensionError(Code.INVALID_EXTENSION_CONFIGURATION)
+        if isinstance(configured._provider, _BundledStoreProvider):
+            store = instance.get("store") if isinstance(instance, Mapping) else None
+            if store is None or any(
+                key in vars(type(store))
+                and (
+                    callable(vars(type(store))[key]) or isinstance(vars(type(store))[key], property)
+                )
+                for key in vars(store)
+            ):
+                raise ExtensionError(Code.EXTENSION_IDENTITY_MISMATCH)
+        return descriptor, configured._provider, instance, evaluator
+
+    def capabilities(self, configured: ConfiguredExtension, *extra: Any) -> list[str]:
+        if extra:
+            raise ExtensionError(Code.EXTENSION_IDENTITY_MISMATCH)
+        _, provider, instance, _ = self._bound(configured)
         try:
             return list(provider.capabilities(instance))
         except Exception as exc:
             raise ExtensionError(Code.INVALID_EXTENSION_CONFIGURATION) from exc
 
-    def health(self, provider: ExtensionProvider, instance: Any) -> str:
+    def health(self, configured: ConfiguredExtension, *extra: Any) -> str:
+        if extra:
+            raise ExtensionError(Code.EXTENSION_IDENTITY_MISMATCH)
+        _, provider, instance, _ = self._bound(configured)
         try:
             return provider.health(instance)
         except Exception as exc:
@@ -227,29 +291,11 @@ class ExtensionRegistry:
     ) -> dict[str, Any]:
         """Evaluate current configured instance before any core or host mutation."""
         del lookup_uri  # URI is only a resolver hint; it cannot change exact identity.
-        provider, instance = self.validate_configuration(descriptor, configuration)
-        claims = self.capabilities(provider, instance)
-        health = self.health(provider, instance)
-        return self.negotiate_observed(
-            descriptor, configuration, provider, instance, claims, health, requirement
-        )
-
-    def negotiate_observed(
-        self,
-        descriptor: Mapping[str, Any],
-        configuration: Mapping[str, Any],
-        provider: ExtensionProvider,
-        instance: Any,
-        claims: Sequence[str],
-        health: str,
-        requirement: Mapping[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Decide from already observed provider calls; useful for host call tracing."""
-        checked = _check("extension-descriptor", descriptor, Code.INVALID_EXTENSION_DESCRIPTOR)
-        registered, _, evaluator = self._entry(checked["category"], checked["provider_reference"])
-        if registered != checked or not self._verified_source(provider, registered):
-            raise ExtensionError(Code.EXTENSION_IDENTITY_MISMATCH)
-        clean = _validate_configuration(configuration)
+        configured = self.validate_configuration(descriptor, configuration)
+        claims = self.capabilities(configured)
+        health = self.health(configured)
+        checked, _, instance, evaluator = self._bound(configured)
+        clean = configured._configuration
         if not isinstance(clean.get("instance_id"), str):
             raise ExtensionError(Code.INVALID_EXTENSION_CONFIGURATION)
         candidate = {
@@ -308,6 +354,10 @@ class ExtensionRegistry:
         weak_profile_opt_in: bool = False,
     ) -> dict[str, Any]:
         """Resolve a complete profile before any aggregate or checkpoint operation."""
+        if requested_profile is not None and not compose:
+            raise ExtensionError(Code.INVALID_EXTENSION_CONFIGURATION)
+        if requested_profile not in (None, "automatic_retry_without_external_io", *_GUARANTEES):
+            raise ExtensionError(Code.INVALID_EXTENSION_CONFIGURATION)
         for requirement in requirements:
             _check(
                 "extension-capability-requirement", requirement, Code.INVALID_EXTENSION_DESCRIPTOR
@@ -338,8 +388,6 @@ class ExtensionRegistry:
             ):
                 raise ExtensionError(Code.EXTENSION_CAPABILITY_MISMATCH)
         effective: dict[str, bool] = {}
-        if requested_profile not in (None, "automatic_retry_without_external_io"):
-            raise ExtensionError(Code.INVALID_EXTENSION_CONFIGURATION)
         if compose:
             full = _compose_capabilities(reports, host_guarantees or {})
             if any(name not in full for name in projection):
@@ -347,9 +395,10 @@ class ExtensionRegistry:
             effective = {name: full[name] for name in projection}
             if full["weak_profile_opt_in_required"] and not weak_profile_opt_in:
                 raise ExtensionError(Code.EXTENSION_CAPABILITY_MISMATCH)
-            if (
-                requested_profile == "automatic_retry_without_external_io"
-                and full["external_io_capable"]
+            if requested_profile in _GUARANTEES and not full[requested_profile]:
+                raise ExtensionError(Code.EXTENSION_CAPABILITY_MISMATCH)
+            if requested_profile == "automatic_retry_without_external_io" and (
+                full["external_io_capable"] or not full["pure"] or not full["deterministic"]
             ):
                 raise ExtensionError(Code.EXTENSION_CAPABILITY_MISMATCH)
         return {"status": "accepted", "reports": reports, "effective": effective}
@@ -430,6 +479,76 @@ def _bundled_source_digest() -> str:
     return "sha256:" + digest.hexdigest()
 
 
+def _bundled_factory_matches_source(name: str, factory: Any) -> bool:
+    """Bind the selected loaded factory and store methods to the hashed package source."""
+    import importlib
+    import inspect
+    import types
+
+    package = Path(__file__).parent
+    module = importlib.import_module(f"determa.state.stores.{name}")
+    source_path = package / "stores" / f"{name}.py"
+    module_file = getattr(module, "__file__", None)
+    if not isinstance(module_file, str) or Path(module_file).resolve() != source_path.resolve():
+        return False
+    if not isinstance(factory, types.FunctionType):
+        return False
+    selected_factory: types.FunctionType = factory
+    if (
+        selected_factory is not getattr(module, f"{name}_execution_store_factory", None)
+        or selected_factory.__globals__ is not vars(module)
+        or selected_factory.__module__ != module.__name__
+        or selected_factory.__closure__ is not None
+    ):
+        return False
+
+    def nested_code(parent: types.CodeType, member_name: str) -> types.CodeType | None:
+        for child in parent.co_consts:
+            if isinstance(child, types.CodeType):
+                if child.co_name == member_name:
+                    return child
+                found = nested_code(child, member_name)
+                if found is not None:
+                    return found
+        return None
+
+    compiled = compile(source_path.read_bytes(), str(source_path), "exec")
+    if selected_factory.__code__ != nested_code(compiled, selected_factory.__name__):
+        return False
+    class_name = {
+        "memory": "MemoryExecutionStore",
+        "file": "FileExecutionStore",
+        "sqlite": "SQLiteExecutionStore",
+        "postgresql": "PostgreSQLExecutionStore",
+    }[name]
+    store_type = vars(module).get(class_name)
+    class_code = nested_code(compiled, class_name)
+    if (
+        not isinstance(store_type, type)
+        or store_type.__module__ != module.__name__
+        or class_code is None
+    ):
+        return False
+    for child in class_code.co_consts:
+        if not isinstance(child, types.CodeType):
+            continue
+        method = vars(store_type).get(child.co_name)
+        if isinstance(method, property):
+            method = method.fget
+        elif isinstance(method, (staticmethod, classmethod)):
+            method = method.__func__
+        if method is None or not callable(method):
+            return False
+        unwrapped = inspect.unwrap(method)
+        if (
+            not isinstance(unwrapped, types.FunctionType)
+            or unwrapped.__code__ != child
+            or unwrapped.__globals__ is not vars(module)
+        ):
+            return False
+    return True
+
+
 def bundled_extension_registry(
     *,
     include_postgresql: bool = True,
@@ -452,8 +571,9 @@ def bundled_extension_registry(
 
     def verify(provider: Any, descriptor: Mapping[str, Any]) -> bool:
         reference = descriptor["provider_reference"]
+        identifier = reference["identifier"]
         installed = (
-            reference["identifier"]
+            identifier
             in {
                 "determa.store.memory",
                 "determa.store.file",
@@ -463,9 +583,21 @@ def bundled_extension_registry(
             and reference["content_digest"] == _bundled_source_digest()
         )
         if isinstance(provider, _BundledStoreProvider):
-            return installed and provider.factory.__module__.startswith("determa.state.stores.")
+            return installed and _bundled_factory_matches_source(
+                identifier.removeprefix("determa.store."), provider.factory
+            )
         if callable(provider) and getattr(provider, "__module__", None) == __name__:
-            return installed
+            selected = getattr(provider, "__defaults__", None)
+            return (
+                installed
+                and isinstance(selected, tuple)
+                and len(selected) == 1
+                and _bundled_factory_matches_source(
+                    identifier.removeprefix("determa.store."), selected[0]
+                )
+            )
+        if identifier.startswith("determa.store."):
+            return False
         return source_verifier is not None and source_verifier(provider, descriptor)
 
     registry = ExtensionRegistry(source_verifier=verify)

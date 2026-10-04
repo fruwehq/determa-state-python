@@ -66,15 +66,42 @@ def _closure(request: dict[str, Any]) -> tuple[Path, str, Any]:
 class _FixtureProvider:
     def __init__(self, module: Any) -> None:
         self.module = module
+        self.stages: list[dict[str, Any]] = []
 
     def validate_configuration(self, configuration: dict[str, Any]) -> Any:
-        return self.module.validate_configuration(configuration)
+        try:
+            instance = self.module.validate_configuration(configuration)
+        except ValueError:
+            self.stages.append(
+                {
+                    "operation": "validate_configuration",
+                    "input": configuration,
+                    "output": {"status": "rejected", "code": "invalid_extension_configuration"},
+                }
+            )
+            raise
+        self.stages.append(
+            {
+                "operation": "validate_configuration",
+                "input": configuration,
+                "output": {"status": "accepted", "value": None},
+            }
+        )
+        return instance
 
     def capabilities(self, instance: Any) -> list[str]:
-        return self.module.capabilities(instance)
+        claims = self.module.capabilities(instance)
+        self.stages.append(
+            {"operation": "capabilities", "input": instance["instance_id"], "output": claims}
+        )
+        return claims
 
     def health(self, instance: Any) -> str:
-        return self.module.health(instance)
+        health = self.module.health(instance)
+        self.stages.append(
+            {"operation": "health", "input": instance["instance_id"], "output": health}
+        )
+        return health
 
 
 def _public(
@@ -125,30 +152,21 @@ def _public(
             }
         )
         return {"decision": result, "stages": trace}
-    configuration = value["configuration"]
-    try:
-        configured_provider, instance = registry.validate_configuration(descriptor, configuration)
-        output = {"status": "accepted", "value": None}
-    except ExtensionError as exc:
-        output = {"status": "rejected", "code": exc.code}
-    trace.append({"operation": "validate_configuration", "input": configuration, "output": output})
-    if output["status"] == "rejected":
-        return {"decision": output, "stages": trace}
-    claims = registry.capabilities(configured_provider, instance)
-    trace.append({"operation": "capabilities", "input": instance["instance_id"], "output": claims})
-    health = registry.health(configured_provider, instance)
-    trace.append({"operation": "health", "input": instance["instance_id"], "output": health})
     result = _decision(
-        lambda: registry.negotiate_observed(
+        lambda: registry.negotiate(
             descriptor,
-            configuration,
-            configured_provider,
-            instance,
-            claims,
-            health,
+            value["configuration"],
             value["requirement"],
+            lookup_uri=value["lookup_uri"],
         )
     )
+    trace.extend(provider.stages)
+    if (
+        provider.stages
+        and provider.stages[-1]["operation"] == "validate_configuration"
+        and provider.stages[-1]["output"]["status"] == "rejected"
+    ):
+        return {"decision": result, "stages": trace}
     trace.append(
         {
             "operation": "negotiate",

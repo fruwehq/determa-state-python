@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import copy
+from dataclasses import replace
 
 import pytest
 
+import determa.state.stores as bundled_stores
+import determa.state.stores.memory as memory_module
 from determa.state.extensions import (
     ExtensionError,
     ExtensionRegistry,
@@ -187,3 +190,157 @@ def test_unhealthy_participant_blocks_profile_without_requirement() -> None:
     }
     with pytest.raises(ExtensionError, match="extension_capability_mismatch"):
         registry.evaluate_profile([participant], [])
+
+
+def test_public_calls_reobserve_current_health_and_bind_configured_instance() -> None:
+    registry = bundled_extension_registry(include_postgresql=False)
+    record = next(
+        item
+        for item in registry.descriptors
+        if item["provider_reference"]["identifier"] == "determa.store.memory"
+    )
+    configuration = {"instance_id": "primary", "uri": "memory:", "store_configuration": {}}
+    requirement = {
+        "category": "execution_store",
+        "provider_reference": record["provider_reference"],
+        "instance_id": "primary",
+        "capability": "ephemeral",
+    }
+    configured = registry.validate_configuration(record, configuration)
+    assert registry.capabilities(configured) == ["ephemeral"]
+    assert registry.health(configured) == "healthy"
+    configured._instance["store"].health = lambda: {"healthy": False}
+    with pytest.raises(ExtensionError, match="extension_identity_mismatch"):
+        registry.health(configured)
+    assert not hasattr(registry, "negotiate_observed")
+    # A new negotiation configures a new store and observes that store afresh.
+    assert registry.negotiate(record, configuration, requirement)["health"] == "healthy"
+    configured._instance["instance_id"] = "other"
+    with pytest.raises(ExtensionError, match="invalid_extension_configuration"):
+        registry.capabilities(configured)
+
+    custom = ExtensionRegistry(source_verifier=lambda _source, _descriptor: True)
+    custom.inject(descriptor(), Provider())
+    dynamic = custom.validate_configuration(
+        descriptor(), {"instance_id": "primary", "claims": [], "health": "healthy"}
+    )
+    dynamic._instance["health"] = "unavailable"
+    assert custom.health(dynamic) == "unavailable"
+
+
+def test_public_calls_reject_unregistered_and_foreign_provider() -> None:
+    calls = 0
+
+    class EvilProvider:
+        def capabilities(self, _instance: object) -> list[str]:
+            nonlocal calls
+            calls += 1
+            return ["ephemeral"]
+
+        def health(self, _instance: object) -> str:
+            nonlocal calls
+            calls += 1
+            return "healthy"
+
+    empty = ExtensionRegistry()
+    with pytest.raises(ExtensionError, match="extension_identity_mismatch"):
+        empty.capabilities(EvilProvider(), {})
+    with pytest.raises(ExtensionError, match="extension_identity_mismatch"):
+        empty.health(EvilProvider(), {})
+    assert calls == 0
+    first = ExtensionRegistry(source_verifier=lambda _source, _descriptor: True)
+    first.inject(descriptor(), Provider())
+    configured = first.validate_configuration(
+        descriptor(), {"instance_id": "primary", "claims": [], "health": "healthy"}
+    )
+    second = ExtensionRegistry(source_verifier=lambda _source, _descriptor: True)
+    second.inject(descriptor(), Provider())
+    with pytest.raises(ExtensionError, match="extension_identity_mismatch"):
+        second.health(configured)
+    forged = replace(
+        configured, _instance={"instance_id": "primary", "claims": [], "health": "healthy"}
+    )
+    with pytest.raises(ExtensionError, match="extension_identity_mismatch"):
+        first.health(forged)
+
+
+def test_bundled_factory_replacement_cannot_retain_source_identity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def replacement(_uri: str, _configuration: object) -> object:
+        nonlocal calls
+        calls += 1
+        return object()
+
+    replacement.__module__ = "determa.state.stores.memory"
+    monkeypatch.setattr(bundled_stores, "memory_execution_store_factory", replacement)
+    registry = bundled_extension_registry(include_postgresql=False)
+    record = next(
+        item
+        for item in registry.descriptors
+        if item["provider_reference"]["identifier"] == "determa.store.memory"
+    )
+    with pytest.raises(ExtensionError, match="extension_identity_mismatch"):
+        registry.negotiate(
+            record, {"instance_id": "primary", "uri": "memory:", "store_configuration": {}}
+        )
+    assert calls == 0
+
+
+def test_bundled_factory_dependency_replacement_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = bundled_extension_registry(include_postgresql=False)
+    record = next(
+        item
+        for item in registry.descriptors
+        if item["provider_reference"]["identifier"] == "determa.store.memory"
+    )
+    monkeypatch.setattr(memory_module, "MemoryExecutionStore", lambda: object())
+    with pytest.raises(ExtensionError, match="extension_identity_mismatch"):
+        registry.negotiate(
+            record, {"instance_id": "primary", "uri": "memory:", "store_configuration": {}}
+        )
+
+
+def test_requested_profile_cannot_skip_composition() -> None:
+    registry = bundled_extension_registry(include_postgresql=False)
+    record = next(
+        item
+        for item in registry.descriptors
+        if item["provider_reference"]["identifier"] == "determa.store.memory"
+    )
+    participants = [
+        {
+            "category": "execution_store",
+            "provider_reference": record["provider_reference"],
+            "configuration": {
+                "instance_id": "primary",
+                "uri": "memory:",
+                "store_configuration": {},
+            },
+        }
+    ]
+    with pytest.raises(ExtensionError, match="invalid_extension_configuration"):
+        registry.evaluate_profile(
+            participants, [], requested_profile="automatic_retry_without_external_io"
+        )
+    with pytest.raises(ExtensionError, match="extension_capability_mismatch"):
+        registry.evaluate_profile(
+            participants,
+            [],
+            requested_profile="automatic_retry_without_external_io",
+            compose=True,
+            weak_profile_opt_in=True,
+        )
+    with pytest.raises(ExtensionError, match="extension_capability_mismatch"):
+        registry.evaluate_profile(
+            participants,
+            [],
+            requested_profile="deterministic",
+            compose=True,
+            weak_profile_opt_in=True,
+            host_guarantees={"deterministic": True},
+        )
