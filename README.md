@@ -5,8 +5,10 @@ a language-agnostic statechart engine with a shared normative conformance suite.
 
 This implementation supports Determa State `format: 1` at specification
 commit `6bd25e3fcdf068af861aa289903a8489bd8f0139`. Correctness is determined by
-98 format-1 core cases, 162 version-1 vectors, 142 durable-host vectors, and 403
-manifest artifacts at conformance commit `710d5e9bcf517e8a8cc8d7087123bda37a362d6b`.
+99 format-1 core cases, 162 version-1 vectors, 142 durable-host vectors, 49 core
+inspection vectors, and 420 manifest artifacts at conformance commit
+`c0e101c86bd71068669df3cd2250d4fec24ff74d`. The 7 native guard-provider
+inspection vectors remain an optional profile pending runtime-provider support.
 
 The package metadata is `0.3.0`. Artifact and checkpoint schema version 1 is the
 only supported portable artifact format. Machine YAML remains `format: 1`.
