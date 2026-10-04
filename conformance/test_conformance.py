@@ -550,6 +550,30 @@ def test_persistence_no_response_requires_call_to_abort(
         run_durable_host_vector(item)
 
 
+def test_durable_gate_rejects_boolean_for_persisted_integer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    item = next(
+        item
+        for item in durable_host_vectors()
+        if item.vector["name"] == "persistence_inbox_first_commit"
+    )
+    original = PersistenceHost.process_v1
+
+    def corrupt_persisted_row(self, request):
+        response = original(self, request)
+        root_id = request["expected_checkpoint"]["root_instance_id"]
+        with self.store.host_transaction(root_id) as (document, _transaction):
+            assert type(document["application_rows"]["aggregate_version"]) is int
+            assert document["application_rows"]["aggregate_version"] == 1
+            document["application_rows"]["aggregate_version"] = True
+        return response
+
+    monkeypatch.setattr(PersistenceHost, "process_v1", corrupt_persisted_row)
+    with pytest.raises(AssertionError):
+        run_durable_host_vector(item)
+
+
 def test_portable_code_sets_match_authoritative_registry() -> None:
     vector_path = (
         conformance_root() / "conformance" / "closed-code-registry" / "vectors.generated.json"

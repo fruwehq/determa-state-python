@@ -31,6 +31,7 @@ from determa.state.host import (
     validate_host_profile_report,
 )
 from determa.state.queueing import _runtime_id_for_target
+from determa.state.wire import strict_json
 
 from .harness import conformance_root
 from .version1 import _json, _pointer, _resolver
@@ -661,4 +662,9 @@ def run_durable_host_vector(item: DurableHostVector) -> None:
 def _same_document(left: bytes | None, right: bytes | None) -> bool:
     if left is None or right is None:
         return left is right
-    return json.loads(left) == json.loads(right)
+    try:
+        left_document, _ = strict_json(left)
+        right_document, _ = strict_json(right)
+    except ArtifactError:
+        return False
+    return _same_typed_json(left_document, right_document)
