@@ -46,6 +46,12 @@ from .errors import (
     SchemaError,
     ValidationError,
 )
+from .extensions import (
+    ExtensionError,
+    ExtensionProvider,
+    ExtensionRegistry,
+    bundled_extension_registry,
+)
 from .host import (
     ExecutionHost,
     ExecutionHostError,
@@ -158,6 +164,9 @@ __all__ = [
     "ExecutionStoreTransaction",
     "ExecutionStoreAdapterFailureCode",
     "ExtensionNegotiationFailureCode",
+    "ExtensionError",
+    "ExtensionProvider",
+    "ExtensionRegistry",
     "FileExecutionStore",
     "InspectionDispositionCode",
     "InspectionFailureCode",
@@ -189,6 +198,7 @@ __all__ = [
     "StagedExecutionResult",
     "ValidationError",
     "__version__",
+    "bundled_extension_registry",
     "aggregate_envelope",
     "aggregate_shape_fingerprint",
     "collect_errors",

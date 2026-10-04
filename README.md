@@ -4,11 +4,12 @@ Python implementation of [Determa State](https://github.com/fruwehq/determa-stat
 a language-agnostic statechart engine with a shared normative conformance suite.
 
 This implementation supports Determa State `format: 1` at specification
-commit `6bd25e3fcdf068af861aa289903a8489bd8f0139`. Correctness is determined by
+commit `6207362e879ccca70f709e1eb4cc90448d910c0b`. Correctness is determined by
 99 format-1 core cases, 162 version-1 vectors, 142 durable-host vectors, 49 core
-inspection vectors, and 420 manifest artifacts at conformance commit
-`c0e101c86bd71068669df3cd2250d4fec24ff74d`. The 7 native guard-provider
-inspection vectors remain an optional profile pending runtime-provider support.
+inspection vectors, 47 extension negotiation vectors, and 420 manifest artifacts
+at conformance commit `e499a99c3ced88f29008049ea9dddcc17a0d9f51`. The 7
+native guard-provider inspection vectors remain an optional profile pending
+runtime-provider support.
 
 The package metadata is `0.3.0`. Artifact and checkpoint schema version 1 is the
 only supported portable artifact format. Machine YAML remains `format: 1`.
@@ -20,9 +21,9 @@ version 1 as the sole portable aggregate, migration, and execution-checkpoint co
 The synchronous host can persist accepted work and restore ready and deferred mailboxes
 across restarts.
 The version-1 checkpoint host returns exact receipt evidence for admission, processing,
-and terminal replay. The closed extension failure-code vocabulary is available for
-the shared registry; extension negotiation is not a claimed host capability in this
-implementation slice.
+and terminal replay. The optional public extension registry validates exact provider
+references, loaded source closure, configured health, and currently proved claims
+before evaluating a requested profile.
 
 ## Install
 
@@ -259,6 +260,18 @@ checkpoint use.
 third-party factories. URI resolution extracts only the scheme; each factory owns its
 configuration. Root checkpoint deletion is unsupported.
 
+`ExtensionRegistry` is an optional common registration boundary for named providers.
+Its `register` and `inject` operations validate the closed descriptor, and
+`validate_configuration`, `capabilities`, `health`, `negotiate`, and
+`evaluate_profile` evaluate the current configured instance. The embedding host
+supplies a trusted source verifier; without one, the registry refuses to execute a
+provider. A provider's claim is a candidate only. Unproved claims are omitted from
+reports, and exact requirements fail closed. `bundled_extension_registry` installs
+the four bundled stores through the same public `register` operation and accepts a
+source verifier for additional providers. Its only positive claim here is memory's
+`ephemeral`, which permits process loss. Category-specific guarantees need their
+operational profile proof before the host can advertise them.
+
 ## Implemented Surface
 
 - strict format-1 loading, default materialization, bundle fingerprinting, and exact
@@ -279,7 +292,9 @@ configuration. Root checkpoint deletion is unsupported.
   validation, synchronous transaction/CAS/replay orchestration, receipts, pending
   delivery, outbox lifecycle, replay retention, and root tombstones;
 - public direct execution-store injection and explicit registration for memory, file,
-  SQLite, optional PostgreSQL, and third-party adapters.
+  SQLite, optional PostgreSQL, and third-party adapters;
+- exact public extension identity, loaded source checks, configured capability
+  negotiation, and composition of guarantees and external-I/O hazards.
 - exact-target structural inspection and optional bounded CEL semantic inspection of
   a restored portable aggregate, with no admission or action execution.
 

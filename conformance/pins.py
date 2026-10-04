@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-CONFORMANCE_COMMIT = "c0e101c86bd71068669df3cd2250d4fec24ff74d"
-SPEC_COMMIT = "6bd25e3fcdf068af861aa289903a8489bd8f0139"
+CONFORMANCE_COMMIT = "e499a99c3ced88f29008049ea9dddcc17a0d9f51"
+SPEC_COMMIT = "6207362e879ccca70f709e1eb4cc90448d910c0b"
 
 ROOT = Path(__file__).resolve().parent.parent
 CONFORMANCE_CACHE = ROOT / ".cache" / f"determa-state-conformance-{CONFORMANCE_COMMIT[:12]}"
