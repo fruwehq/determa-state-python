@@ -1,4 +1,4 @@
-"""Driver for the pinned version-2 aggregate and checkpoint vectors."""
+"""Driver for the pinned version-1 aggregate and checkpoint vectors."""
 
 from __future__ import annotations
 
@@ -20,21 +20,21 @@ from determa.state import (
     MigrationLimits,
     load_bundle,
     restore_aggregate_package,
-    restore_migration_descriptor_v2,
+    restore_migration_descriptor_v1,
     serialize_execution_checkpoint,
 )
-from determa.state.checkpoint_v2 import (
-    admit_checkpoint_v2,
-    prune_checkpoint_v2,
-    restore_execution_checkpoint_v2,
-    step_checkpoint_v2,
+from determa.state.checkpoint_v1 import (
+    admit_checkpoint_v1,
+    prune_checkpoint_v1,
+    restore_execution_checkpoint_v1,
+    step_checkpoint_v1,
 )
 from determa.state.queueing import (
-    admit_aggregate_v2,
-    create_aggregate_v2,
-    migrate_aggregate_v2,
-    restore_aggregate_v2,
-    step_aggregate_v2,
+    admit_aggregate_v1,
+    create_aggregate_v1,
+    migrate_aggregate_v1,
+    restore_aggregate_v1,
+    step_aggregate_v1,
 )
 from determa.state.wire import (
     canonical_bytes,
@@ -46,7 +46,7 @@ from .harness import conformance_root
 
 
 @dataclass(frozen=True)
-class Version2Vector:
+class Version1Vector:
     path: Path
     vector: dict[str, Any]
 
@@ -55,7 +55,7 @@ class Version2Vector:
         return f"{self.path.name}/{self.vector['name']}"
 
 
-def version2_vectors() -> list[Version2Vector]:
+def version1_vectors() -> list[Version1Vector]:
     roots = [
         conformance_root() / "conformance" / "core",
         conformance_root() / "conformance" / "profiles" / "execution-checkpoint",
@@ -67,7 +67,7 @@ def version2_vectors() -> list[Version2Vector]:
             if not test_path.exists():
                 continue
             test = yaml.safe_load(test_path.read_text(encoding="utf-8")) or {}
-            result.extend(Version2Vector(path, item) for item in test.get("version2_vectors", []))
+            result.extend(Version1Vector(path, item) for item in test.get("version1_vectors", []))
     return result
 
 
@@ -137,7 +137,7 @@ def _resolver(path: Path, request: dict[str, Any] | None = None) -> MemoryArtifa
 
 
 def _invoke(
-    item: Version2Vector,
+    item: Version1Vector,
     request: dict[str, Any],
     observation: dict[str, Any] | None = None,
 ) -> Any:
@@ -152,22 +152,22 @@ def _invoke(
         if vector.get("bundle")
         else None
     )
-    if operation == "create_v2":
+    if operation == "create_v1":
         assert bundle is not None
-        return create_aggregate_v2(
+        return create_aggregate_v1(
             bundle,
             request["machine_id"],
             request["root_instance_id"],
             request["creation_id"],
             request["bindings"],
         )["state"]
-    if operation == "admit_v2":
-        return admit_aggregate_v2(before, request["deliveries"], resolver)
-    if operation == "step_v2":
-        return step_aggregate_v2(before, request["target_runtime_id"], resolver)
-    if operation == "round_trip_aggregate_v2":
-        return restore_aggregate_v2(before, resolver).aggregate_envelope
-    if operation == "restore_package_v2":
+    if operation == "admit_v1":
+        return admit_aggregate_v1(before, request["deliveries"], resolver)
+    if operation == "step_v1":
+        return step_aggregate_v1(before, request["target_runtime_id"], resolver)
+    if operation == "round_trip_aggregate_v1":
+        return restore_aggregate_v1(before, resolver).aggregate_envelope
+    if operation == "restore_package_v1":
         package = _json(path / vector["package_file"])
         restored_package = restore_aggregate_package(package, resolver)
         if request["intent"] == "restore_aggregate":
@@ -176,16 +176,16 @@ def _invoke(
             raise AssertionError("unsupported restore-package intent")
         descriptor = resolver.resolve_migration_descriptor(restored_package.migration_route[-1])
         assert descriptor is not None
-        target, _ = load_json_artifact(descriptor, "migration_descriptor_v2")
-        return migrate_aggregate_v2(
+        target, _ = load_json_artifact(descriptor, "migration_descriptor_v1")
+        return migrate_aggregate_v1(
             restored_package.aggregate.aggregate_envelope,
             target["target_validated_bundle_fingerprint"],
             restored_package.migration_route,
             resolver,
             maintenance_mode=request["maintenance_mode"],
         )
-    if operation == "migrate_aggregate_v2":
-        return migrate_aggregate_v2(
+    if operation == "migrate_aggregate_v1":
+        return migrate_aggregate_v1(
             before,
             request.get("target_bundle", {}).get("validated_bundle_fingerprint"),
             request.get("migration_descriptor_digest_route"),
@@ -197,19 +197,19 @@ def _invoke(
                 else None
             ),
         )
-    if operation == "migrate_then_process_v2":
-        migrated = migrate_aggregate_v2(
+    if operation == "migrate_then_process_v1":
+        migrated = migrate_aggregate_v1(
             before,
             request["target_bundle"]["validated_bundle_fingerprint"],
             request["migration_descriptor_digest_route"],
             resolver,
             maintenance_mode=request["maintenance_mode"],
         )
-        admitted = admit_aggregate_v2(migrated["aggregate_state"], [request["delivery"]], resolver)
+        admitted = admit_aggregate_v1(migrated["aggregate_state"], [request["delivery"]], resolver)
         if admitted["result"] != "accepted":
             processing = {
                 "core_step_result_format": "determa.core_step_result",
-                "core_step_result_schema_version": 2,
+                "core_step_result_schema_version": 1,
                 "status": admitted["status"],
                 "disposition": "rejected",
                 "state": admitted["state"],
@@ -226,37 +226,37 @@ def _invoke(
                 runtime_id = target["component"]["component_runtime_id"]
             else:
                 runtime_id = target["spawned_instance"]["instance_id"]
-            processing = step_aggregate_v2(admitted["state"], runtime_id, resolver)
+            processing = step_aggregate_v1(admitted["state"], runtime_id, resolver)
         return {
             "result": "migrated_and_processed",
             "migration_audit_records": migrated["audit_records"],
             "processing": processing,
         }
-    if operation == "checkpoint_admit_v2":
-        return admit_checkpoint_v2(
+    if operation == "checkpoint_admit_v1":
+        return admit_checkpoint_v1(
             before,
             request["deliveries"],
             resolver,
             expected_revision=request["expected_revision"],
             expected_checkpoint_digest=request["expected_checkpoint_digest"],
         )
-    if operation == "checkpoint_step_v2":
-        return step_checkpoint_v2(
+    if operation == "checkpoint_step_v1":
+        return step_checkpoint_v1(
             before,
             request["target_runtime_id"],
             resolver,
             expected_revision=request["expected_revision"],
             expected_checkpoint_digest=request["expected_checkpoint_digest"],
         )
-    if operation == "checkpoint_prune_v2":
-        return prune_checkpoint_v2(
+    if operation == "checkpoint_prune_v1":
+        return prune_checkpoint_v1(
             before,
             request["cutoff_receipt_sequence"],
             resolver,
             expected_revision=request["expected_revision"],
             expected_checkpoint_digest=request["expected_checkpoint_digest"],
         )
-    if operation == "checkpoint_migrate_v2":
+    if operation == "checkpoint_migrate_v1":
         store = MemoryExecutionStore(
             {before["root_instance_id"]: serialize_execution_checkpoint(before)}
         )
@@ -264,7 +264,7 @@ def _invoke(
             observation["store"] = store
             observation["root_instance_id"] = before["root_instance_id"]
         host = ExecutionHost(store, resolver)
-        result = host.maintenance_migration_v2(
+        result = host.maintenance_migration_v1(
             before["root_instance_id"],
             request["operation_id"],
             request["target_bundle"]["validated_bundle_fingerprint"],
@@ -279,10 +279,10 @@ def _invoke(
             assert restored is not None
             assert restored.document == _json(path / expected_after)
         return result
-    raise AssertionError(f"unsupported version-2 operation: {operation}")
+    raise AssertionError(f"unsupported version-1 operation: {operation}")
 
 
-def _assert_checkpoint_unchanged(item: Version2Vector, observation: dict[str, Any]) -> None:
+def _assert_checkpoint_unchanged(item: Version1Vector, observation: dict[str, Any]) -> None:
     store = observation.get("store")
     root_instance_id = observation.get("root_instance_id")
     assert isinstance(store, MemoryExecutionStore)
@@ -293,7 +293,7 @@ def _assert_checkpoint_unchanged(item: Version2Vector, observation: dict[str, An
     assert actual == (item.path / unchanged_file).read_bytes()
 
 
-def run_version2_vector(item: Version2Vector) -> None:
+def run_version1_vector(item: Version1Vector) -> None:
     vector = item.vector
     request = copy.deepcopy(
         _pointer(_json(item.path / vector["request_file"]), vector["request_pointer"])
@@ -312,7 +312,7 @@ def run_version2_vector(item: Version2Vector) -> None:
         actual = None
     if expected["result"] == "failure":
         assert code == expected["code"]
-        if vector["operation"] == "checkpoint_migrate_v2" and expected.get("unchanged_file"):
+        if vector["operation"] == "checkpoint_migrate_v1" and expected.get("unchanged_file"):
             _assert_checkpoint_unchanged(item, observation)
     else:
         assert code is None
@@ -321,34 +321,34 @@ def run_version2_vector(item: Version2Vector) -> None:
         assert request == request_snapshot
 
 
-def validate_version2_artifact(path: Path, artifact: dict[str, Any]) -> None:
+def validate_version1_artifact(path: Path, artifact: dict[str, Any]) -> None:
     resolver = _resolver(path)
     source = (path / artifact["file"]).read_bytes()
     try:
         if artifact["valid"]:
             document, _ = load_json_artifact(source, artifact["kind"])
             if artifact.get("verify_digest", True):
-                if artifact["kind"] == "aggregate_state_v2":
-                    restore_aggregate_v2(source, resolver)
-                elif artifact["kind"] == "execution_checkpoint_v2":
-                    restore_execution_checkpoint_v2(source, resolver)
-                elif artifact["kind"] == "migration_descriptor_v2":
-                    restore_migration_descriptor_v2(source, resolver)
-                elif artifact["kind"] == "aggregate_state_package_v2":
+                if artifact["kind"] == "aggregate_state_v1":
+                    restore_aggregate_v1(source, resolver)
+                elif artifact["kind"] == "execution_checkpoint_v1":
+                    restore_execution_checkpoint_v1(source, resolver)
+                elif artifact["kind"] == "migration_descriptor_v1":
+                    restore_migration_descriptor_v1(source, resolver)
+                elif artifact["kind"] == "aggregate_state_package_v1":
                     restore_aggregate_package(source, resolver)
             if artifact.get("canonical_of"):
                 assert canonical_bytes(document) == source
-        elif artifact["kind"] == "aggregate_state_v2":
-            restore_aggregate_v2(source, resolver)
-        elif artifact["kind"] == "execution_checkpoint_v2":
-            restore_execution_checkpoint_v2(source, resolver)
-        elif artifact["kind"] == "aggregate_state_package_v2":
+        elif artifact["kind"] == "aggregate_state_v1":
+            restore_aggregate_v1(source, resolver)
+        elif artifact["kind"] == "execution_checkpoint_v1":
+            restore_execution_checkpoint_v1(source, resolver)
+        elif artifact["kind"] == "aggregate_state_package_v1":
             restore_aggregate_package(source, resolver)
-        elif artifact["kind"] == "migration_descriptor_v2":
+        elif artifact["kind"] == "migration_descriptor_v1":
             document, _ = load_json_artifact(source, artifact["kind"])
             if migration_descriptor_digest(document) != document["migration_descriptor_digest"]:
                 raise ArtifactError("migration_descriptor_digest_mismatch")
-        elif artifact["kind"] == "core_step_result_v2":
+        elif artifact["kind"] == "core_step_result_v1":
             load_json_artifact(source, artifact["kind"])
         else:
             return
@@ -370,7 +370,7 @@ def _is_declared_semantic_rejection(path: Path, filename: str, code: str) -> boo
         "checkpoint_before",
         "package_file",
     }
-    for item in version2_vectors():
+    for item in version1_vectors():
         if item.path != path:
             continue
         if not any(item.vector.get(field) == filename for field in reference_fields):

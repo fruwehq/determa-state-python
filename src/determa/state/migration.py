@@ -396,22 +396,22 @@ def _resolve_descriptor(resolver: ArtifactResolver, digest: str) -> tuple[dict[s
         raise ArtifactError(PersistenceCode.MIGRATION_ROUTE_MISMATCH)
     if not resolver.migration_descriptor_is_trusted(digest):
         raise ArtifactError(PersistenceCode.MIGRATION_DESCRIPTOR_UNTRUSTED)
-    document, _raw = load_json_artifact(source, "migration_descriptor_v2")
+    document, _raw = load_json_artifact(source, "migration_descriptor_v1")
     encoded = canonical_bytes(document)
     if migration_descriptor_digest(document) != digest:
         raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)
     return document, encoded
 
 
-def restore_migration_descriptor_v2(
+def restore_migration_descriptor_v1(
     source: ArtifactSource,
     artifact_resolver: ArtifactResolver,
     *,
     resource_limits: MigrationLimits | None = None,
 ) -> dict[str, Any]:
-    """Structurally and semantically restore one trusted v2 descriptor."""
+    """Structurally and semantically restore one trusted v1 descriptor."""
     limits = resource_limits or MigrationLimits()
-    document, _raw = load_json_artifact(source, "migration_descriptor_v2")
+    document, _raw = load_json_artifact(source, "migration_descriptor_v1")
     digest = document["migration_descriptor_digest"]
     if migration_descriptor_digest(document) != digest:
         raise ArtifactError(PersistenceCode.INVALID_MIGRATION_DESCRIPTOR)
@@ -928,7 +928,7 @@ def migrate_aggregate(
             )
             audits.append(
                 {
-                    "migration_audit_record_schema_version": 2,
+                    "migration_audit_record_schema_version": 1,
                     "root_instance_id": candidate["root_instance_id"],
                     "root_runtime_id": candidate["root_runtime_id"],
                     "migration_sequence": candidate["migration_sequence"],

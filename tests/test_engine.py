@@ -56,9 +56,9 @@ def test_public_execution_api_is_queue_bearing_only() -> None:
         "dispatch",
         "Delivery",
         "Result",
-        "create_aggregate_v2",
-        "admit_aggregate_v2",
-        "step_aggregate_v2",
+        "create_aggregate_v1",
+        "admit_aggregate_v1",
+        "step_aggregate_v1",
     ):
         assert removed not in state.__all__
         assert not hasattr(state, removed)
@@ -473,7 +473,7 @@ def test_normative_root_runtime_identity_vector() -> None:
     machine = bundle.raw["machines"][0]
 
     assert _root_runtime_id(bundle, machine, "turnstile-42") == (
-        "sha256:72dca6d0b2b3690ae28bda2f17a461179b18fbf11daad7a12709d9384a500c64"
+        "sha256:d42f331cbd0c491bba66d512c010f89f94c52df12057a80fecde85d3b954592f"
     )
 
 
@@ -486,7 +486,7 @@ def test_normative_first_component_and_root_initialization_cause_vectors() -> No
     )
 
     assert left["runtime_id"] == (
-        "sha256:43db74b6a8d6f31543f7d142fb5e25a49e33eb3bf548e7bfd20d59513778cbc3"
+        "sha256:b0145e3c9c3d470fda4e59e55fe1585a1a9a7d74e29377062d70bf1789ffeb76"
     )
     assert (
         _cause_id(
@@ -499,7 +499,7 @@ def test_normative_first_component_and_root_initialization_cause_vectors() -> No
             "/machines/0/root",
             0,
         )
-        == "sha256:c9e8e89a01362f40e9a74c01392d09abe2323f31c8f14f22e05bfcaf6dfac0ab"
+        == "sha256:a1ba8e26366fdefe45f62e34e2856d0bebbf22b9b73fad742ebf5294421ae91c"
     )
 
 
@@ -518,7 +518,7 @@ def test_identity_counter_operands_use_canonical_decimal_above_javascript_range(
             "/machines/0/root",
             9007199254740995,
         )
-        == "sha256:2df23aef5335fe81713038d71e9d1d3f5c91512d995b2175070b8ab77e20da2b"
+        == "sha256:40a377c51eabb13caa8055cf73bbad793c8a209f9c89027963f5bad46169efb4"
     )
 
 
@@ -538,12 +538,12 @@ def test_exact_internal_event_and_external_effect_identity_vectors() -> None:
     )
 
     assert state["root_runtime_id"] == (
-        "sha256:cdfc68fdcbeef09460a7d51758a1d60fa673351d2196357c5c34bd64511ffac2"
+        "sha256:96ebf9368839fec686010a8c17905bf38b9b16bab348073c88551effdb72e63b"
     )
     assert result["emissions"] == [
         {
             "event": "internal_notice",
-            "event_id": ("sha256:521c9fa9e3f1d6ba7187b89f97d9a26bd118213e1ebec9a662bcaf27f96f0e9c"),
+            "event_id": ("sha256:1e6bc94ef085fa3068bda94b0feaee5ef7362df892e0ac8effdf6a5ba15bc663"),
             "target": _root_target(state),
             "payload": {"value": 1},
         },
@@ -553,7 +553,7 @@ def test_exact_internal_event_and_external_effect_identity_vectors() -> None:
             "payload": {"value": 2},
             "correlation_id": "correlation-1",
             "effect_id": (
-                "sha256:d01f6d7dbf678ed598a7a37fea7a025f3818e8ff777d0a9363b92f578fcee5d7"
+                "sha256:46e25a94219025a2aac4416a50d066252df9b3e1cf7e38ef35bc3bf71d224823"
             ),
             "sequence": 0,
         },
@@ -623,10 +623,10 @@ def test_dispatch_allocates_unbounded_logical_counters_with_canonical_id_operand
         worker,
     )
     assert spawned["runtime_id"] == (
-        "sha256:92bc50f1329857e0a74ec7ec1309f8378b8af1fd67ba83cad343984ac30cb97c"
+        "sha256:561bb5e424080749f6bdb56038203b2664da4a9be791f1d3f55b0fea47cc5487"
     )
     assert first["runtime_id"] == (
-        "sha256:afe3002d5165a5a22ea198ff60853f7bdbbd8ff7b8fb9c32916c9215968bad5e"
+        "sha256:d5ca924fbb0247926a740dbded033df35e9bd2ba4002b66c4d3c97b09bcd01a9"
     )
     assert result["emissions"] == [
         {
@@ -635,7 +635,7 @@ def test_dispatch_allocates_unbounded_logical_counters_with_canonical_id_operand
             "payload": {},
             "correlation_id": "high-correlation",
             "effect_id": (
-                "sha256:f5e454de1e9c3f70801148fc9719491cc1b4dc460a8129a342cbee0648f7659c"
+                "sha256:83f76f69981bad0dcdb899a4f1498ea0b9cf272071c26dd5f1e7bef192224a77"
             ),
             "sequence": output_sequence,
         }

@@ -89,6 +89,15 @@ class ExecutionStoreAdapterFailureCode(StrEnum):
     UNKNOWN_ADAPTER = "unknown_adapter"
 
 
+class ExtensionNegotiationFailureCode(StrEnum):
+    DUPLICATE_EXTENSION_REGISTRATION = "duplicate_extension_registration"
+    EXTENSION_CAPABILITY_MISMATCH = "extension_capability_mismatch"
+    EXTENSION_IDENTITY_MISMATCH = "extension_identity_mismatch"
+    INVALID_EXTENSION_CONFIGURATION = "invalid_extension_configuration"
+    INVALID_EXTENSION_DESCRIPTOR = "invalid_extension_descriptor"
+    UNKNOWN_EXTENSION = "unknown_extension"
+
+
 class MachineLoadFailureCode(StrEnum):
     CEL_PROFILE_ERROR = "cel_profile_error"
     DESTROYED_REFERENCE_BINDING = "destroyed_reference_binding"
@@ -149,6 +158,7 @@ _CATEGORY_TYPES: Mapping[str, type[StrEnum]] = MappingProxyType(
         "disposition": DispositionCode,
         "engine_fault": EngineFaultCode,
         "execution_store_adapter_failure": ExecutionStoreAdapterFailureCode,
+        "extension_negotiation_failure": ExtensionNegotiationFailureCode,
         "machine_load_failure": MachineLoadFailureCode,
         "persistence_failure": PersistenceFailureCode,
     }

@@ -11,10 +11,10 @@ from .wire import _schema_registry, artifact_schema, canonical_bytes, hash_value
 
 
 def execution_checkpoint_digest(document: Mapping[str, Any]) -> str:
-    """Compute the canonical schema-v2 checkpoint digest."""
+    """Compute the canonical schema-v1 checkpoint digest."""
     body = copy.deepcopy(dict(document))
     body.pop("execution_checkpoint_digest", None)
-    return hash_value(["determa-execution-checkpoint-digest-2", body])
+    return hash_value(["determa-execution-checkpoint-digest-1", body])
 
 
 def seal_execution_checkpoint(document: Mapping[str, Any]) -> dict[str, Any]:
@@ -34,7 +34,7 @@ def serialize_execution_checkpoint(document: Mapping[str, Any]) -> bytes:
 def _member_validator(name: str) -> Any:
     import jsonschema
 
-    schema = artifact_schema("execution_checkpoint_v2")
+    schema = artifact_schema("execution_checkpoint_v1")
     return jsonschema.Draft202012Validator(
         {"$ref": f"{schema['$id']}#/$defs/{name}"}, registry=_schema_registry()
     )

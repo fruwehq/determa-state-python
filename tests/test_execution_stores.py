@@ -65,7 +65,7 @@ def _resolver() -> MemoryArtifactResolver:
 
 def _create(store: ExecutionStore, root: str = "root") -> ExecutionHost:
     host = ExecutionHost(store, _resolver())
-    host.create_v2(load_bundle(MACHINE), "counter", root, f"{root}-create", {})
+    host.create_v1(load_bundle(MACHINE), "counter", root, f"{root}-create", {})
     return host
 
 
@@ -86,24 +86,24 @@ def test_shared_adapter_contract_round_trip(tmp_path: Path, index: int) -> None:
     host = _create(store)
     restored = host.read_checkpoint("root")
     assert restored is not None
-    replay = host.create_v2(load_bundle(MACHINE), "counter", "root", "root-create", {})
+    replay = host.create_v1(load_bundle(MACHINE), "counter", "root", "root-create", {})
     assert replay["receipt"]["receipt_sequence"] == "0"
 
 
 @pytest.mark.parametrize("index", range(3))
-def test_adapters_commit_and_replay_keyed_v2_maintenance_receipts(
+def test_adapters_commit_and_replay_keyed_v1_maintenance_receipts(
     tmp_path: Path, index: int
 ) -> None:
     store = _factories(tmp_path)[index]()
     store.setup_schema()
     bundle = load_bundle(MACHINE)
     host = ExecutionHost(store, _resolver())
-    host.create_v2(bundle, "counter", "root", "root-create", {})
+    host.create_v1(bundle, "counter", "root", "root-create", {})
     checkpoint = host.read_checkpoint("root")
     assert checkpoint is not None
     aggregate = checkpoint.document["root_record"]["aggregate_state"]
 
-    committed = host.maintenance_migration_v2(
+    committed = host.maintenance_migration_v1(
         "root",
         "adapter-empty-migration",
         aggregate["validated_bundle_fingerprint"],
@@ -111,7 +111,7 @@ def test_adapters_commit_and_replay_keyed_v2_maintenance_receipts(
         expected_revision=checkpoint.document["revision"],
         expected_checkpoint_digest=checkpoint.document["execution_checkpoint_digest"],
     )
-    replay = host.maintenance_migration_v2(
+    replay = host.maintenance_migration_v1(
         "root",
         "adapter-empty-migration",
         aggregate["validated_bundle_fingerprint"],
@@ -207,7 +207,7 @@ def test_concurrent_stale_writer_cannot_overwrite(tmp_path: Path, index: int) ->
 
     def process(operation_id: str) -> str:
         try:
-            ExecutionHost(store, _resolver()).maintenance_migration_v2(
+            ExecutionHost(store, _resolver()).maintenance_migration_v1(
                 "root",
                 operation_id,
                 aggregate["validated_bundle_fingerprint"],
@@ -386,7 +386,7 @@ def test_sqlite_persists_policy_and_forbids_native_root_or_policy_mutation(
 
     assert host.read_checkpoint("bank-root") is not None
     with pytest.raises(ExecutionHostError) as recreate:
-        host.create_v2(load_bundle(MACHINE), "counter", "bank-root", "replacement", {})
+        host.create_v1(load_bundle(MACHINE), "counter", "bank-root", "replacement", {})
     assert recreate.value.code == "creation_id_conflict"
 
     reopened = SQLiteExecutionStore(
@@ -483,7 +483,7 @@ def test_configured_sqlite_satisfies_bank_and_outbox_profiles(
             "retain_unresolved_outbox",
         },
     )
-    checkpoint = host.create_v2(load_bundle(MACHINE), "counter", "bank-root", "create", {})
+    checkpoint = host.create_v1(load_bundle(MACHINE), "counter", "bank-root", "create", {})
     assert checkpoint["result"] == "committed"
     current = host.read_checkpoint("bank-root")
     assert current is not None

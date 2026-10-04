@@ -60,7 +60,7 @@ def _identity(value: list[Any]) -> str:
 def _root_runtime_id(bundle: Bundle, machine: dict[str, Any], root_instance_id: str) -> str:
     return _identity(
         [
-            "determa-root-runtime-identity-2",
+            "determa-root-runtime-identity-1",
             "1",
             bundle.fingerprint,
             bundle.namespace,
@@ -649,7 +649,7 @@ def _validate_prior_state(state: dict[str, Any], bundle: Bundle) -> bool:
         machine = definition.get("machine", {})
         expected_root_id = _identity(
             [
-                "determa-root-runtime-identity-2",
+                "determa-root-runtime-identity-1",
                 "1",
                 definition.get("validated_bundle_fingerprint"),
                 machine.get("namespace"),
@@ -661,7 +661,7 @@ def _validate_prior_state(state: dict[str, Any], bundle: Bundle) -> bool:
     else:
         expected_root_id = _identity(
             [
-                "determa-root-runtime-identity-2",
+                "determa-root-runtime-identity-1",
                 "1",
                 state["validated_bundle_fingerprint"],
                 state["namespace"],
@@ -1526,7 +1526,7 @@ class _Execution:
         system_locator: str | None = None,
     ) -> None:
         if self.capture_emission_provenance and emission.get("target") != "external":
-            emission["_determa_v2_provenance"] = {
+            emission["_determa_v1_provenance"] = {
                 "cause_id": self.cause_id,
                 "source": (
                     {"system": system_locator}
@@ -2133,7 +2133,7 @@ class _Execution:
                     "sequence": sequence,
                 }
                 if self.capture_emission_provenance:
-                    emission["_determa_v2_provenance"] = {"emission_index": index}
+                    emission["_determa_v1_provenance"] = {"emission_index": index}
             else:
                 assert isinstance(target, dict)
                 target_runtime_id = _target_runtime_id(target)
@@ -2154,7 +2154,7 @@ class _Execution:
                 if correlation is not None:
                     emission["correlation_id"] = correlation
                 if self.capture_emission_provenance:
-                    emission["_determa_v2_emission_index"] = index
+                    emission["_determa_v1_emission_index"] = index
             self.append_emission(emission, runtime)
 
     def resolve_send_target(
