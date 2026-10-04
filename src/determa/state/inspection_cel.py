@@ -10,6 +10,8 @@ import ast
 import math
 from typing import Any
 
+import rfc8785
+
 from . import cel
 
 
@@ -226,7 +228,7 @@ class _Interpreter:
                 elif type(value) is int:
                     result = str(value)
                 elif type(value) is float:
-                    result = cel._jcs_number(value)
+                    result = rfc8785.dumps(value).decode("utf-8")
                 else:
                     result = value
                 self.charge(len(value) if isinstance(value, str) else 1)
