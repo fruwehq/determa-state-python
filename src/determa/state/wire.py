@@ -337,6 +337,7 @@ def artifact_schema(kind: str) -> dict[str, Any]:
         "aggregate_state_package_v1": "aggregate-state-package-v1.schema.json",
         "execution_checkpoint_v1": "execution-checkpoint-v1.schema.json",
         "core_step_result_v1": "core-step-result-v1.schema.json",
+        "inspection_v1": "inspection-v1.schema.json",
     }[kind]
     return cast(dict[str, Any], json.loads((_DATA / filename).read_text(encoding="utf-8")))
 
@@ -352,6 +353,7 @@ def _schema_registry() -> Any:
         "aggregate_state_package_v1",
         "execution_checkpoint_v1",
         "core_step_result_v1",
+        "inspection_v1",
     ):
         document = artifact_schema(kind)
         registry = registry.with_resource(document["$id"], Resource.from_contents(document))

@@ -68,6 +68,7 @@ packages = ["src/determa"]
 "src/determa/state/data/aggregate-state-package-v1.schema.json" = "determa/state/data/aggregate-state-package-v1.schema.json"
 "src/determa/state/data/execution-checkpoint-v1.schema.json" = "determa/state/data/execution-checkpoint-v1.schema.json"
 "src/determa/state/data/core-step-result-v1.schema.json" = "determa/state/data/core-step-result-v1.schema.json"
+"src/determa/state/data/inspection-v1.schema.json" = "determa/state/data/inspection-v1.schema.json"
 
 [tool.ruff]
 line-length = 100

@@ -31,6 +31,9 @@ from .codes import (
     EngineFaultCode,
     ExecutionStoreAdapterFailureCode,
     ExtensionNegotiationFailureCode,
+    InspectionDispositionCode,
+    InspectionFailureCode,
+    InspectionReasonCode,
     MachineLoadFailureCode,
     PersistenceFailureCode,
 )
@@ -55,6 +58,7 @@ from .host import (
     portable_envelope,
     validate_host_profile,
 )
+from .inspection import inspect_candidate
 from .migration import (
     MigrationLimits,
     restore_migration_descriptor_v1,
@@ -155,6 +159,9 @@ __all__ = [
     "ExecutionStoreAdapterFailureCode",
     "ExtensionNegotiationFailureCode",
     "FileExecutionStore",
+    "InspectionDispositionCode",
+    "InspectionFailureCode",
+    "InspectionReasonCode",
     "MemoryArtifactResolver",
     "MemoryDurableHostStore",
     "MemoryExecutionStore",
@@ -192,6 +199,7 @@ __all__ = [
     "execution_checkpoint_digest",
     "file_execution_store_factory",
     "load_bundle",
+    "inspect_candidate",
     "memory_execution_store_factory",
     "maintenance_migration_request_digest",
     "outbox_intent_digest",

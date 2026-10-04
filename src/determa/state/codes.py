@@ -98,6 +98,27 @@ class ExtensionNegotiationFailureCode(StrEnum):
     UNKNOWN_EXTENSION = "unknown_extension"
 
 
+class InspectionDispositionCode(StrEnum):
+    HANDLED_NOW = "handled_now"
+    DEFERRED = "deferred"
+    UNHANDLED = "unhandled"
+    INVALID = "invalid"
+
+
+class InspectionFailureCode(StrEnum):
+    INVALID_INSPECTION_REQUEST = "invalid_inspection_request"
+    INSPECTION_CAPABILITY_UNAVAILABLE = "inspection_capability_unavailable"
+    INSPECTION_GUARD_FAILURE = "inspection_guard_failure"
+    INSPECTION_LIMIT_EXCEEDED = "inspection_limit_exceeded"
+
+
+class InspectionReasonCode(StrEnum):
+    TARGET_NOT_FOUND = "target_not_found"
+    TARGET_INCARNATION_MISMATCH = "target_incarnation_mismatch"
+    INVALID_ENVELOPE = "invalid_envelope"
+    RUNTIME_INACTIVE = "runtime_inactive"
+
+
 class MachineLoadFailureCode(StrEnum):
     CEL_PROFILE_ERROR = "cel_profile_error"
     DESTROYED_REFERENCE_BINDING = "destroyed_reference_binding"
@@ -159,6 +180,9 @@ _CATEGORY_TYPES: Mapping[str, type[StrEnum]] = MappingProxyType(
         "engine_fault": EngineFaultCode,
         "execution_store_adapter_failure": ExecutionStoreAdapterFailureCode,
         "extension_negotiation_failure": ExtensionNegotiationFailureCode,
+        "inspection_disposition": InspectionDispositionCode,
+        "inspection_failure": InspectionFailureCode,
+        "inspection_reason": InspectionReasonCode,
         "machine_load_failure": MachineLoadFailureCode,
         "persistence_failure": PersistenceFailureCode,
     }

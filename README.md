@@ -146,6 +146,15 @@ Ready and deferred mailboxes are literal portable aggregate state, so queued wor
 survives serialization and restoration. Each operation returns a new JSON-compatible
 logical aggregate while leaving the supplied prior state unchanged.
 
+`inspect_candidate(state, request, resolver)` predicts dispatch for one complete
+normalized envelope at one exact runtime incarnation. It restores and validates the
+aggregate, checks the
+snapshot digest, and returns a closed result or failure without admitting the event.
+Structural mode lists possible dispositions without executing a guard. Semantic mode
+uses a separate bounded CEL inspector and returns evaluated guard evidence; pass
+`semantic_enabled=False` when that optional capability is disabled. A result describes
+only the supplied snapshot, so inspect again after any state change.
+
 `load_bundle` also accepts a native Python mapping through the same structural and
 semantic validation path. Native values must satisfy the same portable Unicode and
 numeric domain as source documents.
@@ -269,6 +278,8 @@ configuration. Root checkpoint deletion is unsupported.
   delivery, outbox lifecycle, replay retention, and root tombstones;
 - public direct execution-store injection and explicit registration for memory, file,
   SQLite, optional PostgreSQL, and third-party adapters.
+- exact-target structural inspection and optional bounded CEL semantic inspection of
+  a restored portable aggregate, with no admission or action execution.
 
 Format 1 deliberately does not define timers, a broker implementation, package
 imports, standardized enabled-event inspection, or a standardized execution CLI.
