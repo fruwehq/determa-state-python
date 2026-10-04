@@ -92,6 +92,11 @@ def test_string_conversion_uses_canonical_values_and_fuel() -> None:
         safe_evaluate('string(true) == "true"', {}, 20)
 
 
+def test_collection_equality_preserves_portable_scalar_types() -> None:
+    assert safe_evaluate('{"x": true} == {"x": 1}', {}, 100)[0] is False
+    assert safe_evaluate("true in [1]", {}, 100)[0] is False
+
+
 def test_inspection_is_read_only_on_queued_aggregate(monkeypatch: pytest.MonkeyPatch) -> None:
     aggregate, request, resolver = _case()
     envelope = copy.deepcopy(request["envelope"])

@@ -39,6 +39,21 @@ def _checked_number(value: Any) -> Any:
     return value
 
 
+def _portable_equal(left: Any, right: Any) -> bool:
+    """Portable recursive equality keeps booleans distinct from integers."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _portable_equal(item, other) for item, other in zip(left, right, strict=True)
+        )
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            _portable_equal(left[key], right[key]) for key in left
+        )
+    return bool(left == right)
+
+
 class _Interpreter:
     def __init__(self, bindings: dict[str, Any], limit: int) -> None:
         self.bindings = bindings
@@ -121,7 +136,7 @@ class _Interpreter:
                     if isinstance(left, str)
                     else 1
                 )
-                result = left == right
+                result = _portable_equal(left, right)
                 return result if operator == "relation_eq" else not result
             if operator.startswith("relation_"):
                 if operator == "relation_in":
@@ -129,7 +144,7 @@ class _Interpreter:
                         self.charge(value_units(right) + value_units(left))
                     else:
                         self.charge(_map_cost(right, left))
-                    return left in right
+                    return any(_portable_equal(left, item) for item in right)
                 self.charge(len(left) + len(right) if isinstance(left, str) else 1)
                 return {
                     "relation_lt": lambda: left < right,
