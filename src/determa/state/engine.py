@@ -1517,6 +1517,7 @@ class _Execution:
         self.cause_id = ""
         self.event = None
         self.capture_emission_provenance = capture_emission_provenance
+        self._provider_writes: list[tuple[str, str]] = []
 
     def append_emission(
         self,
@@ -1785,27 +1786,9 @@ class _Execution:
     def provider_snapshot(
         self, activation: dict[str, Any], binding: dict[str, Any]
     ) -> dict[str, Any]:
-        from .wire import typed_value
+        from .runtime_providers import guard_snapshot
 
-        result: dict[str, Any] = {}
-        inputs = binding["input_types"]
-        if "event" in inputs and self.event is not None:
-            event = copy.deepcopy(self.event)
-            event["payload"] = typed_value(event["payload"])
-            result["event"] = event
-        if "variables" in inputs:
-            result["variables"] = typed_value(
-                {
-                    name: value
-                    for name, value in activation.items()
-                    if name not in {"event", "owner", "env"}
-                }
-            )
-        if "owner" in inputs and "owner" in activation:
-            result["owner"] = typed_value(activation["owner"])
-        if "env" in inputs and "env" in activation:
-            result["env"] = typed_value(activation["env"])
-        return result
+        return guard_snapshot(activation, self.event, binding)
 
     def allocate_components(
         self, runtime: dict[str, Any], machine: MachineModel, state: StateNode
@@ -1949,6 +1932,8 @@ class _Execution:
             return Disposition.UNHANDLED.value
         source, transition, pointer = selected
         try:
+            self._provider_writes.clear()
+            write_start = len(self._provider_writes)
             target, history = self.resolve_compound_transition(
                 runtime,
                 machine,
@@ -1958,7 +1943,11 @@ class _Execution:
                 event_visible=True,
             )
             if target is None:
+                del self._provider_writes[write_start:]
                 return Disposition.HANDLED.value
+            self.validate_provider_writes(
+                runtime, machine, source, target, transition.get("local") is True, write_start
+            )
             self.apply_transition(
                 runtime,
                 machine,
@@ -1970,6 +1959,32 @@ class _Execution:
         except _StopRuntime:
             self.complete_runtime(runtime, machine)
         return Disposition.HANDLED.value
+
+    def validate_provider_writes(
+        self,
+        runtime: dict[str, Any],
+        machine: MachineModel,
+        source: StateNode,
+        target: StateNode,
+        local: bool,
+        write_start: int,
+    ) -> None:
+        """Reject native writes lost by the complete selected transition before commit."""
+        from .runtime_providers import RuntimeProviderError
+
+        boundary = _boundary(machine, source, target, local)
+        exited = {
+            path
+            for path in runtime["active"]
+            if machine.states[path] is not boundary
+            and boundary.is_ancestor_of(machine.states[path], strict=True)
+        }
+        for scope_path, pointer in self._provider_writes[write_start:]:
+            if scope_path in exited:
+                raise StepFault(FaultCode.ACTION_FAULT, pointer) from RuntimeProviderError(
+                    "runtime_provider_output_invalid"
+                )
+        del self._provider_writes[write_start:]
 
     def resolve_compound_transition(
         self,
@@ -2140,6 +2155,7 @@ class _Execution:
                     runtime["scopes"][scope_path][name] = _normalize_value(
                         value, str(declaration["type"])
                     )
+                    self._provider_writes.append((scope_path, pointer))
                 elif "send" in proposal:
                     self.send(
                         runtime,
@@ -2200,6 +2216,8 @@ class _Execution:
             correlation = self.evaluate(
                 send["correlation_id"], activation, f"{pointer}/correlation_id"
             )
+        if "correlation_id" in send and (type(correlation) is not str or not correlation):
+            raise StepFault(FaultCode.ACTION_FAULT, pointer)
         target_specs = send.get("targets") or [send.get("to", {"self": True})]
         evaluated_targets: list[tuple[dict[str, Any], Any]] = []
         for index, target_spec in enumerate(target_specs):
@@ -2238,7 +2256,7 @@ class _Execution:
             and declaration is not None
             and any(
                 declaration["direction"] != ("output" if target == "external" else "internal")
-                or (target == "external" and not isinstance(correlation, str))
+                or (target == "external" and correlation is None)
                 for target in resolved
             )
         ):

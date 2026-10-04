@@ -10,7 +10,6 @@ import ast
 import copy
 import hashlib
 import importlib
-import inspect
 import json
 import types
 from collections.abc import Callable, Mapping, Sequence
@@ -168,7 +167,7 @@ def _loaded_code_matches(source_path: Path, executable: Any) -> bool:
                 return False
 
     def matches(actual: Any, expected: types.CodeType) -> bool:
-        unwrapped = inspect.unwrap(actual)
+        unwrapped = actual
         return (
             isinstance(unwrapped, types.FunctionType)
             and unwrapped.__code__ == expected
@@ -182,7 +181,9 @@ def _loaded_code_matches(source_path: Path, executable: Any) -> bool:
         if getattr(value, "__module__", None) != module_name:
             return False
         if isinstance(value, type):
-            if any(base.__module__ != module_name for base in value.__mro__[1:-1]):
+            if type(value) is not type or any(
+                base.__module__ != module_name for base in value.__mro__[1:-1]
+            ):
                 return False
             declaration = next(
                 (
@@ -207,6 +208,30 @@ def _loaded_code_matches(source_path: Path, executable: Any) -> bool:
                     )
                 )
             ):
+                return False
+            declared_names: set[str] = set()
+            for statement in declaration.body:
+                if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    declared_names.add(statement.name)
+                elif isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                    targets = (
+                        statement.targets
+                        if isinstance(statement, ast.Assign)
+                        else [statement.target]
+                    )
+                    declared_names.update(
+                        target.id for target in targets if isinstance(target, ast.Name)
+                    )
+            implicit_names = {
+                "__module__",
+                "__doc__",
+                "__dict__",
+                "__weakref__",
+                "__annotations__",
+                "__firstlineno__",
+                "__static_attributes__",
+            }
+            if not set(vars(value)).issubset(declared_names | implicit_names):
                 return False
             for method_code in code.co_consts:
                 if not isinstance(method_code, types.CodeType) or method_code.co_name.startswith(
@@ -291,6 +316,7 @@ class RuntimeProviderRegistry:
                 compiler_entry is not None
                 and getattr(source, "_selected_compiler", None) is compiler_entry[0]
                 and compiler_entry[1].digest_matches(key[1][2])
+                and compiler_entry[1].manifest_verified()
                 and _loaded_code_matches(
                     compiler_entry[1].root / compiler_entry[1].python_source,
                     compiler_entry[0],
@@ -370,6 +396,7 @@ class RuntimeProviderRegistry:
         if (
             entry is None
             or not entry[1].digest_matches(reference["content_digest"])
+            or not entry[1].manifest_verified()
             or not _loaded_code_matches(entry[1].root / entry[1].python_source, entry[0])
         ):
             raise RuntimeProviderError("runtime_provider_unavailable")
@@ -692,6 +719,32 @@ class RuntimeProviderRegistry:
         ):
             raise RuntimeProviderError("inspection_guard_failure")
         return result
+
+
+def guard_snapshot(
+    activation: Mapping[str, Any], event: Mapping[str, Any] | None, binding: Mapping[str, Any]
+) -> dict[str, Any]:
+    """The one native provider view used by dispatch and candidate inspection."""
+    from .wire import typed_value
+
+    result: dict[str, Any] = {}
+    inputs = binding["input_types"]
+    if "event" in inputs and event is not None:
+        native_event = copy.deepcopy(dict(event))
+        native_event["payload"] = typed_value(native_event["payload"])
+        result["event"] = native_event
+    if "variables" in inputs:
+        result["variables"] = typed_value(
+            {
+                name: value
+                for name, value in activation.items()
+                if name not in {"event", "owner", "env"}
+            }
+        )
+    for name in ("owner", "env"):
+        if name in inputs and name in activation:
+            result[name] = typed_value(activation[name])
+    return result
 
 
 def immutable_snapshot(value: Any) -> Any:

@@ -242,15 +242,10 @@ def inspect_candidate(
                     )
                 else:
                     assert runtime_providers is not None
-                    from .runtime_providers import RuntimeProviderError
-                    from .wire import typed_value
+                    from .runtime_providers import RuntimeProviderError, guard_snapshot
 
                     binding = guard["provider"]
-                    snapshot: dict[str, Any] = {}
-                    if "event" in binding["input_types"]:
-                        snapshot["event"] = copy.deepcopy(envelope)
-                    if "variables" in binding["input_types"]:
-                        snapshot["variables"] = typed_value(variables)
+                    snapshot = guard_snapshot(activation, candidate, binding)
                     try:
                         value, _charged, cost = runtime_providers.inspect_guard(
                             binding, snapshot, guard_count + 1, remaining

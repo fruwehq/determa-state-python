@@ -29,16 +29,36 @@ def _artifact(value: Any, schema_name: str, artifact_format: str) -> dict[str, A
 
 
 def _tokens(locator: str) -> tuple[str, ...]:
-    return tuple(part.replace("~1", "/").replace("~0", "~") for part in locator.split("/")[1:])
+    parts = locator.split("/")
+    if not locator.startswith("/") or len(parts) < 2:
+        raise RuntimeProviderError("language_compilation_failed")
+    tokens = []
+    for part in parts[1:]:
+        if any(
+            part[index] == "~" and part[index : index + 2] not in {"~0", "~1"}
+            for index in range(len(part))
+        ):
+            raise RuntimeProviderError("language_compilation_failed")
+        decoded = part.replace("~1", "/").replace("~0", "~")
+        if decoded.replace("~", "~0").replace("/", "~1") != part:
+            raise RuntimeProviderError("language_compilation_failed")
+        tokens.append(decoded)
+    return tuple(tokens)
+
+
+def _array_index(token: str) -> int:
+    if not token.isascii() or not token.isdecimal() or (len(token) > 1 and token[0] == "0"):
+        raise RuntimeProviderError("language_compilation_failed")
+    return int(token)
 
 
 def _slot(template: dict[str, Any], tokens: tuple[str, ...]) -> tuple[Any, str]:
     parent: Any = template
     try:
         for token in tokens[:-1]:
-            parent = parent[int(token)] if isinstance(parent, list) else parent[token]
+            parent = parent[_array_index(token)] if isinstance(parent, list) else parent[token]
         key = tokens[-1]
-        _ = parent[int(key)] if isinstance(parent, list) else parent[key]
+        _ = parent[_array_index(key)] if isinstance(parent, list) else parent[key]
     except (IndexError, KeyError, TypeError, ValueError) as exc:
         raise RuntimeProviderError("language_compilation_failed") from exc
     return parent, key
@@ -70,14 +90,16 @@ def compile_language_source(
     for dependency in dependencies:
         if _reference_key(dependency) not in registry._dependencies:
             raise RuntimeProviderError("runtime_provider_unavailable")
-        if not registry._dependencies[_reference_key(dependency)].digest_matches(
-            dependency["content_digest"]
+        closure = registry._dependencies[_reference_key(dependency)]
+        if (
+            not closure.digest_matches(dependency["content_digest"])
+            or not closure.manifest_verified()
         ):
             raise RuntimeProviderError("runtime_provider_unavailable")
     generated = copy.deepcopy(content["template"])
     for location, region in zip(locations, regions, strict=True):
         parent, key = _slot(generated, location)
-        value = parent[int(key)] if isinstance(parent, list) else parent[key]
+        value = parent[_array_index(key)] if isinstance(parent, list) else parent[key]
         if (region["kind"] == "guard" and (key != "guard" or type(value) is not str)) or (
             region["kind"] == "actions"
             and (key not in {"action", "entry", "exit"} or type(value) is not list)
@@ -95,7 +117,7 @@ def compile_language_source(
             raise RuntimeProviderError("language_compilation_failed") from exc
         parent, key = _slot(generated, location)
         if isinstance(parent, list):
-            parent[int(key)] = replacement
+            parent[_array_index(key)] = replacement
         else:
             parent[key] = replacement
     try:
