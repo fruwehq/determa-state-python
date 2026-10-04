@@ -68,6 +68,15 @@ class ConfiguredExtension:
     _instance: Any
 
 
+@dataclass(frozen=True, slots=True)
+class _InstanceBinding:
+    provider: ExtensionProvider
+    provider_type: type
+    instance: Any
+    store: Any | None
+    store_type: type | None
+
+
 def _check(name: str, document: Any, code: Code) -> dict[str, Any]:
     if type(document) is not dict or not _schema(name).is_valid(document):
         raise ExtensionError(code)
@@ -114,6 +123,7 @@ class ExtensionRegistry:
         self._handles: weakref.WeakValueDictionary[int, ConfiguredExtension] = (
             weakref.WeakValueDictionary()
         )
+        self._bindings: dict[int, _InstanceBinding] = {}
         self._entries: dict[
             tuple[str, str, str],
             tuple[dict[str, Any], ExtensionFactory, OperationalEvaluator | None],
@@ -221,6 +231,15 @@ class ExtensionRegistry:
         except (TypeError, ValueError, KeyError) as exc:
             raise ExtensionError(Code.INVALID_EXTENSION_CONFIGURATION) from exc
         configured = ConfiguredExtension(self._token, registered, clean, provider, instance)
+        store = (
+            instance.get("store")
+            if isinstance(provider, _BundledStoreProvider) and isinstance(instance, Mapping)
+            else None
+        )
+        self._bindings[id(configured)] = _InstanceBinding(
+            provider, type(provider), instance, store, type(store) if store is not None else None
+        )
+        weakref.finalize(configured, self._bindings.pop, id(configured), None)
         self._handles[id(configured)] = configured
         self._bound(configured)
         return configured
@@ -232,6 +251,14 @@ class ExtensionRegistry:
             not isinstance(configured, ConfiguredExtension)
             or configured._token is not self._token
             or self._handles.get(id(configured)) is not configured
+        ):
+            raise ExtensionError(Code.EXTENSION_IDENTITY_MISMATCH)
+        binding = self._bindings.get(id(configured))
+        if (
+            binding is None
+            or configured._provider is not binding.provider
+            or type(configured._provider) is not binding.provider_type
+            or configured._instance is not binding.instance
         ):
             raise ExtensionError(Code.EXTENSION_IDENTITY_MISMATCH)
         descriptor, factory, evaluator = self._entry(
@@ -253,12 +280,11 @@ class ExtensionRegistry:
             raise ExtensionError(Code.INVALID_EXTENSION_CONFIGURATION)
         if isinstance(configured._provider, _BundledStoreProvider):
             store = instance.get("store") if isinstance(instance, Mapping) else None
-            if store is None or any(
-                key in vars(type(store))
-                and (
-                    callable(vars(type(store))[key]) or isinstance(vars(type(store))[key], property)
-                )
-                for key in vars(store)
+            if (
+                store is not binding.store
+                or type(store) is not binding.store_type
+                or _shadows_executable(configured._provider)
+                or _shadows_executable(store)
             ):
                 raise ExtensionError(Code.EXTENSION_IDENTITY_MISMATCH)
         return descriptor, configured._provider, instance, evaluator
@@ -460,6 +486,15 @@ class _BundledStoreProvider:
         return "healthy" if instance["store"].health().get("healthy") is True else "unavailable"
 
 
+def _shadows_executable(instance: Any) -> bool:
+    own = vars(instance)
+    return any(
+        name in own and (callable(value) or isinstance(value, property))
+        for ancestor in type(instance).__mro__
+        for name, value in vars(ancestor).items()
+    )
+
+
 def _bundled_source_digest() -> str:
     """Hash the installed package source closure, including schema and store dependencies."""
     import hashlib
@@ -480,73 +515,186 @@ def _bundled_source_digest() -> str:
 
 
 def _bundled_factory_matches_source(name: str, factory: Any) -> bool:
-    """Bind the selected loaded factory and store methods to the hashed package source."""
+    """Bind the loaded package callbacks used by a bundled store to hashed source."""
+    import ast
     import importlib
     import inspect
     import types
 
     package = Path(__file__).parent
     module = importlib.import_module(f"determa.state.stores.{name}")
-    source_path = package / "stores" / f"{name}.py"
-    module_file = getattr(module, "__file__", None)
-    if not isinstance(module_file, str) or Path(module_file).resolve() != source_path.resolve():
-        return False
     if not isinstance(factory, types.FunctionType):
         return False
-    selected_factory: types.FunctionType = factory
-    if (
-        selected_factory is not getattr(module, f"{name}_execution_store_factory", None)
-        or selected_factory.__globals__ is not vars(module)
-        or selected_factory.__module__ != module.__name__
-        or selected_factory.__closure__ is not None
+    if factory is not getattr(
+        module, f"{name}_execution_store_factory", None
+    ) or factory is not getattr(
+        importlib.import_module("determa.state.stores"), f"{name}_execution_store_factory", None
     ):
         return False
 
-    def nested_code(parent: types.CodeType, member_name: str) -> types.CodeType | None:
-        for child in parent.co_consts:
-            if isinstance(child, types.CodeType):
-                if child.co_name == member_name:
-                    return child
-                found = nested_code(child, member_name)
-                if found is not None:
-                    return found
-        return None
+    compiled: dict[str, types.CodeType] = {}
+    syntax: dict[str, ast.Module] = {}
+    seen: set[tuple[str, str]] = set()
 
-    compiled = compile(source_path.read_bytes(), str(source_path), "exec")
-    if selected_factory.__code__ != nested_code(compiled, selected_factory.__name__):
-        return False
-    class_name = {
-        "memory": "MemoryExecutionStore",
-        "file": "FileExecutionStore",
-        "sqlite": "SQLiteExecutionStore",
-        "postgresql": "PostgreSQLExecutionStore",
-    }[name]
-    store_type = vars(module).get(class_name)
-    class_code = nested_code(compiled, class_name)
-    if (
-        not isinstance(store_type, type)
-        or store_type.__module__ != module.__name__
-        or class_code is None
-    ):
-        return False
-    for child in class_code.co_consts:
-        if not isinstance(child, types.CodeType):
-            continue
-        method = vars(store_type).get(child.co_name)
-        if isinstance(method, property):
-            method = method.fget
-        elif isinstance(method, (staticmethod, classmethod)):
-            method = method.__func__
-        if method is None or not callable(method):
-            return False
-        unwrapped = inspect.unwrap(method)
+    def source_code(origin: types.ModuleType) -> types.CodeType | None:
+        path = getattr(origin, "__file__", None)
+        if not isinstance(path, str):
+            return None
+        source_path = package / Path(*origin.__name__.split(".")[2:])
+        source_path = (
+            source_path / "__init__.py" if source_path.is_dir() else source_path.with_suffix(".py")
+        )
+        if Path(path).resolve() != source_path.resolve() or not source_path.is_file():
+            return None
+        if origin.__name__ not in compiled:
+            source = source_path.read_bytes()
+            tree = ast.parse(source)
+            for node in tree.body:
+                if isinstance(node, ast.ImportFrom) and node.level:
+                    imported = importlib.import_module(
+                        "." * node.level + (node.module or ""), origin.__package__
+                    )
+                    for alias in node.names:
+                        if alias.name == "*" or vars(origin).get(
+                            alias.asname or alias.name
+                        ) is not getattr(imported, alias.name, None):
+                            return None
+            compiled[origin.__name__] = compile(source, str(source_path), "exec")
+            syntax[origin.__name__] = tree
+        return compiled[origin.__name__]
+
+    def direct_code(parent: types.CodeType, member_name: str) -> types.CodeType | None:
+        return next(
+            (
+                child
+                for child in parent.co_consts
+                if isinstance(child, types.CodeType) and child.co_name == member_name
+            ),
+            None,
+        )
+
+    def verify_definition(origin: types.ModuleType, member_name: str) -> bool:
+        key = (origin.__name__, member_name)
+        if key in seen:
+            return True
+        seen.add(key)
+        top = source_code(origin)
+        expected = direct_code(top, member_name) if top is not None else None
+        value = vars(origin).get(member_name)
         if (
-            not isinstance(unwrapped, types.FunctionType)
-            or unwrapped.__code__ != child
-            or unwrapped.__globals__ is not vars(module)
+            expected is None
+            or value is None
+            or getattr(value, "__module__", None) != origin.__name__
         ):
             return False
+
+        def verify_function(candidate: Any, code: types.CodeType) -> bool:
+            actual = inspect.unwrap(candidate)
+            if (
+                not isinstance(actual, types.FunctionType)
+                or actual.__code__ != code
+                or actual.__globals__ is not vars(origin)
+            ):
+                return False
+            for global_name in code.co_names:
+                dependency = actual.__globals__.get(global_name)
+                dependency_module = getattr(dependency, "__module__", "")
+                if (
+                    isinstance(dependency, (types.FunctionType, type))
+                    and isinstance(dependency_module, str)
+                    and dependency_module.startswith("determa.state.")
+                ):
+                    source_module = importlib.import_module(dependency_module)
+                    dependency_name = getattr(dependency, "__name__", None)
+                    if (
+                        not isinstance(dependency_name, str)
+                        or getattr(source_module, dependency_name, None) is not dependency
+                        or not verify_definition(source_module, dependency_name)
+                    ):
+                        return False
+            return True
+
+        if isinstance(value, type):
+            declaration = next(
+                (
+                    node
+                    for node in syntax[origin.__name__].body
+                    if isinstance(node, ast.ClassDef) and node.name == member_name
+                ),
+                None,
+            )
+            if (
+                declaration is None
+                or len(value.__bases__) != max(1, len(declaration.bases))
+                or any(
+                    not isinstance(base, ast.Name)
+                    or vars(origin).get(base.id) is not value.__bases__[index]
+                    for index, base in enumerate(declaration.bases)
+                )
+            ):
+                return False
+            for child in expected.co_consts:
+                if not isinstance(child, types.CodeType) or child.co_name.startswith("<"):
+                    continue
+                method = vars(value).get(child.co_name)
+                if isinstance(method, property):
+                    method = method.fget
+                elif isinstance(method, (staticmethod, classmethod)):
+                    method = method.__func__
+                if not verify_function(method, child):
+                    return False
+            return True
+        return verify_function(value, expected)
+
+    for origin in (
+        importlib.import_module(__name__),
+        module,
+        importlib.import_module("determa.state.stores.base"),
+    ):
+        top = source_code(origin)
+        if top is None:
+            return False
+        for child in top.co_consts:
+            if isinstance(child, types.CodeType) and not child.co_name.startswith("<"):
+                if not verify_definition(origin, child.co_name):
+                    return False
     return True
+
+
+def _bundled_provider_factory_matches_source(factory: Any) -> bool:
+    """The registry's selected wrapper factory must itself be the installed code."""
+    import types
+
+    if (
+        not isinstance(factory, types.FunctionType)
+        or factory.__name__ != "make_provider"
+        or factory.__module__ != __name__
+        or factory.__globals__ is not globals()
+        or factory.__closure__ is not None
+    ):
+        return False
+    compiled = compile(Path(__file__).read_bytes(), __file__, "exec")
+    outer = next(
+        (
+            child
+            for child in compiled.co_consts
+            if isinstance(child, types.CodeType) and child.co_name == "bundled_extension_registry"
+        ),
+        None,
+    )
+    inner = (
+        next(
+            (
+                child
+                for child in outer.co_consts
+                if isinstance(child, types.CodeType) and child.co_name == "make_provider"
+            ),
+            None,
+        )
+        if outer is not None
+        else None
+    )
+    return factory.__code__ == inner
 
 
 def bundled_extension_registry(
@@ -586,7 +734,7 @@ def bundled_extension_registry(
             return installed and _bundled_factory_matches_source(
                 identifier.removeprefix("determa.store."), provider.factory
             )
-        if callable(provider) and getattr(provider, "__module__", None) == __name__:
+        if _bundled_provider_factory_matches_source(provider):
             selected = getattr(provider, "__defaults__", None)
             return (
                 installed

@@ -7,6 +7,7 @@ from dataclasses import replace
 
 import pytest
 
+import determa.state.extensions as extensions
 import determa.state.stores as bundled_stores
 import determa.state.stores.memory as memory_module
 from determa.state.extensions import (
@@ -303,6 +304,82 @@ def test_bundled_factory_dependency_replacement_is_refused(
         registry.negotiate(
             record, {"instance_id": "primary", "uri": "memory:", "store_configuration": {}}
         )
+
+
+def test_bundled_configured_objects_cannot_change_dispatch_targets() -> None:
+    registry = bundled_extension_registry(include_postgresql=False)
+    record = next(
+        item
+        for item in registry.descriptors
+        if item["provider_reference"]["identifier"] == "determa.store.memory"
+    )
+    configuration = {"instance_id": "primary", "uri": "memory:", "store_configuration": {}}
+    configured = registry.validate_configuration(record, configuration)
+    calls = 0
+
+    class SubstituteStore:
+        capabilities = frozenset({"ephemeral"})
+
+        def health(self) -> dict[str, bool]:
+            nonlocal calls
+            calls += 1
+            return {"healthy": True}
+
+    configured._instance["store"] = SubstituteStore()
+    with pytest.raises(ExtensionError, match="extension_identity_mismatch"):
+        registry.capabilities(configured)
+    with pytest.raises(ExtensionError, match="extension_identity_mismatch"):
+        registry.health(configured)
+    assert calls == 0
+
+    configured = registry.validate_configuration(record, configuration)
+    original_type = type(configured._provider)
+
+    class SubstituteProvider(original_type):
+        def capabilities(self, _instance: object) -> list[str]:
+            nonlocal calls
+            calls += 1
+            return ["ephemeral"]
+
+    configured._provider.__class__ = SubstituteProvider
+    with pytest.raises(ExtensionError, match="extension_identity_mismatch"):
+        registry.capabilities(configured)
+    assert calls == 0
+
+    configured = registry.validate_configuration(record, configuration)
+    configured._provider.capabilities = lambda _instance: ["ephemeral"]
+    with pytest.raises(ExtensionError, match="extension_identity_mismatch"):
+        registry.capabilities(configured)
+
+
+def test_bundled_wrapper_and_transaction_callbacks_match_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = extensions._BundledStoreProvider.capabilities
+    calls = 0
+
+    def delegated(self: object, instance: object) -> list[str]:
+        nonlocal calls
+        calls += 1
+        return original(self, instance)
+
+    monkeypatch.setattr(extensions._BundledStoreProvider, "capabilities", delegated)
+    registry = bundled_extension_registry(include_postgresql=False)
+    record = next(
+        item
+        for item in registry.descriptors
+        if item["provider_reference"]["identifier"] == "determa.store.memory"
+    )
+    configuration = {"instance_id": "primary", "uri": "memory:", "store_configuration": {}}
+    with pytest.raises(ExtensionError, match="extension_identity_mismatch"):
+        registry.negotiate(record, configuration)
+    assert calls == 0
+
+    monkeypatch.undo()
+    monkeypatch.setattr(memory_module, "_MemoryTransaction", lambda *_args: object())
+    registry = bundled_extension_registry(include_postgresql=False)
+    with pytest.raises(ExtensionError, match="extension_identity_mismatch"):
+        registry.negotiate(record, configuration)
 
 
 def test_requested_profile_cannot_skip_composition() -> None:
