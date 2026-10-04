@@ -93,6 +93,15 @@ def _validate_manifest_artifact(path: Path, artifact: dict) -> None:
     if artifact["kind"] in _PORTABLE_ARTIFACT_KINDS:
         validate_version1_artifact(path, artifact)
         return
+    if artifact["kind"] == "json_value":
+        try:
+            json.loads((path / artifact["file"]).read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, UnicodeError):
+            valid = False
+        else:
+            valid = True
+        assert valid is artifact["valid"]
+        return
     schema_name = _CONFORMANCE_ARTIFACT_SCHEMAS[artifact["kind"]]
     schema_path = conformance_root() / "scripts" / "schemas" / schema_name
     schema = json.loads(schema_path.read_text(encoding="utf-8"))
@@ -128,10 +137,10 @@ def _spec_root() -> Path | None:
 
 def test_suite_present() -> None:
     assert CORE_DIR.exists(), "pinned conformance suite is unavailable"
-    assert len(core_cases()) == 98
+    assert len(core_cases()) == 99
     assert len(version1_vectors()) == 162
     assert len(durable_host_vectors()) == 142
-    assert len(_manifest_artifacts()) == 403
+    assert len(_manifest_artifacts()) == 420
 
 
 @pytest.mark.parametrize("stored", [b"mutated", None])
@@ -674,4 +683,9 @@ def test_durable_host_vector(item) -> None:
 )
 def test_version1_artifact(case, artifact) -> None:
     path = case.path if isinstance(case, CoreCase) else case
+    if "inspection-provider" in path.parts and artifact["kind"] == "aggregate_state_v1":
+        from determa.state.wire import load_json_artifact
+
+        load_json_artifact((path / artifact["file"]).read_bytes(), "aggregate_state_v1")
+        pytest.skip("optional native guard-provider semantic restore is not claimed")
     _validate_manifest_artifact(path, artifact)
