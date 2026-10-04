@@ -19,7 +19,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: fruwehq/determa-state-conformance
-          ref: bbb215961448ad691189c41072d8ea03f76f9372
+          ref: ce6c94ee1929597689403080d1790e2f48f8a5fb
           path: .pinned/determa-state-conformance
       - name: Check out pinned specification
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -54,7 +54,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: fruwehq/determa-state-conformance
-          ref: bbb215961448ad691189c41072d8ea03f76f9372
+          ref: ce6c94ee1929597689403080d1790e2f48f8a5fb
           path: .pinned/determa-state-conformance
       - name: Check out pinned specification
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -92,7 +92,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: fruwehq/determa-state-conformance
-          ref: bbb215961448ad691189c41072d8ea03f76f9372
+          ref: ce6c94ee1929597689403080d1790e2f48f8a5fb
           path: .pinned/determa-state-conformance
       - name: Check out pinned specification
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -81,7 +81,7 @@ packages = ["src/determa"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
-extend-exclude = ["vendor"]  # the Determa State spec repo is a vendored submodule, not ours to lint
+extend-exclude = ["vendor", ".pinned"]  # external spec/conformance checkouts are not ours to lint
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "W", "C4"]

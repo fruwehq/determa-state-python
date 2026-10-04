@@ -8,7 +8,7 @@ commit `86bb88dd21cb1f799eefe5020b6e49dabf6e7225`. Correctness is determined by
 99 format-1 core cases, 162 version-1 vectors, 142 durable-host vectors, 49 core
 inspection vectors, 47 extension negotiation vectors, 7 native guard-provider
 inspection vectors, 30 runtime-provider vectors, and 476 manifest artifacts at
-conformance commit `bbb215961448ad691189c41072d8ea03f76f9372`. The native
+conformance commit `ce6c94ee1929597689403080d1790e2f48f8a5fb`. The native
 runtime-provider profile is optional and is exercised through its production adapter.
 
 The package metadata is `0.3.0`. Artifact and checkpoint schema version 1 is the
@@ -275,6 +275,12 @@ operational profile proof before the host can advertise them.
 `RuntimeProviderRegistry` installs exact native guard and action providers through
 that same common registration boundary. `SourceClosure` binds the loaded Python
 callable and its declared dependency files to the reference and source digest.
+The registry checks source-literal function defaults and the selected callable's
+identity before use; mutable provider state may change in place. Hosts loading
+providers with dynamic defaults or external executable dependencies can supply
+`source_identity_verifier` when constructing the registry. That host callback must
+independently attest the selected loaded executable and its source provenance;
+provider self-assertions are not evidence.
 `load_bundle(..., runtime_providers=registry)` preflights every native slot, including
 unreachable declarations. The engine passes immutable typed snapshots, validates
 ordered action proposals, and retains the ordinary atomic rollback and fault codes.

@@ -35,11 +35,30 @@ _DOMAIN = b"determa-test-runtime-provider-closure-1\0"
 
 
 def _modified_runtime_bundle(
-    tmp_path: Path, source_transform: str | None = None, *, local_destination: bool = False
+    tmp_path: Path,
+    source_transform: str | None = None,
+    *,
+    local_destination: bool = False,
+    provider_source: str | None = None,
+    allow_dynamic_source: bool = False,
+    dependency_source: str | None = None,
 ) -> tuple[object, RuntimeProviderRegistry]:
     root = tmp_path / "fixture"
+    root.parent.mkdir(parents=True, exist_ok=True)
     shutil.copytree(_PROFILE, root)
     provider_path = root / "provider/test_provider.py"
+    if provider_source is not None:
+        provider_path.write_text(provider_source)
+    closure_paths = ("provider/test_provider.py", "provider/test_provider.rs")
+    if dependency_source is not None:
+        dependency_path = root / "provider/base.py"
+        dependency_path.write_text(dependency_source)
+        spec = importlib.util.spec_from_file_location("external_base_fixture", dependency_path)
+        assert spec is not None and spec.loader is not None
+        dependency_module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = dependency_module
+        spec.loader.exec_module(dependency_module)
+        closure_paths = ("provider/base.py", *closure_paths)
     if source_transform is not None:
         source = provider_path.read_text()
         source = source.replace('["string", "provider-correlation"]', source_transform)
@@ -47,6 +66,8 @@ def _modified_runtime_bundle(
         provider_path.write_text(source)
     manifest_path = root / "provider-closure.json"
     manifest = json.loads(manifest_path.read_text())
+    if dependency_source is not None:
+        manifest["files"].insert(0, {"path": "provider/base.py", "sha256": ""})
     for entry in manifest["files"]:
         entry["sha256"] = (
             "sha256:" + hashlib.sha256((root / entry["path"]).read_bytes()).hexdigest()
@@ -54,7 +75,7 @@ def _modified_runtime_bundle(
     manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")))
     closure = SourceClosure(
         root,
-        ("provider/test_provider.py", "provider/test_provider.rs"),
+        closure_paths,
         "provider-closure.json",
         _DOMAIN,
         "provider/test_provider.py",
@@ -76,7 +97,16 @@ def _modified_runtime_bundle(
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-    registry = RuntimeProviderRegistry()
+    registry = RuntimeProviderRegistry(
+        source_identity_verifier=(
+            lambda path, executable: (
+                path.resolve() == provider_path.resolve()
+                and executable is module.Provider.evaluate_guard
+            )
+        )
+        if allow_dynamic_source
+        else None
+    )
     guard = json.loads((root / "guard-descriptor.json").read_text())
     actions = json.loads((root / "actions-descriptor.json").read_text())
     registry.register_dependency(guard["binding"]["dependencies"][0], closure)
@@ -449,6 +479,213 @@ def test_semantic_and_ordinary_guards_see_same_native_event(tmp_path: Path) -> N
     assert admitted["state"] is not None
     result = step(admitted["state"], runtime["runtime_id"], resolver)
     assert result["disposition"] == "handled"
+
+
+def _fixture_guard_binding(bundle: object) -> dict:
+    return bundle.raw["machines"][0]["root"]["states"]["pending"]["on_events"]["submit"][1][
+        "guard"
+    ]["provider"]
+
+
+def _approved_snapshot() -> dict:
+    return {"event": {"payload": ["map", [["approved", ["boolean", True]]]]}}
+
+
+def test_loaded_keyword_default_rebinding_rejected_before_call_and_restore(
+    tmp_path: Path,
+) -> None:
+    bundle, registry = _modified_runtime_bundle(tmp_path)
+    binding = _fixture_guard_binding(bundle)
+    assert registry.invoke_guard(binding, _approved_snapshot()) is True
+    aggregate = create(bundle, "order", "default-root", "default-create", {})["state"]
+    provider = registry.resolve("guard", binding).provider
+    original = type(provider).evaluate_guard.__kwdefaults__
+    assert original is not None
+    original["guard_override"] = False
+    with pytest.raises(RuntimeProviderError, match="runtime_provider_unavailable"):
+        registry.invoke_guard(binding, _approved_snapshot())
+    with pytest.raises(RuntimeProviderError, match="runtime_provider_unavailable"):
+        restore_aggregate(
+            aggregate, MemoryArtifactResolver(definitions={bundle.fingerprint: bundle})
+        )
+    assert provider.guard_calls == 1
+
+
+def test_loaded_positional_default_rebinding_rejected(tmp_path: Path) -> None:
+    source = (
+        (_PROFILE / "provider/test_provider.py")
+        .read_text()
+        .replace(
+            "def evaluate_guard(self, snapshot, *,",
+            "def evaluate_guard(self, snapshot, marker=None, *,",
+        )
+    )
+    bundle, registry = _modified_runtime_bundle(tmp_path, provider_source=source)
+    binding = _fixture_guard_binding(bundle)
+    provider = registry.resolve("guard", binding).provider
+    assert registry.invoke_guard(binding, _approved_snapshot()) is True
+    type(provider).evaluate_guard.__defaults__ = (False,)
+    with pytest.raises(RuntimeProviderError, match="runtime_provider_unavailable"):
+        registry.invoke_guard(binding, _approved_snapshot())
+    assert provider.guard_calls == 1
+
+
+def test_mutable_default_contents_may_change_but_slot_rebinding_fails(tmp_path: Path) -> None:
+    source = (
+        (_PROFILE / "provider/test_provider.py")
+        .read_text()
+        .replace(
+            "def evaluate_guard(self, snapshot, *,",
+            "def evaluate_guard(self, snapshot, marker=[], *,",
+        )
+    )
+    bundle, registry = _modified_runtime_bundle(tmp_path, provider_source=source)
+    binding = _fixture_guard_binding(bundle)
+    provider = registry.resolve("guard", binding).provider
+    defaults = type(provider).evaluate_guard.__defaults__
+    assert defaults is not None
+    defaults[0].append("local-state")
+    assert registry.invoke_guard(binding, _approved_snapshot()) is True
+    type(provider).evaluate_guard.__defaults__ = ([],)
+    with pytest.raises(RuntimeProviderError, match="runtime_provider_unavailable"):
+        registry.invoke_guard(binding, _approved_snapshot())
+    assert provider.guard_calls == 1
+
+
+def test_same_source_inherited_evaluator_executes_and_rebind_fails(tmp_path: Path) -> None:
+    source = (
+        (_PROFILE / "provider/test_provider.py")
+        .read_text()
+        .replace("class Provider:", "class BaseProvider:")
+        .replace(
+            "\ndef compile_region(",
+            "\nclass Provider(BaseProvider):\n    pass\n\ndef compile_region(",
+        )
+    )
+    bundle, registry = _modified_runtime_bundle(tmp_path, provider_source=source)
+    binding = _fixture_guard_binding(bundle)
+    assert registry.invoke_guard(binding, _approved_snapshot()) is True
+    selected = registry.resolve("guard", binding).provider
+    assert type(selected).__bases__[0].__name__ == "BaseProvider"
+    assert selected.guard_calls == 1
+    invoked = []
+
+    def substitute(*_args: object, **_kwargs: object) -> bool:
+        invoked.append(True)
+        return False
+
+    type(selected).__bases__[0].evaluate_guard = substitute
+    with pytest.raises(RuntimeProviderError, match="runtime_provider_unavailable"):
+        registry.invoke_guard(binding, _approved_snapshot())
+    assert not invoked
+
+
+def test_declared_source_dependency_inherited_evaluator_is_verified(tmp_path: Path) -> None:
+    dependency = """class BaseProvider:
+    def __init__(self):
+        self.guard_calls = 0
+        self.external_effect_log = []
+
+    def evaluate_guard(self, snapshot, *, guard_override=None):
+        self.guard_calls += 1
+        return bool(dict(snapshot["event"]["payload"][1])["approved"][1])
+"""
+    source = """from external_base_fixture import BaseProvider
+
+class Provider(BaseProvider):
+    def evaluate_actions(self, snapshot):
+        return {"actions": []}
+
+    def inspect_guard(self, snapshot, maximum_guard_evaluations, maximum_evaluation_steps):
+        return True, 1, 2
+"""
+    bundle, registry = _modified_runtime_bundle(
+        tmp_path, provider_source=source, dependency_source=dependency
+    )
+    binding = _fixture_guard_binding(bundle)
+    provider = registry.resolve("guard", binding).provider
+    assert registry.invoke_guard(binding, _approved_snapshot()) is True
+    assert provider.guard_calls == 1
+    provider.external_effect_log.append("weak-local-state")
+    assert registry.invoke_guard(binding, _approved_snapshot()) is True
+    assert provider.external_effect_log == ["weak-local-state"]
+    base = type(provider).__bases__[0]
+    base.evaluate_guard.__kwdefaults__["guard_override"] = False
+    with pytest.raises(RuntimeProviderError, match="runtime_provider_unavailable"):
+        registry.invoke_guard(binding, _approved_snapshot())
+    assert provider.guard_calls == 2
+    base.evaluate_guard.__kwdefaults__["guard_override"] = None
+    called = []
+
+    def substitute(*_args: object, **_kwargs: object) -> bool:
+        called.append(True)
+        return False
+
+    base.evaluate_guard = substitute
+    with pytest.raises(RuntimeProviderError, match="runtime_provider_unavailable"):
+        registry.invoke_guard(binding, _approved_snapshot())
+    assert not called
+
+
+def test_weak_native_provider_mutable_state_is_legal(tmp_path: Path) -> None:
+    bundle, registry = _modified_runtime_bundle(tmp_path)
+    binding = _fixture_guard_binding(bundle)
+    selected = registry.resolve("guard", binding)
+    assert selected.capabilities["pure"] is False
+    selected.provider.external_effect_log.append({"effect_id": "local-state"})
+    assert registry.invoke_guard(binding, _approved_snapshot()) is True
+    assert selected.provider.external_effect_log == [{"effect_id": "local-state"}]
+
+
+def test_source_declared_slots_do_not_hide_weak_provider(tmp_path: Path) -> None:
+    source = (
+        (_PROFILE / "provider/test_provider.py")
+        .read_text()
+        .replace(
+            "class Provider:",
+            "class Provider:\n"
+            "    __slots__ = ('guard_calls', 'action_calls', 'external_calls', "
+            "'irreversible_effects', 'external_effect_log')",
+        )
+    )
+    bundle, registry = _modified_runtime_bundle(tmp_path, provider_source=source)
+    binding = _fixture_guard_binding(bundle)
+    assert registry.invoke_guard(binding, _approved_snapshot()) is True
+
+
+def test_nonliteral_default_requires_public_host_identity_verifier(tmp_path: Path) -> None:
+    source = (
+        (_PROFILE / "provider/test_provider.py")
+        .read_text()
+        .replace("guard_override=None", "guard_override=bool(0)")
+    )
+    with pytest.raises(RuntimeProviderError, match="runtime_provider_unavailable"):
+        _modified_runtime_bundle(tmp_path / "unverified", provider_source=source)
+    bundle, registry = _modified_runtime_bundle(
+        tmp_path / "verified", provider_source=source, allow_dynamic_source=True
+    )
+    binding = _fixture_guard_binding(bundle)
+    assert registry.invoke_guard(binding, _approved_snapshot()) is False
+
+
+def test_decorated_evaluator_requires_host_identity_verifier(tmp_path: Path) -> None:
+    decorator = """def wrap(fn):
+    def wrapper(self, snapshot, **options):
+        return fn(self, snapshot, **options)
+    return wrapper
+
+"""
+    source = decorator + (_PROFILE / "provider/test_provider.py").read_text().replace(
+        "    def evaluate_guard(self, snapshot, *,",
+        "    @wrap\n    def evaluate_guard(self, snapshot, *,",
+    )
+    with pytest.raises(RuntimeProviderError, match="runtime_provider_unavailable"):
+        _modified_runtime_bundle(tmp_path / "unverified", provider_source=source)
+    bundle, registry = _modified_runtime_bundle(
+        tmp_path / "verified", provider_source=source, allow_dynamic_source=True
+    )
+    binding = _fixture_guard_binding(bundle)
+    assert registry.invoke_guard(binding, _approved_snapshot()) is True
 
 
 def test_required_native_guarantee_is_rechecked_before_creation() -> None:

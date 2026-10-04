@@ -10,7 +10,9 @@ import ast
 import copy
 import hashlib
 import importlib
+import importlib.util
 import json
+import sys
 import types
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -18,6 +20,83 @@ from pathlib import Path
 from typing import Any
 
 from .extensions import ExtensionError, ExtensionRegistry
+
+SourceIdentityVerifier = Callable[[Path, Any], bool]
+
+
+def _default_record(value: Any) -> tuple[str, Any]:
+    if type(value) is tuple:
+        return "tuple", tuple(_default_record(item) for item in value)
+    if type(value) is frozenset:
+        return "frozenset", frozenset(_default_record(item) for item in value)
+    if type(value) in {type(None), bool, int, float, str, bytes, complex}:
+        return "value", (type(value), value)
+    return "identity", value
+
+
+def _default_still_matches(record: tuple[str, Any], value: Any) -> bool:
+    kind, saved = record
+    if kind == "tuple":
+        return (
+            type(value) is tuple
+            and len(value) == len(saved)
+            and all(
+                _default_still_matches(item, actual)
+                for item, actual in zip(saved, value, strict=True)
+            )
+        )
+    if kind == "frozenset":
+        return type(value) is frozenset and _default_record(value) == record
+    if kind == "value":
+        expected_type, expected_value = saved
+        return type(value) is expected_type and value == expected_value
+    return value is saved
+
+
+@dataclass(frozen=True)
+class _CallableBinding:
+    function: types.FunctionType
+    positional: tuple[tuple[str, Any], ...]
+    keyword: dict[str, tuple[str, Any]]
+
+
+def _bound_provider_method(provider: Any, name: str) -> types.MethodType:
+    """Select the first concrete MRO descriptor without invoking instance hooks."""
+    try:
+        if name in object.__getattribute__(provider, "__dict__"):
+            raise RuntimeProviderError("runtime_provider_unavailable")
+    except AttributeError:
+        pass
+    for owner in type.__getattribute__(type(provider), "__mro__"):
+        descriptor = type.__getattribute__(owner, "__dict__").get(name)
+        if descriptor is not None:
+            if not isinstance(descriptor, types.FunctionType):
+                raise RuntimeProviderError("runtime_provider_unavailable")
+            return types.MethodType(descriptor, provider)
+    raise RuntimeProviderError("runtime_provider_unavailable")
+
+
+def _literal_matches(actual: Any, expected: Any) -> bool:
+    if type(actual) is not type(expected):
+        return False
+    if type(actual) in {list, tuple}:
+        return len(actual) == len(expected) and all(
+            _literal_matches(a, b) for a, b in zip(actual, expected, strict=True)
+        )
+    if type(actual) in {set, frozenset}:
+        return len(actual) == len(expected) and all(
+            any(_literal_matches(item, candidate) for candidate in expected) for item in actual
+        )
+    if type(actual) is dict:
+        return len(actual) == len(expected) and all(
+            any(
+                _literal_matches(actual_key, expected_key)
+                and _literal_matches(actual_value, expected_value)
+                for expected_key, expected_value in expected.items()
+            )
+            for actual_key, actual_value in actual.items()
+        )
+    return bool(actual == expected)
 
 
 class RuntimeProviderError(ValueError):
@@ -88,7 +167,15 @@ class SourceClosure:
         except (OSError, ValueError):
             return False
 
-    def verified(self, binding: Mapping[str, Any], executable: Any) -> bool:
+    def verified(
+        self,
+        binding: Mapping[str, Any],
+        executable: Any,
+        *,
+        anchors: dict[tuple[str, str, str], _CallableBinding] | None = None,
+        capture: bool = False,
+        identity_verifier: SourceIdentityVerifier | None = None,
+    ) -> bool:
         try:
             if not self.digest_matches(binding["provider_reference"]["content_digest"]):
                 return False
@@ -101,12 +188,24 @@ class SourceClosure:
                 return False
             if not self.manifest_verified():
                 return False
-            return _loaded_code_matches(self.root / self.python_source, executable)
+            return _loaded_code_matches(
+                self.root / self.python_source,
+                executable,
+                anchors=anchors,
+                capture=capture,
+                identity_verifier=identity_verifier,
+                trusted_sources=self.trusted_python_sources(),
+            )
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             return False
 
     def manifest_digest(self) -> str:
         return "sha256:" + hashlib.sha256((self.root / self.manifest).read_bytes()).hexdigest()
+
+    def trusted_python_sources(self) -> frozenset[Path]:
+        return frozenset(
+            (self.root / name).resolve() for name in self.paths if name.endswith(".py")
+        )
 
     def manifest_verified(self) -> bool:
         try:
@@ -135,56 +234,198 @@ class SourceClosure:
             return False
 
 
-def _loaded_code_matches(source_path: Path, executable: Any) -> bool:
+def _loaded_code_matches(
+    source_path: Path,
+    executable: Any,
+    *,
+    anchors: dict[tuple[str, str, str], _CallableBinding] | None = None,
+    capture: bool = False,
+    identity_verifier: SourceIdentityVerifier | None = None,
+    trusted_sources: frozenset[Path] | None = None,
+    visited: set[Path] | None = None,
+) -> bool:
     """Compare selected Python code and its module callbacks to installed bytes."""
-    module_name = getattr(executable, "__module__", None)
+    module_name = (
+        type.__getattribute__(executable, "__module__")
+        if isinstance(executable, type)
+        else getattr(executable, "__module__", None)
+    )
     if not isinstance(module_name, str):
         return False
-    module = importlib.import_module(module_name)
-    if Path(getattr(module, "__file__", "")).resolve() != source_path.resolve():
+    module = sys.modules.get(module_name)
+    if module is None or Path(vars(module).get("__file__", "")).resolve() != source_path.resolve():
         return False
+    if trusted_sources is None:
+        trusted_sources = frozenset({source_path.resolve()})
+    if visited is None:
+        visited = set()
+    if source_path.resolve() in visited:
+        return True
+    visited.add(source_path.resolve())
+
+    def host_verified(selected: Any) -> bool:
+        if identity_verifier is None:
+            return False
+        try:
+            return identity_verifier(source_path, selected) is True
+        except Exception:
+            return False
+
+    if source_path.suffix != ".py":
+        return host_verified(executable)
     source = source_path.read_bytes()
     tree = ast.parse(source)
     compiled = compile(source, str(source_path), "exec", dont_inherit=True)
+
     for node in tree.body:
         if isinstance(node, ast.Import):
             for alias in node.names:
-                loaded = importlib.import_module(alias.name)
+                loaded = sys.modules.get(alias.name)
                 if alias.asname is None and "." in alias.name:
-                    loaded = importlib.import_module(alias.name.split(".", 1)[0])
-                if vars(module).get(alias.asname or alias.name.split(".", 1)[0]) is not loaded:
+                    loaded = sys.modules.get(alias.name.split(".", 1)[0])
+                if (
+                    loaded is None
+                    or vars(module).get(alias.asname or alias.name.split(".", 1)[0]) is not loaded
+                ):
                     return False
         elif isinstance(node, ast.ImportFrom) and node.module != "__future__":
-            loaded = importlib.import_module(
-                "." * node.level + (node.module or ""), module.__package__
+            resolved_name = importlib.util.resolve_name(
+                "." * node.level + (node.module or ""), vars(module).get("__package__")
             )
+            loaded = sys.modules.get(resolved_name)
+            if loaded is None:
+                return False
             if any(
                 alias.name == "*"
-                or vars(module).get(alias.asname or alias.name)
-                is not getattr(loaded, alias.name, None)
+                or vars(module).get(alias.asname or alias.name) is not vars(loaded).get(alias.name)
                 for alias in node.names
             ):
                 return False
 
-    def matches(actual: Any, expected: types.CodeType) -> bool:
-        unwrapped = actual
-        return (
-            isinstance(unwrapped, types.FunctionType)
-            and unwrapped.__code__ == expected
-            and unwrapped.__globals__ is vars(module)
+    def matches(
+        actual: Any,
+        expected: types.CodeType,
+        declaration: ast.AST | None,
+        key: tuple[str, str, str],
+    ) -> bool:
+        if not isinstance(actual, types.FunctionType) or not isinstance(
+            declaration, (ast.FunctionDef, ast.AsyncFunctionDef)
+        ):
+            return False
+        source_backed = (
+            actual.__code__ == expected
+            and actual.__globals__ is vars(module)
+            and actual.__closure__ is None
         )
+        if not source_backed and not host_verified(actual):
+            return False
+        positional = actual.__defaults__
+        keyword = actual.__kwdefaults__
+        if (positional is not None and type(positional) is not tuple) or (
+            keyword is not None and type(keyword) is not dict
+        ):
+            return False
+        positional_values = positional or ()
+        keyword_values = keyword or {}
+        expected_keywords = {
+            arg.arg
+            for arg, default in zip(
+                declaration.args.kwonlyargs, declaration.args.kw_defaults, strict=True
+            )
+            if default is not None
+        }
+        if source_backed and (
+            len(positional_values) != len(declaration.args.defaults)
+            or set(keyword_values) != expected_keywords
+        ):
+            return False
+        if anchors is not None and not capture:
+            anchored = anchors.get(key)
+            return bool(
+                anchored is not None
+                and actual is anchored.function
+                and len(positional_values) == len(anchored.positional)
+                and all(
+                    _default_still_matches(saved, value)
+                    for saved, value in zip(anchored.positional, positional_values, strict=True)
+                )
+                and keyword_values.keys() == anchored.keyword.keys()
+                and all(
+                    _default_still_matches(anchored.keyword[name], keyword_values[name])
+                    for name in anchored.keyword
+                )
+            )
+        if source_backed:
+            try:
+                source_positional = [ast.literal_eval(item) for item in declaration.args.defaults]
+                source_keyword = {
+                    arg.arg: ast.literal_eval(default)
+                    for arg, default in zip(
+                        declaration.args.kwonlyargs, declaration.args.kw_defaults, strict=True
+                    )
+                    if default is not None
+                }
+                if not (
+                    all(
+                        _literal_matches(actual_value, source_value)
+                        for actual_value, source_value in zip(
+                            positional_values, source_positional, strict=True
+                        )
+                    )
+                    and all(
+                        _literal_matches(keyword_values[name], source_keyword[name])
+                        for name in source_keyword
+                    )
+                ):
+                    return False
+            except (ValueError, TypeError, SyntaxError, MemoryError):
+                if not host_verified(actual):
+                    return False
+        if anchors is not None and capture:
+            anchors[key] = _CallableBinding(
+                actual,
+                tuple(_default_record(value) for value in positional_values),
+                {name: _default_record(value) for name, value in keyword_values.items()},
+            )
+        return True
 
     for code in compiled.co_consts:
         if not isinstance(code, types.CodeType) or code.co_name.startswith("<"):
             continue
         value = vars(module).get(code.co_name)
-        if getattr(value, "__module__", None) != module_name:
+        if not isinstance(value, (type, types.FunctionType)):
+            return False
+        loaded_module = (
+            type.__getattribute__(value, "__module__")
+            if isinstance(value, type)
+            else object.__getattribute__(value, "__module__")
+        )
+        if loaded_module != module_name:
             return False
         if isinstance(value, type):
-            if type(value) is not type or any(
-                base.__module__ != module_name for base in value.__mro__[1:-1]
-            ):
+            if type(value) is not type and not host_verified(value):
                 return False
+            mro = type.__getattribute__(value, "__mro__")
+            for base in mro[1:-1]:
+                if type.__getattribute__(base, "__module__") == module_name:
+                    continue
+                base_module = sys.modules.get(type.__getattribute__(base, "__module__"))
+                if base_module is None:
+                    return False
+                base_path = Path(vars(base_module).get("__file__", "")).resolve()
+                if base_path in trusted_sources:
+                    if not _loaded_code_matches(
+                        base_path,
+                        base,
+                        anchors=anchors,
+                        capture=capture,
+                        identity_verifier=identity_verifier,
+                        trusted_sources=trusted_sources,
+                        visited=visited,
+                    ):
+                        return False
+                elif not host_verified(base):
+                    return False
             declaration = next(
                 (
                     node
@@ -195,14 +436,17 @@ def _loaded_code_matches(source_path: Path, executable: Any) -> bool:
             )
             if (
                 declaration is None
-                or (not declaration.bases and value.__bases__ != (object,))
+                or (
+                    not declaration.bases and type.__getattribute__(value, "__bases__") != (object,)
+                )
                 or (
                     declaration.bases
                     and (
-                        len(value.__bases__) != len(declaration.bases)
+                        len(type.__getattribute__(value, "__bases__")) != len(declaration.bases)
                         or any(
                             not isinstance(base, ast.Name)
-                            or vars(module).get(base.id) is not value.__bases__[index]
+                            or vars(module).get(base.id)
+                            is not type.__getattribute__(value, "__bases__")[index]
                             for index, base in enumerate(declaration.bases)
                         )
                     )
@@ -222,6 +466,19 @@ def _loaded_code_matches(source_path: Path, executable: Any) -> bool:
                     declared_names.update(
                         target.id for target in targets if isinstance(target, ast.Name)
                     )
+                    if any(
+                        isinstance(target, ast.Name) and target.id == "__slots__"
+                        for target in targets
+                    ):
+                        try:
+                            if statement.value is None:
+                                raise ValueError("missing slots expression")
+                            slots = ast.literal_eval(statement.value)
+                        except (ValueError, TypeError, SyntaxError):
+                            if not host_verified(value):
+                                return False
+                        else:
+                            declared_names.update((slots,) if isinstance(slots, str) else slots)
             implicit_names = {
                 "__module__",
                 "__doc__",
@@ -231,23 +488,56 @@ def _loaded_code_matches(source_path: Path, executable: Any) -> bool:
                 "__firstlineno__",
                 "__static_attributes__",
             }
-            if not set(vars(value)).issubset(declared_names | implicit_names):
+            class_dictionary = type.__getattribute__(value, "__dict__")
+            if not set(class_dictionary).issubset(declared_names | implicit_names):
                 return False
             for method_code in code.co_consts:
                 if not isinstance(method_code, types.CodeType) or method_code.co_name.startswith(
                     "<"
                 ):
                     continue
-                method = vars(value).get(method_code.co_name)
+                method = class_dictionary.get(method_code.co_name)
                 if isinstance(method, property):
                     method = method.fget
                 elif isinstance(method, (staticmethod, classmethod)):
                     method = method.__func__
-                if not matches(method, method_code):
+                method_declaration = next(
+                    (
+                        item
+                        for item in declaration.body
+                        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                        and item.name == method_code.co_name
+                    ),
+                    None,
+                )
+                if not matches(
+                    method,
+                    method_code,
+                    method_declaration,
+                    (module_name, code.co_name, method_code.co_name),
+                ):
                     return False
-        elif not matches(value, code):
+        elif not matches(
+            value,
+            code,
+            next(
+                (
+                    item
+                    for item in tree.body
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and item.name == code.co_name
+                ),
+                None,
+            ),
+            (module_name, "", code.co_name),
+        ):
             return False
-    return getattr(module, getattr(executable, "__name__", ""), None) is executable
+    name = (
+        type.__getattribute__(executable, "__name__")
+        if isinstance(executable, type)
+        else getattr(executable, "__name__", "")
+    )
+    return vars(module).get(name) is executable
 
 
 @dataclass(frozen=True)
@@ -289,8 +579,12 @@ def _invoke_proof(callback: Callable[..., Any], *args: Any) -> frozenset[str]:
 class RuntimeProviderRegistry:
     """Public exact-reference installation and resolution for runtime slots."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, source_identity_verifier: SourceIdentityVerifier | None = None) -> None:
         self._common = ExtensionRegistry(source_verifier=self._verify_common)
+        self._source_identity_verifier = source_identity_verifier
+        self._loaded_anchors: dict[
+            tuple[str, tuple[str, str, str]], dict[tuple[str, str, str], _CallableBinding]
+        ] = {}
         self._installed: dict[
             tuple[str, tuple[str, str, str]],
             tuple[dict[str, Any], Callable[[], Any], SourceClosure, CapabilityProof],
@@ -320,6 +614,9 @@ class RuntimeProviderRegistry:
                 and _loaded_code_matches(
                     compiler_entry[1].root / compiler_entry[1].python_source,
                     compiler_entry[0],
+                    anchors=self._loaded_anchors.get(key),
+                    identity_verifier=self._source_identity_verifier,
+                    trusted_sources=compiler_entry[1].trusted_python_sources(),
                 )
             )
         entry = self._installed.get(key)
@@ -328,7 +625,12 @@ class RuntimeProviderRegistry:
         descriptor, factory, closure, _ = entry
         binding = descriptor["binding"]
         selected = getattr(source, "_selected_factory", None)
-        return selected is factory and closure.verified(binding, factory)
+        return selected is factory and closure.verified(
+            binding,
+            factory,
+            anchors=self._loaded_anchors.get(key),
+            identity_verifier=self._source_identity_verifier,
+        )
 
     def register_dependency(self, reference: Mapping[str, str], closure: SourceClosure) -> None:
         if not _valid_reference(reference):
@@ -357,10 +659,18 @@ class RuntimeProviderRegistry:
         key = _reference_key(reference)
         if key in self._compilers:
             raise RuntimeProviderError("duplicate_extension_registration")
+        anchors: dict[tuple[str, str, str], _CallableBinding] = {}
         if (
             not closure.digest_matches(reference["content_digest"])
             or not closure.manifest_verified()
-            or not _loaded_code_matches(closure.root / closure.python_source, compiler)
+            or not _loaded_code_matches(
+                closure.root / closure.python_source,
+                compiler,
+                anchors=anchors,
+                capture=True,
+                identity_verifier=self._source_identity_verifier,
+                trusted_sources=closure.trusted_python_sources(),
+            )
         ):
             raise RuntimeProviderError("runtime_provider_unavailable")
         proven = (
@@ -369,6 +679,7 @@ class RuntimeProviderRegistry:
             else frozenset()
         )
         self._compilers[key] = compiler, closure, proven
+        self._loaded_anchors[("compiler", key)] = anchors
         self._compiler_proofs[key] = capability_proof
 
         def make_wrapper() -> _CompilerWrapper:
@@ -388,6 +699,7 @@ class RuntimeProviderRegistry:
         except Exception:
             del self._compilers[key]
             del self._compiler_proofs[key]
+            del self._loaded_anchors[("compiler", key)]
             raise
 
     def compiler(self, reference: Mapping[str, str]) -> Callable[[str], Any]:
@@ -397,7 +709,13 @@ class RuntimeProviderRegistry:
             entry is None
             or not entry[1].digest_matches(reference["content_digest"])
             or not entry[1].manifest_verified()
-            or not _loaded_code_matches(entry[1].root / entry[1].python_source, entry[0])
+            or not _loaded_code_matches(
+                entry[1].root / entry[1].python_source,
+                entry[0],
+                anchors=self._loaded_anchors.get(("compiler", key)),
+                identity_verifier=self._source_identity_verifier,
+                trusted_sources=entry[1].trusted_python_sources(),
+            )
         ):
             raise RuntimeProviderError("runtime_provider_unavailable")
         try:
@@ -462,14 +780,22 @@ class RuntimeProviderRegistry:
         dependencies = [_reference_key(item) for item in binding["dependencies"]]
         if dependencies != sorted(set(dependencies)):
             raise RuntimeProviderError("invalid_extension_descriptor")
-        if not closure.verified(binding, factory):
-            raise RuntimeProviderError("runtime_provider_unavailable")
         key = ("runtime_provider", _reference_key(binding["provider_reference"]))
         if key in self._installed:
             raise RuntimeProviderError("duplicate_extension_registration")
+        anchors: dict[tuple[str, str, str], _CallableBinding] = {}
+        if not closure.verified(
+            binding,
+            factory,
+            anchors=anchors,
+            capture=True,
+            identity_verifier=self._source_identity_verifier,
+        ):
+            raise RuntimeProviderError("runtime_provider_unavailable")
         checked = copy.deepcopy(dict(descriptor))
         proof = capability_proof or (lambda _provider, _binding: frozenset())
         self._installed[key] = checked, factory, closure, proof
+        self._loaded_anchors[key] = anchors
         self._options[key] = copy.deepcopy(dict(evaluation_options or {}))
         self._guard_methods[key] = guard_method
 
@@ -489,6 +815,7 @@ class RuntimeProviderRegistry:
             self._common.register(extension_descriptor, make_wrapper)
         except Exception:
             del self._installed[key]
+            del self._loaded_anchors[key]
             del self._options[key]
             del self._guard_methods[key]
             raise
@@ -500,7 +827,12 @@ class RuntimeProviderRegistry:
             raise RuntimeProviderError("runtime_provider_unavailable")
         installed_descriptor, factory, closure, proof = entry
         installed = installed_descriptor["binding"]
-        if not closure.verified(installed, factory) or any(
+        if not closure.verified(
+            installed,
+            factory,
+            anchors=self._loaded_anchors.get(key),
+            identity_verifier=self._source_identity_verifier,
+        ) or any(
             _reference_key(dependency) not in self._dependencies
             or not self._dependencies[_reference_key(dependency)].digest_matches(
                 dependency["content_digest"]
@@ -516,7 +848,11 @@ class RuntimeProviderRegistry:
                 or active.binding != binding
                 or type(active.provider) is not self._provider_types[key]
                 or not _loaded_code_matches(
-                    closure.root / closure.python_source, type(active.provider)
+                    closure.root / closure.python_source,
+                    type(active.provider),
+                    anchors=self._loaded_anchors.get(key),
+                    identity_verifier=self._source_identity_verifier,
+                    trusted_sources=closure.trusted_python_sources(),
                 )
                 or any(
                     name in getattr(active.provider, "__dict__", {})
@@ -561,7 +897,13 @@ class RuntimeProviderRegistry:
             provider = configured._instance["provider"]
         except (ExtensionError, KeyError) as exc:
             raise RuntimeProviderError("runtime_provider_unavailable") from exc
-        if not _loaded_code_matches(closure.root / closure.python_source, type(provider)) or any(
+        if not _loaded_code_matches(
+            closure.root / closure.python_source,
+            type(provider),
+            anchors=self._loaded_anchors.get(key),
+            identity_verifier=self._source_identity_verifier,
+            trusted_sources=closure.trusted_python_sources(),
+        ) or any(
             name in getattr(provider, "__dict__", {})
             for name in (
                 "evaluate_guard",
@@ -577,16 +919,9 @@ class RuntimeProviderRegistry:
                 raise RuntimeProviderError("runtime_provider_unavailable")
         except ExtensionError as exc:
             raise RuntimeProviderError("runtime_provider_unavailable") from exc
-        if kind == "guard" and (
-            self._guard_methods[key] not in vars(type(provider))
-            or not callable(getattr(provider, self._guard_methods[key], None))
-        ):
-            raise RuntimeProviderError("runtime_provider_unavailable")
-        if kind == "actions" and (
-            "evaluate_actions" not in vars(type(provider))
-            or not callable(getattr(provider, "evaluate_actions", None))
-        ):
-            raise RuntimeProviderError("runtime_provider_unavailable")
+        _bound_provider_method(
+            provider, self._guard_methods[key] if kind == "guard" else "evaluate_actions"
+        )
         actual = _invoke_proof(proof, provider, binding)
         claims = {
             name: bool(binding["capabilities"].get(name) is True and name in actual)
@@ -653,7 +988,7 @@ class RuntimeProviderRegistry:
     def invoke_guard(self, binding: Mapping[str, Any], snapshot: Mapping[str, Any]) -> bool:
         selected = self.resolve("guard", binding)
         key = ("runtime_provider", _reference_key(binding["provider_reference"]))
-        result = getattr(selected.provider, self._guard_methods[key])(
+        result = _bound_provider_method(selected.provider, self._guard_methods[key])(
             immutable_snapshot(snapshot), **copy.deepcopy(self._options[key])
         )
         if type(result) is not bool:
@@ -669,7 +1004,7 @@ class RuntimeProviderRegistry:
 
         selected = self.resolve("actions", binding)
         key = ("runtime_provider", _reference_key(binding["provider_reference"]))
-        result = selected.provider.evaluate_actions(
+        result = _bound_provider_method(selected.provider, "evaluate_actions")(
             immutable_snapshot(snapshot), **copy.deepcopy(self._options[key])
         )
         schema = json.loads(
@@ -683,11 +1018,13 @@ class RuntimeProviderRegistry:
 
     def can_inspect(self, binding: Mapping[str, Any]) -> bool:
         selected = self.resolve("guard", binding)
-        return (
-            selected.capabilities.get("semantically_introspectable") is True
-            and "inspect_guard" in vars(type(selected.provider))
-            and callable(getattr(selected.provider, "inspect_guard", None))
-        )
+        if selected.capabilities.get("semantically_introspectable") is not True:
+            return False
+        try:
+            _bound_provider_method(selected.provider, "inspect_guard")
+        except RuntimeProviderError:
+            return False
+        return True
 
     def inspect_guard(
         self,
@@ -703,7 +1040,7 @@ class RuntimeProviderRegistry:
             before = copy.deepcopy(getattr(selected.provider, "__dict__", {}))
         except Exception as exc:
             raise RuntimeProviderError("inspection_guard_failure") from exc
-        result = selected.provider.inspect_guard(
+        result = _bound_provider_method(selected.provider, "inspect_guard")(
             immutable_snapshot(snapshot), maximum_guard_evaluations, maximum_evaluation_steps
         )
         if (
