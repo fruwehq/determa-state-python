@@ -51,7 +51,6 @@ from .extensions import (
     ExtensionProvider,
     ExtensionRegistry,
     bundled_extension_registry,
-    compose_capabilities,
 )
 from .host import (
     ExecutionHost,
@@ -200,7 +199,6 @@ __all__ = [
     "ValidationError",
     "__version__",
     "bundled_extension_registry",
-    "compose_capabilities",
     "aggregate_envelope",
     "aggregate_shape_fingerprint",
     "collect_errors",

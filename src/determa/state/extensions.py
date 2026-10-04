@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 from collections.abc import Callable, Mapping, Sequence
 from functools import cache
 from pathlib import Path
@@ -17,6 +18,7 @@ from .codes import ExtensionNegotiationFailureCode as Code
 from .errors import DetermaError
 
 _DATA = Path(__file__).parent / "data"
+_INSTANCE_ID = re.compile(r"[a-z][a-z0-9.-]*\Z")
 
 
 @cache
@@ -172,6 +174,8 @@ class ExtensionRegistry:
     def _entry(
         self, category: str, reference: Mapping[str, Any]
     ) -> tuple[dict[str, Any], ExtensionFactory, OperationalEvaluator | None]:
+        if type(category) is not str:
+            raise ExtensionError(Code.INVALID_EXTENSION_DESCRIPTOR)
         validated = _check("provider-reference", reference, Code.INVALID_EXTENSION_DESCRIPTOR)
         entry = self._entries.get((category, validated["identifier"], validated["version"]))
         if entry is not None:
@@ -185,9 +189,7 @@ class ExtensionRegistry:
     def validate_configuration(
         self, descriptor: Mapping[str, Any], configuration: Mapping[str, Any]
     ) -> tuple[ExtensionProvider, Any]:
-        checked = _check(
-            "extension-descriptor", dict(descriptor), Code.INVALID_EXTENSION_DESCRIPTOR
-        )
+        checked = _check("extension-descriptor", descriptor, Code.INVALID_EXTENSION_DESCRIPTOR)
         registered, factory, _ = self._entry(checked["category"], checked["provider_reference"])
         if registered != checked:
             raise ExtensionError(Code.EXTENSION_IDENTITY_MISMATCH)
@@ -243,9 +245,7 @@ class ExtensionRegistry:
         requirement: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Decide from already observed provider calls; useful for host call tracing."""
-        checked = _check(
-            "extension-descriptor", dict(descriptor), Code.INVALID_EXTENSION_DESCRIPTOR
-        )
+        checked = _check("extension-descriptor", descriptor, Code.INVALID_EXTENSION_DESCRIPTOR)
         registered, _, evaluator = self._entry(checked["category"], checked["provider_reference"])
         if registered != checked or not self._verified_source(provider, registered):
             raise ExtensionError(Code.EXTENSION_IDENTITY_MISMATCH)
@@ -270,11 +270,19 @@ class ExtensionRegistry:
             raise
         except Exception as exc:
             raise ExtensionError(Code.EXTENSION_CAPABILITY_MISMATCH) from exc
-        report["claims"] = [claim for claim in claims if claim in proven and health == "healthy"]
+        # An observed I/O hazard prevents a contradictory pure guarantee even
+        # before its category-specific public claim becomes available.
+        report["claims"] = [
+            claim
+            for claim in claims
+            if claim in proven
+            and health == "healthy"
+            and not (claim == "pure" and "external_io_capable" in claims)
+        ]
         if requirement is not None:
             requested = _check(
                 "extension-capability-requirement",
-                dict(requirement),
+                requirement,
                 Code.INVALID_EXTENSION_DESCRIPTOR,
             )
             target, _, _ = self._entry(requested["category"], requested["provider_reference"])
@@ -282,6 +290,7 @@ class ExtensionRegistry:
                 raise ExtensionError(Code.EXTENSION_IDENTITY_MISMATCH)
             if (
                 requested["instance_id"] != report["instance_id"]
+                or report["health"] != "healthy"
                 or requested["capability"] not in report["claims"]
             ):
                 raise ExtensionError(Code.EXTENSION_CAPABILITY_MISMATCH)
@@ -305,7 +314,11 @@ class ExtensionRegistry:
             )
         reports: list[dict[str, Any]] = []
         for participant in configurations:
-            if set(participant) != {"category", "provider_reference", "configuration"}:
+            if type(participant) is not dict or set(participant) != {
+                "category",
+                "provider_reference",
+                "configuration",
+            }:
                 raise ExtensionError(Code.INVALID_EXTENSION_CONFIGURATION)
             descriptor, _, _ = self._entry(
                 participant["category"], participant["provider_reference"]
@@ -317,6 +330,7 @@ class ExtensionRegistry:
                 report["category"] == requirement["category"]
                 and report["provider_reference"] == requirement["provider_reference"]
                 and report["instance_id"] == requirement["instance_id"]
+                and report["health"] == "healthy"
                 and requirement["capability"] in report["claims"]
                 for report in reports
             ):
@@ -325,12 +339,12 @@ class ExtensionRegistry:
         if requested_profile not in (None, "automatic_retry_without_external_io"):
             raise ExtensionError(Code.INVALID_EXTENSION_CONFIGURATION)
         if compose:
-            full = compose_capabilities(
-                reports, host_guarantees or {}, weak_profile_opt_in=weak_profile_opt_in
-            )
+            full = _compose_capabilities(reports, host_guarantees or {})
             if any(name not in full for name in projection):
                 raise ExtensionError(Code.INVALID_EXTENSION_CONFIGURATION)
             effective = {name: full[name] for name in projection}
+            if full["weak_profile_opt_in_required"] and not weak_profile_opt_in:
+                raise ExtensionError(Code.EXTENSION_CAPABILITY_MISMATCH)
             if (
                 requested_profile == "automatic_retry_without_external_io"
                 and full["external_io_capable"]
@@ -339,15 +353,13 @@ class ExtensionRegistry:
         return {"status": "accepted", "reports": reports, "effective": effective}
 
 
-def compose_capabilities(
+def _compose_capabilities(
     reports: Sequence[Mapping[str, Any]],
     host_guarantees: Mapping[str, bool],
-    *,
-    weak_profile_opt_in: bool = False,
 ) -> dict[str, bool]:
     """Compose all-party guarantees and any-party external I/O hazard."""
     effective = {
-        guarantee: bool(host_guarantees.get(guarantee, False))
+        guarantee: host_guarantees.get(guarantee) is True
         and all(
             report.get("health") == "healthy" and guarantee in report.get("claims", ())
             for report in reports
@@ -364,9 +376,6 @@ def compose_capabilities(
     )
     effective["external_io_capable"] = hazard
     effective["weak_profile_opt_in_required"] = hazard or not all(effective[g] for g in _GUARANTEES)
-    if effective["weak_profile_opt_in_required"] and not weak_profile_opt_in:
-        # Composition is still reportable; the caller checks its requested profile.
-        pass
     return effective
 
 
@@ -381,7 +390,8 @@ class _BundledStoreProvider:
 
         if (
             set(configuration) != {"instance_id", "uri", "store_configuration"}
-            or not isinstance(configuration["instance_id"], str)
+            or type(configuration["instance_id"]) is not str
+            or _INSTANCE_ID.fullmatch(configuration["instance_id"]) is None
             or not isinstance(configuration["uri"], str)
             or not isinstance(configuration["store_configuration"], dict)
         ):

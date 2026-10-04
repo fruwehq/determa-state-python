@@ -138,7 +138,8 @@
             "uniqueItems": true,
             "items": {
               "enum": [
-                "durable_ingress_dead_letter"
+                "durable_ingress_dead_letter",
+                "source_ordered"
               ]
             }
           }
