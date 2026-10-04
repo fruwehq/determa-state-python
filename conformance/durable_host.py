@@ -238,13 +238,14 @@ def _replay_evidence(checkpoint: dict[str, Any], event_id: str) -> dict[str, Any
 
 
 def _validate_public_response(
-    operation: str,
+    item: DurableHostVector,
     request: dict[str, Any],
     response: dict[str, Any],
-    stored: bytes | None,
 ) -> None:
+    operation = item.vector["operation"]
     assert type(response) is dict
-    checkpoint = None if stored is None else json.loads(stored)
+    after_name = item.vector.get("checkpoint_after")
+    checkpoint = None if after_name is None else _json(item.path / after_name)
     if operation == "checkpoint_create_v2":
         assert checkpoint is not None
         assert response == {
@@ -589,7 +590,7 @@ def run_durable_host_vector(item: DurableHostVector) -> None:
         else:
             response, stored, core_calls = _invoke_checkpoint(item, request, observation)
             _validate_public_response(
-                item.vector["operation"], request, response, stored
+                item, request, response
             )
             initial_source = observation.get("initial_source", before_bytes)
             replayed = _checkpoint_replayed(item, request, response, initial_source)
