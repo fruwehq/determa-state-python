@@ -4,17 +4,23 @@ Python implementation of [Determa State](https://github.com/fruwehq/determa-stat
 a language-agnostic statechart engine with a shared normative conformance suite.
 
 This implementation supports Determa State `format: 1` at specification
-commit `ee38796d5e38e67e350a06548fd50faa530cbb12`. Correctness is determined by
+commit `6796b554b976627c68fc746ec5629629aaf2b38e`. Correctness is determined by
 98 format-1 core cases, 162 version-2 vectors, 138 durable-host vectors, and 381 generated version-2 artifacts
-at conformance commit `99a4d9ad5256f7330e75b06d48f340cc7239a40d`.
+at conformance commit `a586417292d0a5cac8d07e1164669688c407a7e1`.
 
-The package metadata remains `0.2.0`. Artifact and checkpoint schema version 2 is the
+The package metadata is `0.3.0`. Artifact and checkpoint schema version 2 is the
 only supported portable artifact format. Machine YAML remains `format: 1`.
+
+## Release 0.3.0
+
+This release adds portable event deferral to the queue-bearing aggregate and uses schema
+version 2 as the sole portable aggregate, migration, and execution-checkpoint contract.
+The synchronous host can persist accepted work and restore ready and deferred mailboxes
+across restarts.
 
 ## Install
 
-Until the synchronized `0.2.0` Determa State release is published, install this release
-candidate from a checkout:
+To try the `0.3.0` release candidate before publication, install it from a checkout:
 
 ```sh
 git clone https://github.com/fruwehq/determa-state-python.git

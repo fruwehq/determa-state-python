@@ -145,6 +145,46 @@ def test_v2_maintenance_failure_requires_exact_unchanged_checkpoint(
         _assert_checkpoint_unchanged(item, observation)
 
 
+@pytest.mark.parametrize(
+    "vector_name",
+    ["outbox_forbidden_deletion", "checkpoint_physical_deletion_unsupported"],
+)
+@pytest.mark.parametrize("response", [None, "wrong_error"])
+def test_retained_deletion_vectors_exercise_production_host(
+    monkeypatch: pytest.MonkeyPatch, vector_name: str, response: str | None
+) -> None:
+    item = next(item for item in durable_host_vectors() if item.vector["name"] == vector_name)
+
+    def altered_host_response(*args: object, **kwargs: object) -> None:
+        if response == "wrong_error":
+            raise ExecutionHostError("effect_id_conflict")
+
+    monkeypatch.setattr(ExecutionHost, "delete_retained_record", altered_host_response)
+    with pytest.raises(AssertionError):
+        run_durable_host_vector(item)
+
+
+@pytest.mark.parametrize(
+    "vector_name",
+    ["checkpoint_root_tombstone", "checkpoint_root_tombstone_replay"],
+)
+def test_tombstone_response_uses_fixture_oracle(
+    monkeypatch: pytest.MonkeyPatch, vector_name: str
+) -> None:
+    item = next(item for item in durable_host_vectors() if item.vector["name"] == vector_name)
+    original = ExecutionHost.tombstone_root_v2
+
+    def altered_response(self: ExecutionHost, *args: object, **kwargs: object) -> dict:
+        response = original(self, *args, **kwargs)
+        result = copy.deepcopy(response)
+        result["tombstone"]["final_aggregate_state_digest"] = "sha256:" + "0" * 64
+        return result
+
+    monkeypatch.setattr(ExecutionHost, "tombstone_root_v2", altered_response)
+    with pytest.raises(AssertionError):
+        run_durable_host_vector(item)
+
+
 def test_valid_artifact_manifest_does_not_accept_forged_digest(tmp_path: Path) -> None:
     case, artifact = next(
         (case, artifact)
