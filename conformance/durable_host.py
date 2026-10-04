@@ -454,7 +454,7 @@ def _invoke_checkpoint(
                 root_instance_id, request["effect_id"], **expected
             )
         elif operation == "checkpoint_delete_retained_record_v2":
-            raise ExecutionHostError("invalid_execution_checkpoint")
+            response = host.delete_retained_record(root_instance_id, **expected)
         else:
             raise AssertionError(f"unsupported checkpoint operation: {operation}")
     finally:

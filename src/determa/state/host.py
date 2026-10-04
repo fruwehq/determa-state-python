@@ -1336,6 +1336,24 @@ class ExecutionHost:
         self._after_commit()
         return {"result": "committed"}
 
+    def delete_retained_record(
+        self,
+        root_instance_id: str,
+        *,
+        expected_revision: str,
+        expected_checkpoint_digest: str,
+    ) -> None:
+        """Reject physical deletion of retained checkpoint evidence."""
+        with self._transaction(root_instance_id) as transaction:
+            source = transaction.load()
+            if source is None:
+                raise ExecutionHostError(PreAcceptanceCode.WRONG_ROOT)
+            checkpoint = self._restore(source, root_instance_id).document
+            self._check_expected(
+                checkpoint, expected_revision, expected_checkpoint_digest
+            )
+            raise ExecutionHostError(HostCode.INVALID_EXECUTION_CHECKPOINT)
+
     def update_replay_retention(
         self,
         root_instance_id: str,
