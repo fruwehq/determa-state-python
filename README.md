@@ -4,10 +4,10 @@ Python implementation of [Determa State](https://github.com/fruwehq/determa-stat
 a language-agnostic statechart engine with a shared normative conformance suite.
 
 This implementation supports Determa State `format: 1` at specification
-commit `6207362e879ccca70f709e1eb4cc90448d910c0b`. Correctness is determined by
+commit `86bb88dd21cb1f799eefe5020b6e49dabf6e7225`. Correctness is determined by
 99 format-1 core cases, 162 version-1 vectors, 142 durable-host vectors, 49 core
-inspection vectors, 47 extension negotiation vectors, and 420 manifest artifacts
-at conformance commit `e499a99c3ced88f29008049ea9dddcc17a0d9f51`. The 7
+inspection vectors, 47 extension negotiation vectors, and 476 manifest artifacts
+at conformance commit `bbb215961448ad691189c41072d8ea03f76f9372`. The 7
 native guard-provider inspection vectors remain an optional profile pending
 runtime-provider support.
 
@@ -24,6 +24,16 @@ The version-1 checkpoint host returns exact receipt evidence for admission, proc
 and terminal replay. The optional public extension registry validates exact provider
 references, loaded source closure, configured health, and currently proved claims
 before evaluating a requested profile.
+
+`ApplicationProjectionFacade` binds explicitly selected application rows to one
+root. Supply an `ApplicationRowMapping` that reads and writes those rows through
+the configured execution store's native shared transaction. The mapping provides
+typed input, projects the proposed complete checkpoint into selected rows and
+supplemental storage, and reconstructs it for a precommit round-trip check. `run`
+returns the exact create, admit, or step result after commit; a retained delivery
+returns its receipt before current row input is mapped. The optional aggregate-only
+step path uses the mapping's `reconstruct_aggregate` and `project_aggregate`
+methods when no checkpoint exists.
 
 ## Install
 

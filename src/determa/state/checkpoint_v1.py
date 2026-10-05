@@ -539,6 +539,8 @@ def create_checkpoint_v1(
     root_instance_id: str,
     creation_id: str,
     bindings: dict[str, dict[str, Any]] | None = None,
+    *,
+    _include_projection_result: bool = False,
 ) -> dict[str, Any]:
     """Create a fresh queue-bearing checkpoint from the public v1 core result."""
     result = create_aggregate_v1(
@@ -630,7 +632,10 @@ def create_checkpoint_v1(
                 "emission_references": [],
             }
         )
-    return seal_execution_checkpoint(checkpoint)
+    sealed = seal_execution_checkpoint(checkpoint)
+    if _include_projection_result:
+        return {"checkpoint": sealed, "core_result": result}
+    return sealed
 
 
 def _check_cas(document: Mapping[str, Any], revision: str, digest: str) -> None:
@@ -714,6 +719,7 @@ def admit_checkpoint_v1(
     *,
     expected_revision: str,
     expected_checkpoint_digest: str,
+    _include_projection_result: bool = False,
 ) -> dict[str, Any]:
     """Atomically admit or replay a delivery batch against one v1 checkpoint."""
     restored = restore_execution_checkpoint_v1(source, definition_resolver)
@@ -850,6 +856,10 @@ def admit_checkpoint_v1(
         members[-1].pop("event_id", None)
         members[-1] = {"event_id": event_id, **members[-1]}
     sealed = seal_execution_checkpoint(candidate)
+    if _include_projection_result and all(
+        member["disposition"] == "accepted" for member in members
+    ):
+        return {"checkpoint": sealed, "core_result": admission}
     assert deliveries == snapshot
     if all(member["disposition"] == "accepted" for member in members):
         return sealed
@@ -864,11 +874,13 @@ def step_checkpoint_v1(
     expected_revision: str,
     expected_checkpoint_digest: str,
     _include_host_response: bool = False,
+    _defer_projection_cas: bool = False,
 ) -> dict[str, Any]:
     """Process one ready mailbox head and append its terminal receipt."""
     restored = restore_execution_checkpoint_v1(source, definition_resolver)
     document = restored.document
-    _check_cas(document, expected_revision, expected_checkpoint_digest)
+    if not _defer_projection_cas:
+        _check_cas(document, expected_revision, expected_checkpoint_digest)
     aggregate = document["root_record"].get("aggregate_state")
     if aggregate is None:
         raise ArtifactError("tombstoned_root")
@@ -906,6 +918,8 @@ def step_checkpoint_v1(
         definition_resolver,
         _include_host_evidence=True,
     )
+    if _defer_projection_cas:
+        _check_cas(document, expected_revision, expected_checkpoint_digest)
     if selected is None or result["disposition"] in {"not_runnable", "rejected"}:
         return {
             "result": "not_committed",

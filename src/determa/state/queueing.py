@@ -242,7 +242,7 @@ def _mailbox_payload_is_normalized(
         native_runtime = next(
             (
                 item
-                for item in restored.state["runtimes"]
+                for item in restored.state["runtimes"].values()
                 if item["runtime_id"] == runtime["runtime_id"]
             ),
             None,

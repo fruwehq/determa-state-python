@@ -59,6 +59,7 @@ _PORTABLE_ARTIFACT_KINDS = {
     "core_step_result_v1",
 }
 _CONFORMANCE_ARTIFACT_SCHEMAS = {
+    "application_projection_v1": "application-projection-v1.schema.json",
     "durable_host_call_log_v1": "durable-host-call-log-v1.schema.json",
     "durable_host_inputs_v1": "durable-host-inputs-v1.schema.json",
     "durable_host_results_v1": "durable-host-results-v1.schema.json",
@@ -140,7 +141,7 @@ def test_suite_present() -> None:
     assert len(core_cases()) == 99
     assert len(version1_vectors()) == 162
     assert len(durable_host_vectors()) == 142
-    assert len(_manifest_artifacts()) == 420
+    assert len(_manifest_artifacts()) == 476
 
 
 @pytest.mark.parametrize("stored", [b"mutated", None])
