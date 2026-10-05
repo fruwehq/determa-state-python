@@ -1,13 +1,15 @@
 """Explicit foreground SQLite timer records, separate from portable checkpoints.
 
 This implementation checkpoint supports durable schedule/cancel/read, initial claims
-and coordinated SQLite admission. Proved-fate reclaim, verified provider installation,
+and coordinated SQLite admission with strictly local native-fate reclaim. Verified
+provider installation,
 archive and recovery integration remain unfinished; no completed profile is advertised.
 """
 
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import re
 import sqlite3
@@ -16,6 +18,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Any
 
+from .checkpoint_v1 import restore_execution_checkpoint_v1
 from .definition import Bundle
 from .engine import _normalize_payload
 from .errors import ArtifactError
@@ -25,6 +28,7 @@ from .host import (
     SharedExecutionTransaction,
     delivery_request_digest,
 )
+from .stores.base import ExecutionStoreError
 from .stores.sqlite import SQLiteApplicationTransaction, SQLiteExecutionStore
 from .wire import _schema_registry, canonical_bytes, decoded_typed_value, hash_value, strict_json
 
@@ -243,9 +247,33 @@ class SQLiteTimerHelper:
             finally:
                 connection.rollback()
 
+    def _implementation_digest(self) -> str:
+        # An existing native origin cannot silently change completion implementation.
+        # Independent loaded-source registration is still required before a profile claim.
+        directory = Path(__file__).parent
+        closure = b"".join(
+            path.relative_to(directory).as_posix().encode() + b"\0" + path.read_bytes()
+            for path in sorted(directory.rglob("*"))
+            if path.is_file() and path.suffix in {".py", ".json"}
+        )
+        return "sha256:" + hashlib.sha256(closure).hexdigest()
+
     def _configuration(self) -> dict[str, Any]:
         return {
             "native_timer_configuration_version": 1,
+            "implementation_digest": self._implementation_digest(),
+            "coordinated_store_configuration": {
+                "journal_mode": self.coordinated_host.store.journal_mode,
+                "synchronous": self.coordinated_host.store.synchronous,
+                "replay_retention": self.coordinated_host.store.replay_retention,
+                "outbox_retention": self.coordinated_host.store.outbox_retention,
+                "shared_application_transactions": (
+                    self.coordinated_host.store.shared_application_transactions
+                ),
+            }
+            if self.coordinated_host is not None
+            and type(self.coordinated_host.store) is SQLiteExecutionStore
+            else None,
             "storage_path": self.path,
             "scope_identity": self.scope_identity,
             "root_instance_id": self.root_instance_id,
@@ -470,6 +498,96 @@ class SQLiteTimerHelper:
             return _time(self.trusted_clock())
         except Exception as error:
             raise TimerError("timer_clock_unavailable") from error
+
+    def _prove_local_uncommitted_fire(
+        self, connection: sqlite3.Connection, artifact: dict[str, Any], record: dict[str, Any]
+    ) -> None:
+        """Resolve the previous native transaction before committing a replacement fence.
+
+        Caller time, absence of an event, and portable claims are not this proof.
+        The caller owns BEGIN IMMEDIATE, and _load has validated the complete immutable
+        native commit history against this storage-bound origin. Every completion by
+        this exact coordinated implementation commits admission and fired evidence
+        together. The preceding writer has therefore resolved before this decision.
+        """
+        host = self.coordinated_host
+        if (
+            type(self) is not SQLiteTimerHelper
+            or type(host) is not ExecutionHost
+            or type(host.store) is not SQLiteExecutionStore
+            or Path(host.store.path).resolve() != Path(self.path)
+            or not host.store.shared_application_transactions
+            or host.store.journal_mode != "WAL"
+            or host.store.synchronous != "FULL"
+            or host.store.replay_retention != "permanent"
+            or not connection.in_transaction
+            or any(
+                getattr(SharedExecutionTransaction, name) is not method
+                or getattr(method, "__code__", None) is not code
+                for name, method, code in _FATE_SHARED_METHODS
+            )
+            or any(
+                getattr(getattr(instance, name), "__func__", None) is not method
+                or getattr(method, "__code__", None) is not code
+                for instance, methods in (
+                    (host, _FATE_HOST_METHODS),
+                    (host.store, _FATE_STORE_METHODS),
+                )
+                for name, method, code in methods
+            )
+            or any(
+                getattr(getattr(self, name), "__func__", None) is not method
+                or getattr(method, "__code__", None) is not code
+                for name, method, code in _FATE_METHODS
+            )
+        ):
+            raise TimerError("delivery_ambiguous")
+        retained_claim = any(
+            receipt["result"]["operation"] == "claim_fire"
+            and receipt["result"]["timer_id"] == record["timer_id"]
+            and receipt["result"]["record_revision"] == record["revision"]
+            and receipt["result"]["attempt_fence"] == record["attempt_fence"]
+            and receipt["result"]["expires_at"] == record["expires_at"]
+            for receipt in artifact["operation_receipts"]
+        )
+        if not retained_claim or any(
+            receipt["result"]["operation"] == "complete_fire"
+            and receipt["result"]["timer_id"] == record["timer_id"]
+            for receipt in artifact["operation_receipts"]
+        ):
+            raise TimerError("delivery_ambiguous")
+        try:
+            host.store._validate_schema(connection)
+            row = connection.execute(
+                "SELECT revision,checkpoint_digest,checkpoint FROM determa_execution_checkpoints "
+                "WHERE root_instance_id=?",
+                (self.root_instance_id,),
+            ).fetchone()
+            if row is None:
+                raise TimerError("delivery_ambiguous")
+            checkpoint = restore_execution_checkpoint_v1(
+                bytes(row[2]), host.artifact_resolver
+            ).document
+            aggregate = checkpoint["root_record"].get("aggregate_state")
+            if (
+                checkpoint["revision"] != row[0]
+                or checkpoint["execution_checkpoint_digest"] != row[1]
+                or checkpoint["root_instance_id"] != self.root_instance_id
+                or not aggregate
+                or aggregate["root_runtime_id"] != self.root_runtime_id
+                or aggregate["validated_bundle_fingerprint"] != self.bundle.fingerprint
+                or checkpoint["replay_retention"]["mode"] != "permanent"
+                or checkpoint["replay_retention"]["pruned_through_receipt_sequence"] is not None
+                # An independently admitted matching event is not helper completion;
+                # never promote it or infer safe recovery from its receipt or absence.
+                or any(
+                    receipt.get("event_id") == record["event_id"]
+                    for receipt in checkpoint["operation_receipts"]
+                )
+            ):
+                raise TimerError("delivery_ambiguous")
+        except (ArtifactError, ExecutionStoreError, sqlite3.Error) as error:
+            raise TimerError("delivery_ambiguous") from error
 
     def _complete(self, request: Mapping[str, Any], principal: str) -> dict[str, Any]:
         host = self.coordinated_host
@@ -776,15 +894,9 @@ class SQLiteTimerHelper:
                     return _result(request, record, "timer_cancelled")
                 now = self._now()
                 if record["state"] == "claimed":
-                    # A timeout is not proof that a previous admission did not commit.
-                    # Reclaim is refused until coordinated fate verification is implemented.
-                    return _result(
-                        request,
-                        record,
-                        "delivery_ambiguous"
-                        if now >= _time(record["expires_at"])
-                        else "timer_fire_in_progress",
-                    )
+                    if now < _time(record["expires_at"]):
+                        return _result(request, record, "timer_fire_in_progress")
+                    self._prove_local_uncommitted_fire(connection, artifact, record)
                 if now < _time(record["deadline_at"]):
                     return _result(request, record, "timer_not_due")
                 expires_at = now + self.claim_lease_nanoseconds
@@ -815,3 +927,40 @@ class SQLiteTimerHelper:
         finally:
             connection.rollback()
             connection.close()
+
+
+# Trusted local factory methods remain bound while an instance proves native fate.
+# This guard supplements native origin/history; it is not external registration proof.
+_FATE_METHODS = tuple(
+    (name, getattr(SQLiteTimerHelper, name), getattr(SQLiteTimerHelper, name).__code__)
+    for name in (
+        "execute",
+        "_complete",
+        "_load",
+        "_history",
+        "_record_commit",
+        "_persist",
+        "_schema",
+        "_configuration",
+        "_implementation_digest",
+        "_prove_local_uncommitted_fire",
+    )
+)
+
+_FATE_HOST_METHODS = tuple(
+    (name, getattr(ExecutionHost, name), getattr(ExecutionHost, name).__code__)
+    for name in ("run_shared_transaction", "_bound", "_restore", "_stage_replace", "admit_v1")
+)
+_FATE_STORE_METHODS = tuple(
+    (name, getattr(SQLiteExecutionStore, name), getattr(SQLiteExecutionStore, name).__code__)
+    for name in ("shared_transaction", "_connect", "_validate_schema")
+)
+
+_FATE_SHARED_METHODS = tuple(
+    (
+        name,
+        getattr(SharedExecutionTransaction, name),
+        getattr(SharedExecutionTransaction, name).__code__,
+    )
+    for name in ("admit_v1", "read_checkpoint", "_stage", "_finish")
+)

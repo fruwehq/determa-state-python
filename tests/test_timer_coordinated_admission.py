@@ -123,12 +123,12 @@ def test_sigkill_restart_resolves_actual_native_timer_and_admission_fate(tmp_pat
     assert restarted_host.read_checkpoint("server-1").document == expected
 
 
-def configured(tmp_path):
+def configured(tmp_path, replay_retention="permanent"):
     path = tmp_path / "coordinated.sqlite"
     definition = bundle()
     resolver = MemoryArtifactResolver(definitions={definition.fingerprint: definition})
     store = SQLiteExecutionStore(
-        path, replay_retention="permanent", shared_application_transactions=True
+        path, replay_retention=replay_retention, shared_application_transactions=True
     )
     store.setup_schema()
     host = ExecutionHost(store, resolver)
