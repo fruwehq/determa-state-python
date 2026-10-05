@@ -221,22 +221,13 @@ def _inventory(
     # Discover logical references in retained checkpoint bytes as well as the
     # current native rows. Allocation-time hints cannot establish completeness.
     retained = []
-    for source in ledger["checkpoint_bytes"]:
-        try:
-            document = _parse(source)
-        except ValueError:
-            # Guarded host mutations may be opaque bytes. Actual native
-            # checkpoint rows are always parsed and validated separately.
-            continue
-        if (
-            isinstance(document, dict)
-            and document.get("execution_checkpoint_format") == "determa.execution_checkpoint"
-        ):
-            if not validate_execution_checkpoint_member("executionCheckpoint", document):
-                raise ValueError("invalid retained checkpoint inventory")
-            if document["execution_checkpoint_digest"] != execution_checkpoint_digest(document):
-                raise ValueError("invalid retained checkpoint digest")
-            retained.append(document)
+    for source in _native_checkpoint_history(ledger):
+        document = _parse(source)
+        if not validate_execution_checkpoint_member("executionCheckpoint", document):
+            raise ValueError("invalid retained checkpoint inventory")
+        if document["execution_checkpoint_digest"] != execution_checkpoint_digest(document):
+            raise ValueError("invalid retained checkpoint digest")
+        retained.append(document)
     for document in retained + checkpoints:
         root = document["root_instance_id"]
         members.append({"kind": "root", "identity": root})
@@ -297,6 +288,13 @@ def _inventory(
     ]
 
 
+def _native_checkpoint_history(ledger: Mapping[str, Any]) -> list[str]:
+    history = ledger.get("native_checkpoint_bytes")
+    if type(history) is not list or any(type(source) is not str for source in history):
+        raise ValueError("native checkpoint provenance unavailable")
+    return history
+
+
 def _native_checkpoints(
     connection: sqlite3.Connection, ledger: Mapping[str, Any]
 ) -> list[dict[str, Any]]:
@@ -315,7 +313,7 @@ def _native_checkpoints(
         "ORDER BY root_instance_id"
     ):
         source = bytes(payload).decode("utf-8", "strict")
-        if root not in ledger["roots"] or source not in ledger["checkpoint_bytes"]:
+        if root not in ledger["roots"] or source not in _native_checkpoint_history(ledger):
             raise ValueError("untracked native checkpoint")
         document = _parse(source)
         if not validate_execution_checkpoint_member("executionCheckpoint", document):
@@ -607,6 +605,7 @@ class SQLiteLocalAuthority:
             "receipts": [],
             "mutation_bytes": [],
             "checkpoint_bytes": [],
+            "native_checkpoint_bytes": [],
             "journal_entries": [],
             "ingress_acknowledgements": [],
             "active_claims": [],
@@ -933,6 +932,10 @@ class AuthoritySQLiteExecutionStore(SQLiteExecutionStore):
                 raise ExecutionStoreError("stale_scope_authority")
             if root_instance_id not in ledger["roots"]:
                 raise ExecutionStoreError("unauthorized_scope")
+            try:
+                native_history = _native_checkpoint_history(ledger)
+            except ValueError as error:
+                raise ExecutionStoreError("scope_fence_unproven") from error
             transaction = _SQLiteTransaction(connection, root_instance_id)
             previous = transaction.load()
             yield transaction
@@ -972,6 +975,7 @@ class AuthoritySQLiteExecutionStore(SQLiteExecutionStore):
                 encoded = current.decode("utf-8", "strict")
                 ledger["mutation_bytes"].append(encoded)
                 ledger["checkpoint_bytes"].append(encoded)
+                native_history.append(encoded)
                 connection.execute(
                     "UPDATE determa_scope_authority SET ledger = ? WHERE scope_identity = ?",
                     (_compact(ledger), self.scope_identity),

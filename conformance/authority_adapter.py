@@ -90,6 +90,7 @@ def _baseline_ledger() -> dict[str, Any]:
         "receipts": [],
         "mutation_bytes": [],
         "checkpoint_bytes": [],
+        "native_checkpoint_bytes": [],
         "journal_entries": [],
         "ingress_acknowledgements": [],
         "active_claims": [],

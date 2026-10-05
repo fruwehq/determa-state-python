@@ -39,7 +39,14 @@ def _request(operation: str, operation_id: str, generation: str, arguments: dict
     return json.dumps(request, sort_keys=True, separators=(",", ":"))
 
 
-@pytest.mark.parametrize("mutation", ['{"checkpoint":"one"}', "native mutation bytes"])
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        '{"checkpoint":"one"}',
+        "native mutation bytes",
+        '{"execution_checkpoint_format":"determa.execution_checkpoint"}',
+    ],
+)
 def test_lost_response_replays_committed_receipt_and_freeze_fences_writer(
     tmp_path, mutation
 ) -> None:
@@ -311,3 +318,36 @@ machines:
         assert writer.result(timeout=5)["result"] == "committed"
         assert json.loads(freezer.result(timeout=5))["state"] == "frozen"
     assert authority.inspect("scope-1")["scope_generation"] == "2"
+
+
+@pytest.mark.parametrize("provenance", [None, {}, [7]])
+def test_missing_or_malformed_native_provenance_refuses_freeze_and_writes(tmp_path, provenance):
+    authority = SQLiteLocalAuthority(tmp_path / "unproved.sqlite")
+    authority.setup_schema()
+    assert authority.allocate("scope-1", "owner-1", roots=("root-1",))
+    store = AuthoritySQLiteExecutionStore(authority, "scope-1", "owner-1", "0")
+    store.setup_schema()
+    ledger = authority.inspect("scope-1")
+    if provenance is None:
+        del ledger["native_checkpoint_bytes"]
+    else:
+        ledger["native_checkpoint_bytes"] = provenance
+    with authority._connect() as connection:
+        connection.execute(
+            "UPDATE determa_scope_authority SET ledger = ? WHERE scope_identity = ?",
+            (json.dumps(ledger), "scope-1"),
+        )
+        connection.commit()
+    invocation = {
+        "authenticated_principal": "owner-1",
+        "authorized_scopes": ["scope-1"],
+        "operation_rights": ["freeze_scope"],
+    }
+    result = json.loads(
+        authority.perform(_request("freeze_scope", "freeze-unproved", "0", {}), invocation)
+    )
+    assert result["error_code"] == "scope_fence_unproven"
+    with pytest.raises(ExecutionStoreError, match="scope_fence_unproven"):
+        with store.transaction("root-1"):
+            pytest.fail("unproved history obtained a checkpoint transaction")
+    assert authority.inspect("scope-1") == ledger
