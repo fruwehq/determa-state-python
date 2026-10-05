@@ -110,7 +110,8 @@ def _validate_manifest_artifact(path: Path, artifact: dict) -> None:
     registry = _schema_registry()
     for reference_path in sorted(schema_path.parent.glob("*.schema.json")):
         reference = json.loads(reference_path.read_text(encoding="utf-8"))
-        registry = registry.with_resource(reference["$id"], Resource.from_contents(reference))
+        if "$id" in reference:
+            registry = registry.with_resource(reference["$id"], Resource.from_contents(reference))
     spec_root = _spec_root()
     if spec_root is not None:
         for reference_path in sorted((spec_root / "schema").glob("*.schema.json")):

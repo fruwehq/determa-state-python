@@ -756,6 +756,7 @@ class SQLiteCommittedEffectHost:
             before = canonical_bytes(document)
             value = change(document)
             validate_journal(document["checkpoint"], document["journal"])
+            restore_execution_checkpoint_v1(document["checkpoint"], self.resolver)
             if (
                 ledger is not None
                 and authority_mutation is not None
@@ -1031,7 +1032,10 @@ class SQLiteCommittedEffectHost:
                 raise EffectError("unauthorized_scope")
             intent = next(
                 item["intent"]
-                for item in document["checkpoint"]["pending_outbox_intents"]
+                for item in (
+                    document["checkpoint"]["pending_outbox_intents"]
+                    + document["checkpoint"]["terminal_outbox_records"]
+                )
                 if item["intent"]["effect_id"] == effect_id
             )
             metadata = {

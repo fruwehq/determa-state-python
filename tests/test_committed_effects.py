@@ -435,3 +435,32 @@ def test_missing_native_work_cannot_be_rebound_to_another_authorized_root(tmp_pa
     request, invocation = authority_claim_request(authority, scope, "other-authorized-root", record)
     assert json.loads(authority.perform(request, invocation))["status"] == "rejected"
     assert authority.inspect(scope) == ledger
+
+
+def test_invalid_terminal_outcome_cannot_corrupt_persisted_checkpoint(tmp_path):
+    from determa.state.wire import ArtifactError
+
+    host, root, request, _ = host_fixture(tmp_path)
+    before = host.snapshot(root)
+    with pytest.raises(ArtifactError):
+        host.terminalize_outbox(root, request["effect_id"], {"status": "bogus"})
+    assert host.snapshot(root) == before
+
+
+def test_confirmed_outbox_does_not_remove_the_business_invocation_payload(tmp_path):
+    host, root, request, context = host_fixture(tmp_path)
+    record = host.snapshot(root)["journal"]["effect_records"][0]
+    host.route.update(
+        {key: record[key] for key in ("handler_reference", "destination_binding_digest")}
+    )
+    calls = []
+    host.handler = lambda *arguments: calls.append(arguments) or {"invoked": True}
+    host.terminalize_outbox(root, request["effect_id"], {"status": "confirmed"})
+    assert host.dispatch(root, request["effect_id"], credential="test-credential", **context) == {
+        "invoked": True
+    }
+    assert len(calls) == 1
+    assert (
+        calls[0][0]
+        == host.snapshot(root)["checkpoint"]["terminal_outbox_records"][0]["intent"]["payload"]
+    )
