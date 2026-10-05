@@ -175,6 +175,7 @@ class SourceClosure:
         anchors: dict[tuple[str, str, str], _CallableBinding] | None = None,
         capture: bool = False,
         identity_verifier: SourceIdentityVerifier | None = None,
+        trusted_sources: frozenset[Path] | None = None,
     ) -> bool:
         try:
             if not self.digest_matches(binding["provider_reference"]["content_digest"]):
@@ -194,7 +195,7 @@ class SourceClosure:
                 anchors=anchors,
                 capture=capture,
                 identity_verifier=identity_verifier,
-                trusted_sources=self.trusted_python_sources(),
+                trusted_sources=trusted_sources or self.trusted_python_sources(),
             )
         except (OSError, ValueError, KeyError, TypeError, AttributeError):
             return False
@@ -242,26 +243,36 @@ def _loaded_code_matches(
     capture: bool = False,
     identity_verifier: SourceIdentityVerifier | None = None,
     trusted_sources: frozenset[Path] | None = None,
-    visited: set[Path] | None = None,
+    visited: set[tuple[Path, str]] | None = None,
 ) -> bool:
     """Compare selected Python code and its module callbacks to installed bytes."""
     module_name = (
-        type.__getattribute__(executable, "__module__")
-        if isinstance(executable, type)
-        else getattr(executable, "__module__", None)
+        vars(executable).get("__name__")
+        if isinstance(executable, types.ModuleType)
+        else (
+            type.__getattribute__(executable, "__module__")
+            if isinstance(executable, type)
+            else getattr(executable, "__module__", None)
+        )
     )
     if not isinstance(module_name, str):
         return False
     module = sys.modules.get(module_name)
-    if module is None or Path(vars(module).get("__file__", "")).resolve() != source_path.resolve():
+    if (
+        module is None
+        or (isinstance(executable, types.ModuleType) and module is not executable)
+        or not isinstance(vars(module).get("__file__"), str)
+        or Path(vars(module)["__file__"]).resolve() != source_path.resolve()
+    ):
         return False
     if trusted_sources is None:
         trusted_sources = frozenset({source_path.resolve()})
     if visited is None:
         visited = set()
-    if source_path.resolve() in visited:
+    visit_key = (source_path.resolve(), module_name)
+    if visit_key in visited:
         return True
-    visited.add(source_path.resolve())
+    visited.add(visit_key)
 
     def host_verified(selected: Any) -> bool:
         if identity_verifier is None:
@@ -277,15 +288,48 @@ def _loaded_code_matches(
     tree = ast.parse(source)
     compiled = compile(source, str(source_path), "exec", dont_inherit=True)
 
+    def import_verified(imported: Any) -> bool:
+        """An import can execute only from declared source or host attestation."""
+        if not isinstance(imported, types.ModuleType):
+            return False
+        imported_file = vars(imported).get("__file__")
+        if type(imported) is not types.ModuleType:
+            return host_verified(imported)
+        if not isinstance(imported_file, str) or not imported_file:
+            return host_verified(imported)
+        imported_path = Path(imported_file).resolve()
+        if imported_path in trusted_sources:
+            return _loaded_code_matches(
+                imported_path,
+                imported,
+                anchors=anchors,
+                capture=capture,
+                identity_verifier=identity_verifier,
+                trusted_sources=trusted_sources,
+                visited=visited,
+            )
+        if identity_verifier is None:
+            return False
+        try:
+            return identity_verifier(imported_path, imported) is True
+        except Exception:
+            return False
+
     for node in tree.body:
         if isinstance(node, ast.Import):
             for alias in node.names:
-                loaded = sys.modules.get(alias.name)
-                if alias.asname is None and "." in alias.name:
-                    loaded = sys.modules.get(alias.name.split(".", 1)[0])
+                imported = sys.modules.get(alias.name)
+                loaded = (
+                    sys.modules.get(alias.name.split(".", 1)[0])
+                    if alias.asname is None and "." in alias.name
+                    else imported
+                )
                 if (
                     loaded is None
+                    or imported is None
                     or vars(module).get(alias.asname or alias.name.split(".", 1)[0]) is not loaded
+                    or not import_verified(loaded)
+                    or (imported is not loaded and not import_verified(imported))
                 ):
                     return False
         elif isinstance(node, ast.ImportFrom) and node.module != "__future__":
@@ -293,13 +337,43 @@ def _loaded_code_matches(
                 "." * node.level + (node.module or ""), vars(module).get("__package__")
             )
             loaded = sys.modules.get(resolved_name)
-            if loaded is None:
+            if loaded is None or not import_verified(loaded):
                 return False
             if any(
                 alias.name == "*"
-                or vars(module).get(alias.asname or alias.name) is not vars(loaded).get(alias.name)
+                or (
+                    isinstance(vars(module).get(alias.asname or alias.name), types.ModuleType)
+                    and not import_verified(vars(module)[alias.asname or alias.name])
+                )
+                or (
+                    (
+                        callable(vars(module).get(alias.asname or alias.name))
+                        or isinstance(
+                            vars(module).get(alias.asname or alias.name), types.ModuleType
+                        )
+                        or callable(vars(loaded).get(alias.name))
+                        or isinstance(vars(loaded).get(alias.name), types.ModuleType)
+                    )
+                    and vars(module).get(alias.asname or alias.name)
+                    is not vars(loaded).get(alias.name)
+                )
                 for alias in node.names
             ):
+                return False
+
+    # Local imports do not create module globals. Require their target modules to
+    # have been loaded and verified before selecting code that could import them.
+    for nested in ast.walk(tree):
+        if nested in tree.body:
+            continue
+        if isinstance(nested, ast.Import):
+            if any(not import_verified(sys.modules.get(alias.name)) for alias in nested.names):
+                return False
+        elif isinstance(nested, ast.ImportFrom) and nested.module != "__future__":
+            resolved_name = importlib.util.resolve_name(
+                "." * nested.level + (nested.module or ""), vars(module).get("__package__")
+            )
+            if not import_verified(sys.modules.get(resolved_name)):
                 return False
 
     def matches(
@@ -532,6 +606,8 @@ def _loaded_code_matches(
             (module_name, "", code.co_name),
         ):
             return False
+    if isinstance(executable, types.ModuleType):
+        return sys.modules.get(module_name) is executable
     name = (
         type.__getattribute__(executable, "__name__")
         if isinstance(executable, type)
@@ -630,7 +706,22 @@ class RuntimeProviderRegistry:
             factory,
             anchors=self._loaded_anchors.get(key),
             identity_verifier=self._source_identity_verifier,
+            trusted_sources=self._trusted_sources(binding, closure),
         )
+
+    def _trusted_sources(
+        self, binding: Mapping[str, Any], closure: SourceClosure
+    ) -> frozenset[Path]:
+        sources = set(closure.trusted_python_sources())
+        for reference in binding["dependencies"]:
+            dependency = self._dependencies.get(_reference_key(reference))
+            if (
+                dependency is not None
+                and dependency.digest_matches(reference["content_digest"])
+                and dependency.manifest_verified()
+            ):
+                sources.update(dependency.trusted_python_sources())
+        return frozenset(sources)
 
     def register_dependency(self, reference: Mapping[str, str], closure: SourceClosure) -> None:
         if not _valid_reference(reference):
@@ -790,6 +881,7 @@ class RuntimeProviderRegistry:
             anchors=anchors,
             capture=True,
             identity_verifier=self._source_identity_verifier,
+            trusted_sources=self._trusted_sources(binding, closure),
         ):
             raise RuntimeProviderError("runtime_provider_unavailable")
         checked = copy.deepcopy(dict(descriptor))
@@ -832,6 +924,7 @@ class RuntimeProviderRegistry:
             factory,
             anchors=self._loaded_anchors.get(key),
             identity_verifier=self._source_identity_verifier,
+            trusted_sources=self._trusted_sources(binding, closure),
         ) or any(
             _reference_key(dependency) not in self._dependencies
             or not self._dependencies[_reference_key(dependency)].digest_matches(
@@ -852,7 +945,7 @@ class RuntimeProviderRegistry:
                     type(active.provider),
                     anchors=self._loaded_anchors.get(key),
                     identity_verifier=self._source_identity_verifier,
-                    trusted_sources=closure.trusted_python_sources(),
+                    trusted_sources=self._trusted_sources(binding, closure),
                 )
                 or any(
                     name in getattr(active.provider, "__dict__", {})
@@ -902,7 +995,7 @@ class RuntimeProviderRegistry:
             type(provider),
             anchors=self._loaded_anchors.get(key),
             identity_verifier=self._source_identity_verifier,
-            trusted_sources=closure.trusted_python_sources(),
+            trusted_sources=self._trusted_sources(binding, closure),
         ) or any(
             name in getattr(provider, "__dict__", {})
             for name in (

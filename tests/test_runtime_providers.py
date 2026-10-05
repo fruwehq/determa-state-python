@@ -7,6 +7,7 @@ import importlib.util
 import json
 import shutil
 import sys
+import types
 from pathlib import Path
 
 import pytest
@@ -624,6 +625,189 @@ class Provider(BaseProvider):
     base.evaluate_guard = substitute
     with pytest.raises(RuntimeProviderError, match="runtime_provider_unavailable"):
         registry.invoke_guard(binding, _approved_snapshot())
+    assert not called
+
+
+@pytest.mark.parametrize("source_backed", [False, True])
+def test_untracked_import_refused_before_native_provider_execution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, source_backed: bool
+) -> None:
+    if source_backed:
+        helper_path = tmp_path / "untracked_runtime_helper.py"
+        helper_path.write_text("def choose(value):\n    return value\n")
+        spec = importlib.util.spec_from_file_location("untracked_runtime_helper", helper_path)
+        assert spec is not None and spec.loader is not None
+        helper = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(helper)
+    else:
+        helper = types.ModuleType("untracked_runtime_helper")
+        helper.choose = lambda value: value
+    monkeypatch.setitem(sys.modules, helper.__name__, helper)
+    source = "import untracked_runtime_helper\n" + (
+        (_PROFILE / "provider/test_provider.py")
+        .read_text()
+        .replace(
+            "return bool(reply.approved if",
+            "return bool(untracked_runtime_helper.choose(reply.approved) if",
+        )
+    )
+    with pytest.raises(RuntimeProviderError, match="runtime_provider_unavailable"):
+        _modified_runtime_bundle(tmp_path, provider_source=source)
+
+
+@pytest.mark.parametrize("import_form", ["module", "from"])
+def test_declared_import_rebinding_refused_across_native_public_paths(
+    tmp_path: Path, import_form: str
+) -> None:
+    import_line = (
+        "import external_base_fixture\n"
+        if import_form == "module"
+        else "from external_base_fixture import choose\n"
+    )
+    choose = "external_base_fixture.choose" if import_form == "module" else "choose"
+    source = import_line + (
+        (_PROFILE / "provider/test_provider.py")
+        .read_text()
+        .replace("return bool(reply.approved if", f"return bool({choose}(reply.approved) if")
+        .replace("return bool(approved), 1, 2", f"return bool({choose}(approved)), 1, 2")
+    )
+    bundle, registry = _modified_runtime_bundle(
+        tmp_path,
+        provider_source=source,
+        dependency_source="def choose(value):\n    return value\n",
+    )
+    binding = _fixture_guard_binding(bundle)
+    assert registry.invoke_guard(binding, _approved_snapshot()) is True
+    aggregate = create(bundle, "order", "import-root", "import-create", {})["state"]
+    helper = sys.modules["external_base_fixture"]
+    called = []
+
+    def substitute(value: object) -> bool:
+        called.append(value)
+        return False
+
+    helper.choose = substitute
+    with pytest.raises(RuntimeProviderError, match="runtime_provider_unavailable"):
+        registry.invoke_guard(binding, _approved_snapshot())
+    with pytest.raises(RuntimeProviderError, match="runtime_provider_unavailable"):
+        restore_aggregate(
+            aggregate, MemoryArtifactResolver(definitions={bundle.fingerprint: bundle})
+        )
+    assert not called
+
+
+def test_declared_import_rebinding_refused_before_compiler_call(tmp_path: Path) -> None:
+    source = "from external_base_fixture import choose\n" + (
+        (_PROFILE / "provider/test_provider.py")
+        .read_text()
+        .replace("    return source\n", "    return choose(source)\n")
+    )
+    _bundle, registry = _modified_runtime_bundle(
+        tmp_path,
+        provider_source=source,
+        dependency_source="def choose(value):\n    return value\n",
+    )
+    root = tmp_path / "fixture"
+    closure = SourceClosure(
+        root,
+        ("provider/base.py", "provider/test_provider.py", "provider/test_provider.rs"),
+        "provider-closure.json",
+        _DOMAIN,
+        "provider/test_provider.py",
+    )
+    reference = {
+        "identifier": "test-imported-compiler",
+        "version": "1.0.0",
+        "content_digest": closure.digest(),
+    }
+    module = sys.modules[f"test_e_modified_{tmp_path.name.replace('-', '_')}"]
+    registry.register_compiler(reference, module.compile_region, closure)
+    assert registry.compiler(reference)("event.payload.approved") == "event.payload.approved"
+    helper = sys.modules["external_base_fixture"]
+    helper.choose = lambda _value: "substituted"
+    with pytest.raises(RuntimeProviderError, match="runtime_provider_unavailable"):
+        registry.compiler(reference)
+
+
+def test_declared_import_rebinding_refused_before_native_inspection(tmp_path: Path) -> None:
+    profile = (
+        conformance_root() / "conformance/profiles/inspection-provider/provider-01-exact-closure"
+    )
+    root = tmp_path / "inspection"
+    shutil.copytree(profile, root)
+    helper_path = root / "provider/inspection_helper.py"
+    helper_path.write_text("def choose(value):\n    return value\n")
+    source_path = root / "provider/test_provider.py"
+    source_path.write_text(
+        "import inspection_helper_fixture\n"
+        + source_path.read_text().replace(
+            "return True, 1, 2", "return inspection_helper_fixture.choose(True), 1, 2"
+        )
+    )
+    manifest_path = root / "provider-closure.json"
+    manifest = json.loads(manifest_path.read_text())
+    manifest["files"].insert(0, {"path": "provider/inspection_helper.py", "sha256": ""})
+    for entry in manifest["files"]:
+        entry["sha256"] = (
+            "sha256:" + hashlib.sha256((root / entry["path"]).read_bytes()).hexdigest()
+        )
+    manifest_path.write_text(json.dumps(manifest, sort_keys=True, separators=(",", ":")))
+    closure = SourceClosure(
+        root,
+        ("provider/inspection_helper.py", "provider/test_provider.py", "provider/test_provider.rs"),
+        "provider-closure.json",
+        b"determa-test-inspection-provider-closure-1\0",
+        "provider/test_provider.py",
+    )
+    original = SourceClosure(
+        profile,
+        ("provider/test_provider.py", "provider/test_provider.rs"),
+        "provider-closure.json",
+        b"determa-test-inspection-provider-closure-1\0",
+        "provider/test_provider.py",
+    )
+    document_path = root / "machine.yaml"
+    document_path.write_text(
+        document_path.read_text()
+        .replace(original.digest(), closure.digest())
+        .replace(original.manifest_digest(), closure.manifest_digest())
+    )
+    for name, path in (
+        ("inspection_helper_fixture", helper_path),
+        ("test_imported_inspection_provider", source_path),
+    ):
+        spec = importlib.util.spec_from_file_location(name, path)
+        assert spec is not None and spec.loader is not None
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    module = sys.modules["test_imported_inspection_provider"]
+    helper = sys.modules["inspection_helper_fixture"]
+    binding = yaml.safe_load(document_path.read_text())["machines"][0]["root"]["states"]["waiting"][
+        "on_events"
+    ]["safe"]["guard"]["provider"]
+    registry = RuntimeProviderRegistry()
+    registry.register(
+        {"kind": "guard", "binding": binding},
+        module.SafeGuard,
+        closure,
+        guard_method="evaluate",
+        capability_proof=lambda _provider, _binding: frozenset({"semantically_introspectable"}),
+    )
+    assert registry.inspect_guard(binding, {"event": {"payload": ["map", []]}}, 1, 2) == (
+        True,
+        1,
+        2,
+    )
+    called = []
+
+    def substitute(value: object) -> bool:
+        called.append(value)
+        return False
+
+    helper.choose = substitute
+    with pytest.raises(RuntimeProviderError, match="runtime_provider_unavailable"):
+        registry.inspect_guard(binding, {"event": {"payload": ["map", []]}}, 1, 2)
     assert not called
 
 

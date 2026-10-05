@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import copy
+import json
 
 import pytest
+import yaml
 
 import determa.state.checkpoint_v1 as checkpoint_v1
+from conformance.harness import conformance_root
 from determa.state import (
     ArtifactError,
     ExecutionHost,
@@ -19,6 +22,21 @@ from determa.state import (
     seal_execution_checkpoint,
 )
 from determa.state.queueing import admit_aggregate_v1, step_aggregate_v1
+
+
+def test_committed_effect_result_checkpoints_restore_with_definition_resolver() -> None:
+    case = conformance_root() / "conformance/profiles/committed-native-effects/effect-01-result"
+    bundle = load_bundle(yaml.safe_load((case / "machine.yaml").read_text()))
+    resolver = MemoryArtifactResolver(definitions={bundle.fingerprint: bundle})
+    for name in (
+        "pending-checkpoint.json",
+        "admitted-checkpoint.json",
+        "cancelled-admitted-checkpoint.json",
+    ):
+        checkpoint = json.loads((case / name).read_text())
+        restored = restore_execution_checkpoint_v1(checkpoint, resolver)
+        assert restored.document == checkpoint
+
 
 MACHINE = """
 format: 1
