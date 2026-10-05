@@ -139,6 +139,13 @@ class PublicHostClient:
             raise PublicHostError("invalid_host_request")
         if response["error"] is not None and response["error"]["operation"] != request["operation"]:
             raise PublicHostError("invalid_host_request")
+        if request["operation"] == "capabilities" and response["status"] == "committed":
+            profile = copy.deepcopy(response["value"]["result"])
+            digest = profile.pop("profile_digest")
+            if digest != hash_value(
+                ["determa-public-host-profile-1", "1", profile["scope_binding_identity"], profile]
+            ):
+                raise PublicHostError("invalid_host_request")
         return copy.deepcopy(response)
 
     def discover(self, name: str) -> dict[str, Any]:
@@ -180,13 +187,16 @@ class PublicHostClient:
         binding = self.bindings.get(name)
         if binding is None:
             raise PublicHostError("binding_unavailable")
-        if candidate.get("scope_binding_identity") is None:
-            discovery = self.discover(name)
-            if discovery["status"] != "committed":
-                raise PublicHostError("binding_unavailable")
-            candidate["scope_binding_identity"] = discovery["value"]["result"][
-                "scope_binding_identity"
-            ]
+        discovery = self.discover(name)
+        if discovery["status"] != "committed":
+            raise PublicHostError("binding_unavailable")
+        profile = discovery["value"]["result"]
+        resolved = profile["scope_binding_identity"]
+        if candidate.get("scope_binding_identity") not in {None, resolved}:
+            raise PublicHostError("binding_unavailable")
+        candidate["scope_binding_identity"] = resolved
+        if candidate.get("operation") not in profile["supported_operations"]:
+            raise PublicHostError("host_capability_mismatch")
         validate_public_message(candidate)
         if candidate["operation"] in _READS:
             return self._send(binding.endpoint, candidate)
