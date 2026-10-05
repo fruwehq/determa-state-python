@@ -244,9 +244,7 @@ def test_expired_claim_without_commit_fate_proof_never_grants_a_new_fence(tmp_pa
     refused = worker_helper(path, lambda: now[0]).execute(retry, principal="worker-B")
     assert refused["error_code"] == "delivery_ambiguous" and refused["attempt_fence"] == "1"
     assert installed.snapshot() == before
-    assert (
-        installed.execute(retry, principal="worker-A")["error_code"] == "unauthorized_timer_scope"
-    )
+    assert installed.execute(retry, principal="worker-A")["error_code"] == "timer_worker_mismatch"
     assert installed.snapshot() == before
 
 

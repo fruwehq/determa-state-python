@@ -328,6 +328,9 @@ class SQLiteTimerHelper:
                     ),
                     None,
                 )
+                claimed_record = copy.deepcopy(record)
+                if request["arguments"]["worker_principal"] != principal:
+                    raise TimerError("timer_worker_mismatch")
                 previous = next(
                     (
                         item
@@ -488,9 +491,9 @@ class SQLiteTimerHelper:
             request["root_runtime_id"],
         ) != (self.scope_identity, self.root_instance_id, self.root_runtime_id):
             return _result(request, None, "unauthorized_timer_scope")
-        if request["operation"] in ("claim_fire", "complete_fire") and (
-            principal not in self.worker_principals
-            or request["arguments"]["worker_principal"] != principal
+        if (
+            request["operation"] in ("claim_fire", "complete_fire")
+            and principal not in self.worker_principals
         ):
             return _result(request, None, "unauthorized_timer_scope")
         if request["operation"] == "complete_fire" and self.coordinated_host is not None:
@@ -519,6 +522,11 @@ class SQLiteTimerHelper:
                 ),
                 None,
             )
+            if (
+                request["operation"] in ("claim_fire", "complete_fire")
+                and request["arguments"]["worker_principal"] != principal
+            ):
+                return _result(request, record, "timer_worker_mismatch")
             if previous is not None:
                 return (
                     copy.deepcopy(previous["result"])

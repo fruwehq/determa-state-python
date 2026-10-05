@@ -6,6 +6,7 @@ import pytest
 
 from determa.state import ExecutionHost, ExecutionStoreError, SQLiteExecutionStore, load_bundle
 from determa.state.stores.base import SHARED_APPLICATION_TRANSACTION
+from determa.state.stores.sqlite import sqlite_execution_store_factory
 
 from .test_execution_stores import MACHINE, _resolver
 
@@ -96,6 +97,22 @@ def test_sqlite_default_store_refuses_shared_transaction(tmp_path):
     host = ExecutionHost(store, _resolver())
     with pytest.raises(Exception, match="adapter_capability_mismatch"):
         host.run_shared_transaction("root", lambda sql, execution: None)
+
+
+def test_bundled_sqlite_uri_requires_an_explicit_shared_transaction_option(tmp_path):
+    path = tmp_path / "public-uri.sqlite"
+    ordinary = sqlite_execution_store_factory(f"sqlite://{path}", {})
+    ordinary.setup_schema()
+    selected = sqlite_execution_store_factory(
+        f"sqlite://{path}?shared_application_transactions=true", {}
+    )
+    assert SHARED_APPLICATION_TRANSACTION in selected.capabilities
+    assert SHARED_APPLICATION_TRANSACTION not in ordinary.capabilities
+    for invalid in ("1", "TRUE", "", "yes", "true&shared_application_transactions=false"):
+        with pytest.raises(ExecutionStoreError, match="invalid_adapter_configuration"):
+            sqlite_execution_store_factory(
+                f"sqlite://{path}?shared_application_transactions={invalid}", {}
+            )
 
 
 @pytest.mark.parametrize(

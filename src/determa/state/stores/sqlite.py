@@ -598,6 +598,7 @@ def sqlite_execution_store_factory(uri: str, configuration: Mapping[str, Any]) -
         "timeout",
         "replay_retention",
         "outbox_retention",
+        "shared_application_transactions",
     }:
         raise ExecutionStoreError(AdapterCode.INVALID_ADAPTER_CONFIGURATION)
     journal_mode = _single_query(query, "journal_mode", "WAL")
@@ -605,6 +606,9 @@ def sqlite_execution_store_factory(uri: str, configuration: Mapping[str, Any]) -
     timeout_text = _single_query(query, "timeout", "30")
     replay_retention = _single_query(query, "replay_retention", "bounded")
     outbox_retention = _single_query(query, "outbox_retention", "none")
+    shared = _single_query(query, "shared_application_transactions", "false")
+    if shared not in {"true", "false"}:
+        raise ExecutionStoreError(AdapterCode.INVALID_ADAPTER_CONFIGURATION)
     try:
         timeout = float(timeout_text)
     except ValueError as exc:
@@ -616,4 +620,5 @@ def sqlite_execution_store_factory(uri: str, configuration: Mapping[str, Any]) -
         timeout=timeout,
         replay_retention=replay_retention,
         outbox_retention=outbox_retention,
+        shared_application_transactions=shared == "true",
     )

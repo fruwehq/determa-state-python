@@ -1302,6 +1302,7 @@ def bundled_extension_registry(
         "file": {"restart_persistent"},
         "sqlite": {
             "durable_single_writer",
+            "shared_application_transaction",
             "root_identity_retention",
             "permanent_receipt_retention",
             "permanent_outbox_terminal_retention",
