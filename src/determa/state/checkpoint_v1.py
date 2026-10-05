@@ -539,6 +539,8 @@ def create_checkpoint_v1(
     root_instance_id: str,
     creation_id: str,
     bindings: dict[str, dict[str, Any]] | None = None,
+    *,
+    _include_projection_result: bool = False,
 ) -> dict[str, Any]:
     """Create a fresh queue-bearing checkpoint from the public v1 core result."""
     result = create_aggregate_v1(
@@ -630,7 +632,10 @@ def create_checkpoint_v1(
                 "emission_references": [],
             }
         )
-    return seal_execution_checkpoint(checkpoint)
+    sealed = seal_execution_checkpoint(checkpoint)
+    if _include_projection_result:
+        return {"checkpoint": sealed, "core_result": result}
+    return sealed
 
 
 def _check_cas(document: Mapping[str, Any], revision: str, digest: str) -> None:
@@ -707,18 +712,15 @@ def _retained_replay(
     return None
 
 
-def admit_checkpoint_v1(
-    source: ArtifactSource,
+def _preflight_checkpoint_admission(
+    document: dict[str, Any],
     deliveries: Sequence[Mapping[str, Any]],
     definition_resolver: DefinitionResolver,
     *,
     expected_revision: str,
     expected_checkpoint_digest: str,
-) -> dict[str, Any]:
-    """Atomically admit or replay a delivery batch against one v1 checkpoint."""
-    restored = restore_execution_checkpoint_v1(source, definition_resolver)
-    document = restored.document
-    snapshot = copy.deepcopy(deliveries)
+) -> tuple[list[str], list[dict[str, Any] | None], list[Mapping[str, Any]], dict[str, Any] | None]:
+    """Validate a restored checkpoint's delivery batch without core evaluation."""
     terminal_code: str | None
     if document["root_record"]["status"] == "tombstone":
         terminal_code = "tombstoned_root"
@@ -800,8 +802,13 @@ def admit_checkpoint_v1(
             for delivery, evidence in zip(deliveries, replay_evidence, strict=True)
         ]
         if len(replay_members) == 1:
-            return dict(replay_members[0]["evidence"])
-        return {"result": "batch", "checkpoint": document, "members": replay_members}
+            return canonical_digests, replay_evidence, [], dict(replay_members[0]["evidence"])
+        return (
+            canonical_digests,
+            replay_evidence,
+            [],
+            {"result": "batch", "checkpoint": document, "members": replay_members},
+        )
     if terminal_code is not None:
         raise ArtifactError(terminal_code)
     _check_cas(document, expected_revision, expected_checkpoint_digest)
@@ -816,6 +823,34 @@ def admit_checkpoint_v1(
     validation_code = _validate_new_deliveries(restored_aggregate, new_deliveries)
     if validation_code is not None:
         raise ArtifactError(validation_code)
+    return canonical_digests, replay_evidence, new_deliveries, None
+
+
+def admit_checkpoint_v1(
+    source: ArtifactSource,
+    deliveries: Sequence[Mapping[str, Any]],
+    definition_resolver: DefinitionResolver,
+    *,
+    expected_revision: str,
+    expected_checkpoint_digest: str,
+    _include_projection_result: bool = False,
+) -> dict[str, Any]:
+    """Atomically admit or replay a delivery batch against one v1 checkpoint."""
+    restored = restore_execution_checkpoint_v1(source, definition_resolver)
+    document = restored.document
+    snapshot = copy.deepcopy(deliveries)
+    canonical_digests, replay_evidence, new_deliveries, replay_result = (
+        _preflight_checkpoint_admission(
+            document,
+            deliveries,
+            definition_resolver,
+            expected_revision=expected_revision,
+            expected_checkpoint_digest=expected_checkpoint_digest,
+        )
+    )
+    if replay_result is not None:
+        return replay_result
+    aggregate = document["root_record"]["aggregate_state"]
     admission = admit_aggregate_v1(aggregate, new_deliveries, definition_resolver)
     if admission["result"] == "rejected":
         raise ArtifactError(admission["rejection"]["code"])
@@ -850,6 +885,10 @@ def admit_checkpoint_v1(
         members[-1].pop("event_id", None)
         members[-1] = {"event_id": event_id, **members[-1]}
     sealed = seal_execution_checkpoint(candidate)
+    if _include_projection_result and all(
+        member["disposition"] == "accepted" for member in members
+    ):
+        return {"checkpoint": sealed, "core_result": admission}
     assert deliveries == snapshot
     if all(member["disposition"] == "accepted" for member in members):
         return sealed
@@ -864,11 +903,13 @@ def step_checkpoint_v1(
     expected_revision: str,
     expected_checkpoint_digest: str,
     _include_host_response: bool = False,
+    _defer_projection_cas: bool = False,
 ) -> dict[str, Any]:
     """Process one ready mailbox head and append its terminal receipt."""
     restored = restore_execution_checkpoint_v1(source, definition_resolver)
     document = restored.document
-    _check_cas(document, expected_revision, expected_checkpoint_digest)
+    if not _defer_projection_cas:
+        _check_cas(document, expected_revision, expected_checkpoint_digest)
     aggregate = document["root_record"].get("aggregate_state")
     if aggregate is None:
         raise ArtifactError("tombstoned_root")
@@ -906,6 +947,8 @@ def step_checkpoint_v1(
         definition_resolver,
         _include_host_evidence=True,
     )
+    if _defer_projection_cas:
+        _check_cas(document, expected_revision, expected_checkpoint_digest)
     if selected is None or result["disposition"] in {"not_runnable", "rejected"}:
         return {
             "result": "not_committed",

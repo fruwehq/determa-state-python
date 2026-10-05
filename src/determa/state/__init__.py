@@ -5,6 +5,11 @@ from __future__ import annotations
 import logging
 
 from .__about__ import __version__
+from .application_projection import (
+    ApplicationProjectionFacade,
+    ApplicationRowMapping,
+    ProjectionError,
+)
 from .checkpoint import (
     execution_checkpoint_digest,
     seal_execution_checkpoint,
@@ -135,6 +140,8 @@ from .wire import (
 )
 
 __all__ = [
+    "ApplicationProjectionFacade",
+    "ApplicationRowMapping",
     "ArtifactError",
     "ArtifactResolver",
     "admit",
@@ -188,6 +195,8 @@ __all__ = [
     "PERMANENT_RECEIPT_RETENTION",
     "PostgreSQLExecutionStore",
     "PORTABLE_CODE_SETS",
+    "ProjectionError",
+    "ProjectionFailureCode",
     "PersistenceFailureCode",
     "ProjectionFailureCode",
     "PersistenceHost",
