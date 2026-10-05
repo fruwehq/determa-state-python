@@ -474,6 +474,7 @@ class SQLiteCommittedEffectHost:
         *,
         authority_scope: str | None = None,
         core_observer: Callable[[str, str, Mapping[str, Any]], None] | None = None,
+        trusted_clock: Callable[[], str] | None = None,
     ) -> None:
         self.path = str(Path(path).resolve())
         self.resolver = resolver
@@ -481,6 +482,7 @@ class SQLiteCommittedEffectHost:
         self.handler = handler
         self.authority_scope = authority_scope
         self.core_observer = core_observer
+        self.trusted_clock = trusted_clock
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, isolation_level=None, timeout=30)
@@ -1008,6 +1010,9 @@ class SQLiteCommittedEffectHost:
         authorized: bool = True,
     ) -> Mapping[str, Any]:
         """Run an installed native handler after durable intent and live guard proof."""
+        clock = self.trusted_clock
+        if clock is None:
+            raise EffectError("stale_attempt_fence")
 
         def call(document: dict[str, Any]) -> Mapping[str, Any]:
             record = _record(document["journal"], effect_id)
@@ -1021,7 +1026,7 @@ class SQLiteCommittedEffectHost:
                 principal,
                 scope,
                 epoch,
-                trusted_now,
+                clock(),
             )
             if (
                 not authorized
@@ -1045,11 +1050,24 @@ class SQLiteCommittedEffectHost:
                 "destination_binding_digest": record["destination_binding_digest"],
                 "credential": credential,
             }
-            return self.handler(
+            result = self.handler(
                 copy.deepcopy(intent["payload"]),
                 metadata,
                 {"attempt_fence": record["attempt_fence"]},
             )
+            # External acceptance cannot extend an expired worker's mutation
+            # rights. A refusal leaves its leased journal for reconciliation.
+            self._authorize(
+                document,
+                effect_id,
+                record["operation_token"],
+                record["attempt_fence"],
+                principal,
+                scope,
+                epoch,
+                clock(),
+            )
+            return result
 
         return self._transact(
             root, call, expected_epoch=epoch, worker_guard=(effect_id, principal, None, trusted_now)

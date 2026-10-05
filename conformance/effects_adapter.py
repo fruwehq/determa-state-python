@@ -318,6 +318,7 @@ def _run_operation(payload: dict[str, Any], control: Path | None = None) -> dict
         handler,
         authority_scope=_AUTHORITY_SCOPE,
         core_observer=observe_core,
+        trusted_clock=lambda: payload["auth_context"]["trusted_host_now"],
     )
     # Install the vector's pre-existing authority facts as trusted test setup.
     # The production seed path may restore these claims, but cannot issue them.

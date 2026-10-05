@@ -455,6 +455,7 @@ def test_confirmed_outbox_does_not_remove_the_business_invocation_payload(tmp_pa
     )
     calls = []
     host.handler = lambda *arguments: calls.append(arguments) or {"invoked": True}
+    host.trusted_clock = lambda: "0"
     host.terminalize_outbox(root, request["effect_id"], {"status": "confirmed"})
     assert host.dispatch(root, request["effect_id"], credential="test-credential", **context) == {
         "invoked": True
@@ -531,3 +532,22 @@ def test_multi_effect_recovery_commits_one_journal_revision_per_effect(tmp_path)
         "ambiguous"
     }
     assert committed_revisions == [initial_revision + 1, initial_revision + 2]
+
+
+def test_dispatch_crossing_lease_expiry_preserves_unresolved_work_for_recovery(tmp_path):
+    host, root, request, context = host_fixture(tmp_path)
+    record = host.snapshot(root)["journal"]["effect_records"][0]
+    host.route.update(
+        {key: record[key] for key in ("handler_reference", "destination_binding_digest")}
+    )
+    expiry = read("data/active-claim.json")["expires_at"]
+    readings = iter(["0", expiry])
+    host.trusted_clock = lambda: next(readings)
+    calls = []
+    host.handler = lambda *args: calls.append(args) or {"accepted": True}
+    before = host.snapshot(root)
+    with pytest.raises(EffectError, match="stale_attempt_fence"):
+        host.dispatch(root, request["effect_id"], credential="test-credential", **context)
+    assert len(calls) == 1
+    assert host.snapshot(root) == before
+    assert host.recover(root)["journal"]["effect_records"][0]["invocation_state"] == "ambiguous"
