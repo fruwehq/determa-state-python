@@ -97,6 +97,7 @@ def create_aggregate_v1(
 ) -> dict[str, Any]:
     """Create one queue-bearing aggregate and route initialization emissions."""
     validated = bundle if isinstance(bundle, Bundle) else load_bundle(bundle)
+    validated.verify_runtime_policy()
     result = _create(
         validated,
         machine_id,
@@ -239,14 +240,7 @@ def _mailbox_payload_is_normalized(
     if event == "env":
         if set(payload) != {"changed"} or not isinstance(payload["changed"], Mapping):
             return False
-        native_runtime = next(
-            (
-                item
-                for item in restored.state["runtimes"].values()
-                if item["runtime_id"] == runtime["runtime_id"]
-            ),
-            None,
-        )
+        native_runtime = restored.state["runtimes"].get(runtime["runtime_id"])
         if native_runtime is None:
             return False
         root = _pointer_get(restored.bundle.raw, native_runtime["root_pointer"])
@@ -303,8 +297,8 @@ def _validate_mailbox_semantics(document: Mapping[str, Any], restored: RestoredA
                         expected = "input" if mode == "input" else "internal"
                         valid_event = declaration["direction"] == expected
                         correlation = envelope.get("correlation_id")
-                        valid_event = valid_event and bool(declaration.get("correlates_to")) == (
-                            correlation is not None
+                        valid_event = valid_event and (
+                            not declaration.get("correlates_to") or correlation is not None
                         )
                     valid_event = (
                         valid_event

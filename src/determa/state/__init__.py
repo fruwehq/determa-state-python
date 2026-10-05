@@ -43,6 +43,7 @@ from .codes import (
     PersistenceFailureCode,
     ProjectionFailureCode,
 )
+from .compilation import compile_language_source
 from .definition import Bundle, BundleSource, load_bundle
 from .errors import (
     ArtifactError,
@@ -95,6 +96,7 @@ from .queueing import (
 from .queueing import (
     step_aggregate_v1 as step,
 )
+from .runtime_providers import RuntimeProviderError, RuntimeProviderRegistry, SourceClosure
 from .stores import (
     COMPACT_EFFECT_IDENTITY_RETENTION,
     DURABLE_CONCURRENT,
@@ -145,6 +147,9 @@ __all__ = [
     "admit",
     "admit_checkpoint_v1",
     "Bundle",
+    "RuntimeProviderError",
+    "RuntimeProviderRegistry",
+    "SourceClosure",
     "BundleSource",
     "CelError",
     "CheckpointArtifactFailureCode",
@@ -193,6 +198,7 @@ __all__ = [
     "ProjectionError",
     "ProjectionFailureCode",
     "PersistenceFailureCode",
+    "ProjectionFailureCode",
     "PersistenceHost",
     "RESTART_PERSISTENT",
     "ROOT_IDENTITY_RETENTION",
@@ -219,6 +225,7 @@ __all__ = [
     "execution_checkpoint_digest",
     "file_execution_store_factory",
     "load_bundle",
+    "compile_language_source",
     "inspect_candidate",
     "memory_execution_store_factory",
     "maintenance_migration_request_digest",

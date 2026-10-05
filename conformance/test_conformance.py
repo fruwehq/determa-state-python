@@ -60,6 +60,7 @@ _PORTABLE_ARTIFACT_KINDS = {
 }
 _CONFORMANCE_ARTIFACT_SCHEMAS = {
     "application_projection_v1": "application-projection-v1.schema.json",
+    "lossless_delivery_v1": "lossless-delivery-v1.schema.json",
     "durable_host_call_log_v1": "durable-host-call-log-v1.schema.json",
     "durable_host_inputs_v1": "durable-host-inputs-v1.schema.json",
     "durable_host_results_v1": "durable-host-results-v1.schema.json",
@@ -110,6 +111,11 @@ def _validate_manifest_artifact(path: Path, artifact: dict) -> None:
     for reference_path in sorted(schema_path.parent.glob("*.schema.json")):
         reference = json.loads(reference_path.read_text(encoding="utf-8"))
         registry = registry.with_resource(reference["$id"], Resource.from_contents(reference))
+    spec_root = _spec_root()
+    if spec_root is not None:
+        for reference_path in sorted((spec_root / "schema").glob("*.schema.json")):
+            reference = json.loads(reference_path.read_text(encoding="utf-8"))
+            registry = registry.with_resource(reference["$id"], Resource.from_contents(reference))
     validator = Draft202012Validator(schema, registry=registry)
     try:
         document = json.loads((path / artifact["file"]).read_text(encoding="utf-8"))
@@ -649,6 +655,25 @@ def test_bundled_artifact_schema_is_valid_draft_2020_12(kind: str) -> None:
     Draft202012Validator.check_schema(artifact_schema(kind))
 
 
+@pytest.mark.parametrize(
+    "name",
+    [
+        "runtime-action-output-v1.schema.json",
+        "runtime-provider-descriptor-v1.schema.json",
+        "language-source-v1.schema.json",
+        "compilation-manifest-v1.schema.json",
+    ],
+)
+def test_optional_runtime_schemas_match_pinned_spec(name: str) -> None:
+    root = _spec_root()
+    assert root is not None, "pinned specification is unavailable"
+    installed = Path(__file__).resolve().parents[1] / "src/determa/state/data" / name
+    upstream = json.loads((root / "schema" / name).read_text(encoding="utf-8"))
+    bundled = json.loads(installed.read_text(encoding="utf-8"))
+    Draft202012Validator.check_schema(bundled)
+    assert bundled == upstream
+
+
 def test_bundled_schema_is_valid_draft_2020_12() -> None:
     Draft202012Validator.check_schema(bundled_schema())
 
@@ -684,9 +709,4 @@ def test_durable_host_vector(item) -> None:
 )
 def test_version1_artifact(case, artifact) -> None:
     path = case.path if isinstance(case, CoreCase) else case
-    if "inspection-provider" in path.parts and artifact["kind"] == "aggregate_state_v1":
-        from determa.state.wire import load_json_artifact
-
-        load_json_artifact((path / artifact["file"]).read_bytes(), "aggregate_state_v1")
-        pytest.skip("optional native guard-provider semantic restore is not claimed")
     _validate_manifest_artifact(path, artifact)

@@ -6,10 +6,10 @@ a language-agnostic statechart engine with a shared normative conformance suite.
 This implementation supports Determa State `format: 1` at specification
 commit `86bb88dd21cb1f799eefe5020b6e49dabf6e7225`. Correctness is determined by
 99 format-1 core cases, 162 version-1 vectors, 142 durable-host vectors, 49 core
-inspection vectors, 47 extension negotiation vectors, and 476 manifest artifacts
-at conformance commit `bbb215961448ad691189c41072d8ea03f76f9372`. The 7
-native guard-provider inspection vectors remain an optional profile pending
-runtime-provider support.
+inspection vectors, 47 extension negotiation vectors, 7 native guard-provider
+inspection vectors, 30 runtime-provider vectors, and 476 manifest artifacts at
+conformance commit `ce6c94ee1929597689403080d1790e2f48f8a5fb`. The native
+runtime-provider profile is optional and is exercised through its production adapter.
 
 The package metadata is `0.3.0`. Artifact and checkpoint schema version 1 is the
 only supported portable artifact format. Machine YAML remains `format: 1`.
@@ -281,6 +281,30 @@ the four bundled stores through the same public `register` operation and accepts
 source verifier for additional providers. Its only positive claim here is memory's
 `ephemeral`, which permits process loss. Category-specific guarantees need their
 operational profile proof before the host can advertise them.
+
+`RuntimeProviderRegistry` installs exact native guard and action providers through
+that same common registration boundary. `SourceClosure` binds the loaded Python
+callable and its declared dependency files to the reference and source digest.
+The registry checks source-literal function defaults and the selected callable's
+identity before use; mutable provider state may change in place. Hosts loading
+providers with dynamic defaults or external executable dependencies can supply
+`source_identity_verifier` when constructing the registry. That host callback must
+independently attest the selected loaded executable and its source provenance;
+provider self-assertions are not evidence.
+`load_bundle(..., runtime_providers=registry)` preflights every native slot, including
+unreachable declarations. The engine passes immutable typed snapshots, validates
+ordered action proposals, and retains the ordinary atomic rollback and fault codes.
+The registry reports effective guarantees from configured provider proof; unknown
+purity discloses possible external I/O. A host may require guarantees at load with
+`required_capabilities`. Native I/O can occur before a Determa commit and survives
+a failed compare-and-swap; the engine does not retry it automatically.
+
+`compile_language_source(source, registry, manifest=manifest)` verifies the exact
+source and compiler closure, compiles disjoint regions in order, strictly loads the
+generated format-1 bundle, and checks the manifest fingerprint and proved source
+capabilities. A generated CEL bundle restores without an installed compiler.
+Semantic inspection calls only a separately proved, bounded `inspect_guard` method;
+structural inspection never invokes a native provider.
 
 ## Implemented Surface
 
