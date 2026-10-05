@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, cast
 
@@ -23,6 +25,31 @@ from .wire import DefinitionResolver, canonical_bytes, decoded_typed_value, hash
 
 _OPERATIONS = ["capabilities", "create", "admit", "process", "read", "inspect", "receipt"]
 _MUTATIONS = {"create", "admit", "process"}
+
+_TABLES = {
+    "determa_public_host_binding": "singleton INTEGER PRIMARY KEY CHECK(singleton=1), "
+    "schema_version INTEGER NOT NULL CHECK(schema_version=1), scope_binding_identity TEXT NOT NULL",
+    "determa_public_host_checkpoints": (
+        "root_instance_id TEXT PRIMARY KEY, checkpoint BLOB NOT NULL"
+    ),
+    "determa_public_host_responses": "operation_id TEXT PRIMARY KEY, request BLOB NOT NULL, "
+    "request_digest TEXT NOT NULL, response BLOB NOT NULL",
+}
+_TRIGGERS = {
+    f"{table}_forbid_{action.lower()}": f"CREATE TRIGGER {table}_forbid_{action.lower()} "
+    f"BEFORE {action} ON {table} "
+    "BEGIN SELECT RAISE(ABORT,'public_host_immutable'); END"
+    for table, actions in {
+        "determa_public_host_binding": ("INSERT", "UPDATE", "DELETE"),
+        "determa_public_host_checkpoints": ("DELETE",),
+        "determa_public_host_responses": ("UPDATE", "DELETE"),
+    }.items()
+    for action in actions
+}
+
+
+def _sql_tokens(source: str) -> list[str]:
+    return re.findall(r"[a-z_][a-z0-9_]*|[0-9]+|[(),=]", source.lower())
 
 
 class SQLitePublicExecutionHost:
@@ -55,37 +82,65 @@ class SQLitePublicExecutionHost:
         self.authorized_principals = frozenset(authorized_principals)
         self.resolver = resolver
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         db = sqlite3.connect(self.path)
-        db.execute("PRAGMA journal_mode=WAL")
-        db.execute("PRAGMA synchronous=FULL")
-        return db
+        try:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA synchronous=FULL")
+            if (
+                db.execute("PRAGMA journal_mode").fetchone()[0] != "wal"
+                or db.execute("PRAGMA synchronous").fetchone()[0] != 2
+            ):
+                raise PublicHostError("host_capability_mismatch")
+            with db:
+                yield db
+        finally:
+            db.close()
 
     def setup_schema(self) -> None:
+        """Create the exact local schema without replacing prior scope evidence."""
         with self._connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            db.execute(
-                "CREATE TABLE IF NOT EXISTS determa_public_host_binding ("
-                "singleton INTEGER PRIMARY KEY CHECK(singleton=1), "
-                "schema_version INTEGER NOT NULL CHECK(schema_version=1), "
-                "scope_binding_identity TEXT NOT NULL)"
-            )
-            db.execute(
-                "CREATE TABLE IF NOT EXISTS determa_public_host_checkpoints ("
-                "root_instance_id TEXT PRIMARY KEY, checkpoint BLOB NOT NULL)"
-            )
-            db.execute(
-                "CREATE TABLE IF NOT EXISTS determa_public_host_responses ("
-                "operation_id TEXT PRIMARY KEY, request BLOB NOT NULL, "
-                "request_digest TEXT NOT NULL, response BLOB NOT NULL)"
-            )
-            db.execute(
-                "INSERT OR IGNORE INTO determa_public_host_binding VALUES (1,1,?)",
-                (self.scope_binding_identity,),
-            )
+            for name, columns in _TABLES.items():
+                db.execute(f"CREATE TABLE IF NOT EXISTS {name} ({columns})")
+            if not db.execute("SELECT 1 FROM determa_public_host_binding").fetchone():
+                db.execute(
+                    "INSERT INTO determa_public_host_binding VALUES (1,1,?)",
+                    (self.scope_binding_identity,),
+                )
+            for name, definition in _TRIGGERS.items():
+                existing = db.execute(
+                    "SELECT sql FROM sqlite_master WHERE type='trigger' AND name=?", (name,)
+                ).fetchone()
+                if existing is None:
+                    db.execute(definition)
             self._check_binding(db)
 
+    @staticmethod
+    def _check_schema(db: sqlite3.Connection) -> None:
+        for name, columns in _TABLES.items():
+            row = db.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (name,)
+            ).fetchone()
+            if row is None or _sql_tokens(row[0]) != _sql_tokens(
+                f"CREATE TABLE {name} ({columns})"
+            ):
+                raise PublicHostError("host_capability_mismatch")
+        actual = dict(
+            db.execute(
+                "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name IN (?,?,?)",
+                tuple(_TABLES),
+            )
+        )
+        if set(actual) != set(_TRIGGERS) or any(
+            _sql_tokens(actual[name]) != _sql_tokens(definition)
+            for name, definition in _TRIGGERS.items()
+        ):
+            raise PublicHostError("host_capability_mismatch")
+
     def _check_binding(self, db: sqlite3.Connection) -> None:
+        self._check_schema(db)
         rows = db.execute(
             "SELECT singleton,schema_version,scope_binding_identity "
             "FROM determa_public_host_binding"

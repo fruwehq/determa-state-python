@@ -10,7 +10,8 @@ import copy
 import json
 import sqlite3
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
@@ -101,14 +102,24 @@ class PublicHostClient:
                 "request_digest TEXT NOT NULL, response BLOB)"
             )
 
-    def _connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def _connect(self) -> Iterator[sqlite3.Connection]:
         db = sqlite3.connect(self.path)
-        db.execute("PRAGMA journal_mode=WAL")
-        db.execute("PRAGMA synchronous=FULL")
-        return db
+        try:
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA synchronous=FULL")
+            with db:
+                yield db
+        finally:
+            db.close()
 
     def _send(self, endpoint: str, request: dict[str, Any]) -> dict[str, Any]:
         response = self.transport(endpoint, copy.deepcopy(request))
+        return self._checked_response(request, response)
+
+    def _checked_response(
+        self, request: dict[str, Any], response: dict[str, Any]
+    ) -> dict[str, Any]:
         validate_public_message(response, response=True)
         if response["operation_id"] != request["operation_id"]:
             raise PublicHostError("invalid_host_request")
@@ -160,6 +171,21 @@ class PublicHostClient:
             if saved is not None:
                 if saved["operation_id"] != request["arguments"]["queried_operation_id"]:
                     raise PublicHostError("invalid_host_request")
+                with self._connect() as db:
+                    local = db.execute(
+                        "SELECT request,request_digest FROM determa_public_client_requests "
+                        "WHERE operation_id=?",
+                        (saved["operation_id"],),
+                    ).fetchone()
+                if local is not None:
+                    original = json.loads(local[0])
+                    if (
+                        public_request_digest(original) != local[1]
+                        or local[1] != request["arguments"]["request_digest"]
+                        or original["scope_binding_identity"] != request["scope_binding_identity"]
+                    ):
+                        raise PublicHostError("invalid_host_request")
+                    self._checked_response(original, saved)
                 evidence = saved["receipt"]
                 if evidence is not None and (
                     evidence["scope_binding_identity"] != request["scope_binding_identity"]
@@ -254,8 +280,7 @@ class PublicHostClient:
             raise PublicHostError("invalid_host_request")
         if row[3] is not None:
             response = json.loads(row[3])
-            validate_public_message(response, response=True)
-            return cast(dict[str, Any], response)
+            return self._checked_response(request, cast(dict[str, Any], response))
         response = self._send(row[0], request)
         if response["status"] != "pending":
             with self._connect() as db:
@@ -277,6 +302,9 @@ class PublicHostClient:
         if row is None:
             raise PublicHostError("outcome_unknown")
         saved = json.loads(row[1])
+        if canonical_bytes(saved) != row[1] or public_request_digest(saved) != row[2]:
+            raise PublicHostError("invalid_host_request")
+
         request = {
             "protocol": _PROTOCOL,
             "protocol_version": 1,

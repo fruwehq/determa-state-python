@@ -226,3 +226,77 @@ def test_client_rejects_mismatched_nested_receipt_evidence(tmp_path):
         client.submit("one", creation(bundle))
     with pytest.raises(PublicHostError, match="invalid_host_request"):
         client.receipt("operation-create")
+
+
+def test_native_response_insert_failure_rolls_back_checkpoint_and_ledger(tmp_path, monkeypatch):
+    import sqlite3
+
+    import pytest
+
+    host, bundle = open_host(tmp_path)
+    original_connect = sqlite3.connect
+
+    class FailingConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            if sql.startswith("INSERT INTO determa_public_host_responses"):
+                raise sqlite3.OperationalError("injected response write failure")
+            return super().execute(sql, parameters)
+
+    monkeypatch.setattr(
+        "determa.state.public_host.sqlite3.connect",
+        lambda path: original_connect(path, factory=FailingConnection),
+    )
+    with pytest.raises(sqlite3.OperationalError):
+        host.handle(creation(bundle), principal="alice")
+    monkeypatch.undo()
+    observed = host.handle(base("read", "after-failure"), principal="alice")
+    assert observed["value"]["result"]["checkpoint"] is None
+    with original_connect(host.path) as db:
+        assert db.execute("SELECT COUNT(*) FROM determa_public_host_responses").fetchone()[0] == 0
+
+
+def test_native_commit_with_lost_fate_reconciles_to_first_response(tmp_path, monkeypatch):
+    import sqlite3
+
+    import pytest
+
+    host, bundle = open_host(tmp_path)
+    original_connect = sqlite3.connect
+
+    class LostCommitConnection(sqlite3.Connection):
+        def __exit__(self, *args):
+            result = super().__exit__(*args)
+            if args[0] is None:
+                raise sqlite3.OperationalError("commit response lost after native commit")
+            return result
+
+    monkeypatch.setattr(
+        "determa.state.public_host.sqlite3.connect",
+        lambda path: original_connect(path, factory=LostCommitConnection),
+    )
+    request = creation(bundle)
+    with pytest.raises(sqlite3.OperationalError):
+        host.handle(request, principal="alice")
+    monkeypatch.undo()
+
+    def forbidden_core(*_args, **_kwargs):
+        raise AssertionError("unknown native commit must reconcile without core execution")
+
+    monkeypatch.setattr("determa.state.public_host.create_checkpoint_v1", forbidden_core)
+    result = host.handle(request, principal="alice")
+    assert result["status"] == "committed"
+    assert result["receipt"] is not None
+    with original_connect(host.path) as db:
+        assert db.execute("SELECT COUNT(*) FROM determa_public_host_responses").fetchone()[0] == 1
+
+
+def test_changed_native_schema_refuses_before_mutation(tmp_path):
+    import sqlite3
+
+    host, bundle = open_host(tmp_path)
+    with sqlite3.connect(host.path) as db:
+        db.execute("DROP TRIGGER determa_public_host_responses_forbid_delete")
+    response = host.handle(creation(bundle), principal="alice")
+    assert response["error"]["code"] == "host_capability_mismatch"
+    with sqlite3.connect(host.path) as db:
+        assert db.execute("SELECT COUNT(*) FROM determa_public_host_checkpoints").fetchone()[0] == 0
