@@ -361,10 +361,17 @@ def _reconstruct_producer_response(
 
 def _validate_authority_pair(ledger: Mapping[str, Any], document: Mapping[str, Any]) -> None:
     """Check the old native pair before any journal transition can be staged."""
+    from .authority import _native_checkpoint_history
+
+    try:
+        history = _native_checkpoint_history(ledger)
+    except ValueError as error:
+        raise EffectError("unauthorized_scope") from error
     journal = document["journal"]
     if (
         journal["scope_identity"] != ledger["scope_identity"]
         or journal["root_instance_id"] not in ledger["roots"]
+        or canonical_bytes(document["checkpoint"]).decode() not in history
     ):
         raise EffectError("unauthorized_scope")
     for record in journal["effect_records"]:
@@ -533,6 +540,12 @@ class SQLiteCommittedEffectHost:
                 ):
                     raise EffectError("stale_attempt_fence")
                 for record in journal["effect_records"]:
+                    if any(
+                        previous["work_identity"] == record["effect_id"]
+                        and int(previous["attempt_fence"]) > int(record["attempt_fence"])
+                        for previous in ledger.get("effect_claim_history", [])
+                    ):
+                        raise EffectError("stale_attempt_fence")
                     expected = {
                         "work_identity": record["effect_id"],
                         "attempt_fence": record["attempt_fence"],
@@ -581,6 +594,10 @@ class SQLiteCommittedEffectHost:
         ledger: dict[str, Any], document: dict[str, Any], *, advance_generation: bool = True
     ) -> None:
         """Mirror effect fences and exact committed bytes in the colocated authority ledger."""
+        native_roots = ledger.setdefault("native_effect_roots", [])
+        root = document["checkpoint"]["root_instance_id"]
+        if root not in native_roots:
+            native_roots.append(root)
         records = document["journal"]["effect_records"]
         for record in records:
             entry = next(

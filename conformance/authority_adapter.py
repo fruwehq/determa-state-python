@@ -170,7 +170,7 @@ def _observed_ledger(authority: SQLiteLocalAuthority) -> dict[str, Any] | None:
     return {
         key: value
         for key, value in ledger.items()
-        if key not in {"native_checkpoint_bytes", "effect_claim_history"}
+        if key not in {"native_checkpoint_bytes", "effect_claim_history", "native_effect_roots"}
     }
 
 

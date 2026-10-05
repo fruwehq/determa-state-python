@@ -364,3 +364,61 @@ def test_effect_mutations_refuse_a_torn_authority_journal_pair(tmp_path, changed
         host.claim(root, record["effect_id"], "worker-a", "0", expires_at="10", trusted_now="0")
     assert host.snapshot(root) == before
     assert authority.inspect(scope) == ledger
+
+
+@pytest.mark.parametrize("damage", ["provenance", "native_row", "native_table", "work_identity"])
+def test_authority_claim_refuses_missing_native_participant_evidence(tmp_path, damage):
+    authority, host, scope, root, record = authority_effect_fixture(tmp_path)
+    if damage == "provenance":
+        ledger = authority.inspect(scope)
+        ledger["native_checkpoint_bytes"] = []
+        with authority._connect() as connection:
+            connection.execute("UPDATE determa_scope_authority SET ledger=?", (json.dumps(ledger),))
+            connection.commit()
+    elif damage in {"native_row", "native_table"}:
+        with host._connect() as connection:
+            connection.execute(
+                "DELETE FROM determa_committed_effects"
+                if damage == "native_row"
+                else "DROP TABLE determa_committed_effects"
+            )
+            connection.commit()
+    else:
+        record = {**record, "effect_id": "unrelated-work"}
+        ledger = authority.inspect(scope)
+        ledger["journal_entries"].append({"work_identity": "unrelated-work", "attempt_fence": "0"})
+        with authority._connect() as connection:
+            connection.execute("UPDATE determa_scope_authority SET ledger=?", (json.dumps(ledger),))
+            connection.commit()
+    request, invocation = authority_claim_request(authority, scope, root, record)
+    ledger = authority.inspect(scope)
+    before = None if damage in {"native_row", "native_table"} else host.snapshot(root)
+    assert json.loads(authority.perform(request, invocation))["status"] == "rejected"
+    assert authority.inspect(scope) == ledger
+    if before is not None:
+        assert host.snapshot(root) == before
+
+
+def test_seed_preserves_historical_claim_without_reviving_it(tmp_path):
+    authority, host, scope, root, record = authority_effect_fixture(tmp_path)
+    request, invocation = authority_claim_request(authority, scope, root, record)
+    claim = json.loads(authority.perform(request, invocation))["claim"]
+    # Model a retained completed attempt whose current journal permits a retry.
+    journal = read("data/retryable-journal.json")
+    ledger = authority.inspect(scope)
+    ledger["active_claims"] = []
+    assert claim in ledger["effect_claim_history"]
+    checkpoint = host.snapshot(root)["checkpoint"]
+    with authority._connect() as connection:
+        connection.execute("UPDATE determa_scope_authority SET ledger=?", (json.dumps(ledger),))
+        connection.execute("DELETE FROM determa_committed_effects")
+        connection.commit()
+    host.seed(checkpoint, journal, claim)
+    assert authority.inspect(scope)["active_claims"] == []
+    assert host.snapshot(root)["claims"][record["effect_id"]] == claim
+    new_claim = host.claim(
+        root, record["effect_id"], "worker-b", "0", expires_at="30", trusted_now="20"
+    )
+    assert new_claim["attempt_fence"] == "2"
+    assert authority.inspect(scope)["active_claims"] == [new_claim]
+    assert claim in authority.inspect(scope)["effect_claim_history"]

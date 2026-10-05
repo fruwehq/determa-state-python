@@ -965,6 +965,10 @@ class SQLiteLocalAuthority:
                 }
                 # An installed effect journal is a participant in this claim,
                 # not an eventually updated mirror of the authority receipt.
+                native_owned = arguments["root_instance_id"] in ledger.get(
+                    "native_effect_roots", []
+                )
+                native_update = None
                 if connection.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' "
                     "AND name='determa_committed_effects'"
@@ -993,6 +997,8 @@ class SQLiteLocalAuthority:
                         )
                         if found is None:
                             continue
+                        if native_update is not None:
+                            return _compact(_result(request, ledger, "host_capability_mismatch"))
                         if (
                             native_root != arguments["root_instance_id"]
                             or found["operation_token"] != arguments["operation_token"]
@@ -1022,11 +1028,14 @@ class SQLiteLocalAuthority:
                                 else "host_capability_mismatch"
                             )
                             return _compact(_result(request, ledger, code))
-                        connection.execute(
-                            "UPDATE determa_committed_effects SET document=? "
-                            "WHERE root_instance_id=?",
-                            (canonical_bytes(native), native_root),
-                        )
+                        native_update = (canonical_bytes(native), native_root)
+                if native_owned and native_update is None:
+                    return _compact(_result(request, ledger, "host_capability_mismatch"))
+                if native_update is not None:
+                    connection.execute(
+                        "UPDATE determa_committed_effects SET document=? WHERE root_instance_id=?",
+                        native_update,
+                    )
                 entry["attempt_fence"] = fence
                 ledger["active_claims"] = [
                     item
