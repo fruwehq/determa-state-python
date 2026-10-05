@@ -140,6 +140,8 @@ jobs:
           cache: pip
       - name: Install
         run: pip install -e '.[dev]'
+      - name: Install pinned conformance validator dependencies
+        run: python -m pip install -r .pinned/determa-state-conformance/scripts/validation-requirements.txt
       - name: Conformance suite
         env:
           DETERMA_CONFORMANCE_DIR: ${{ github.workspace }}/.pinned/determa-state-conformance
