@@ -13,11 +13,13 @@ import weakref
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any, Protocol, TypeVar
 
 from ._platform_bindings import PLATFORM_BINDINGS
 from .codes import ExtensionNegotiationFailureCode as Code
 from .errors import DetermaError
+
+_CopyValue = TypeVar("_CopyValue")
 
 _DATA = Path(__file__).parent / "data"
 _INSTANCE_ID = re.compile(r"[a-z][a-z0-9.-]*\Z")
@@ -85,10 +87,16 @@ class _InstanceBinding:
     store_type: type | None
 
 
+def _verified_copy(value: _CopyValue) -> _CopyValue:
+    if not PLATFORM_BINDINGS.matches(copy, "deepcopy"):
+        raise ExtensionError(Code.EXTENSION_IDENTITY_MISMATCH)
+    return copy.deepcopy(value)
+
+
 def _check(name: str, document: Any, code: Code) -> dict[str, Any]:
     if type(document) is not dict or not _schema(name).is_valid(document):
         raise ExtensionError(code)
-    return copy.deepcopy(document)
+    return _verified_copy(document)
 
 
 def _reference_key(descriptor: Mapping[str, Any]) -> tuple[str, str, str]:
@@ -115,7 +123,7 @@ def _validate_configuration(configuration: Any) -> dict[str, Any]:
 
     if not valid(configuration):
         raise ExtensionError(Code.INVALID_EXTENSION_CONFIGURATION)
-    return copy.deepcopy(configuration)
+    return _verified_copy(configuration)
 
 
 class ExtensionRegistry:
@@ -140,7 +148,7 @@ class ExtensionRegistry:
     @property
     def descriptors(self) -> tuple[dict[str, Any], ...]:
         """Discover exact registered descriptors without opening providers."""
-        return tuple(copy.deepcopy(self._entries[key][0]) for key in sorted(self._entries))
+        return tuple(_verified_copy(self._entries[key][0]) for key in sorted(self._entries))
 
     def _verified_source(self, provider: Any, descriptor: Mapping[str, Any]) -> bool:
         if self._source_verifier is None:
@@ -235,7 +243,7 @@ class ExtensionRegistry:
             provider = factory()
             if not self._verified_source(provider, registered):
                 raise ExtensionError(Code.EXTENSION_IDENTITY_MISMATCH)
-            instance = provider.validate_configuration(copy.deepcopy(clean))
+            instance = provider.validate_configuration(_verified_copy(clean))
         except (TypeError, ValueError, KeyError) as exc:
             raise ExtensionError(Code.INVALID_EXTENSION_CONFIGURATION) from exc
         configured = ConfiguredExtension(self._token, registered, clean, provider, instance)
@@ -531,7 +539,7 @@ def _bundled_factory_matches_source(name: str, factory: Any) -> bool:
 
     package = Path(__file__).parent
     module = importlib.import_module(f"determa.state.stores.{name}")
-    if not isinstance(factory, types.FunctionType):
+    if type(module) is not types.ModuleType or not isinstance(factory, types.FunctionType):
         return False
     if factory is not getattr(
         module, f"{name}_execution_store_factory", None
@@ -549,6 +557,8 @@ def _bundled_factory_matches_source(name: str, factory: Any) -> bool:
         import sys
         import sysconfig
 
+        if type(module) is not types.ModuleType:
+            return False
         root_name = module.__name__.split(".", 1)[0]
         if root_name not in sys.stdlib_module_names:
             # External validator implementations are a separate installed
@@ -563,6 +573,8 @@ def _bundled_factory_matches_source(name: str, factory: Any) -> bool:
         ):
             return False
         defining_module = importlib.import_module(defining_name)
+        if type(defining_module) is not types.ModuleType:
+            return False
         source_file = getattr(defining_module, "__file__", None)
         stdlib = Path(sysconfig.get_paths()["stdlib"]).resolve()
         if isinstance(source_file, str) and not Path(source_file).resolve().is_relative_to(stdlib):
@@ -687,6 +699,8 @@ def _bundled_factory_matches_source(name: str, factory: Any) -> bool:
         return same_executable(value, reference_class)
 
     def source_code(origin: types.ModuleType) -> types.CodeType | None:
+        if type(origin) is not types.ModuleType:
+            return None
         path = getattr(origin, "__file__", None)
         if not isinstance(path, str):
             return None
@@ -730,6 +744,8 @@ def _bundled_factory_matches_source(name: str, factory: Any) -> bool:
                     imported = importlib.import_module(
                         "." * node.level + (node.module or ""), origin.__package__
                     )
+                    if type(imported) is not types.ModuleType:
+                        return None
                     for alias in node.names:
                         if alias.name == "*" or vars(origin).get(
                             alias.asname or alias.name

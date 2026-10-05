@@ -548,6 +548,49 @@ def test_bundled_rejects_transitive_stdlib_callback_before_invocation(
     assert called == 0
 
 
+@pytest.mark.parametrize("replacement", ["dispatch_table", "module_dispatch"])
+def test_bundled_rejects_indirect_platform_dispatch_before_invocation(
+    monkeypatch: pytest.MonkeyPatch, replacement: str
+) -> None:
+    import copy
+    import types
+
+    registry = bundled_extension_registry(include_postgresql=False)
+    record = next(
+        item
+        for item in registry.descriptors
+        if item["provider_reference"]["identifier"] == "determa.store.memory"
+    )
+    called = 0
+    original = (
+        copy._deepcopy_dispatch[dict]  # type: ignore[attr-defined]
+        if replacement == "dispatch_table"
+        else memory_module.threading.RLock
+    )
+
+    def substituted(*args: object, **kwargs: object) -> object:
+        nonlocal called
+        called += 1
+        return original(*args, **kwargs)
+
+    class SubstituteModule(types.ModuleType):
+        def __getattribute__(self, name: str) -> object:
+            if name == "RLock":
+                return substituted
+            return super().__getattribute__(name)
+
+    with monkeypatch.context() as patch:
+        if replacement == "dispatch_table":
+            patch.setitem(copy._deepcopy_dispatch, dict, substituted)  # type: ignore[attr-defined]
+        else:
+            patch.setattr(memory_module.threading, "__class__", SubstituteModule)
+        with pytest.raises(ExtensionError, match="extension_identity_mismatch"):
+            registry.negotiate(
+                record, {"instance_id": "primary", "uri": "memory:", "store_configuration": {}}
+            )
+    assert called == 0
+
+
 def test_bundled_rejects_rebound_decorator_before_reference_execution(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

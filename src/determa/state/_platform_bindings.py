@@ -48,6 +48,7 @@ class _PlatformBindings:
         self.functions: dict[Any, tuple[Any, ...]] = {}
         self.classes: dict[type, tuple[Any, ...]] = {}
         self.descriptors: dict[int, tuple[Any, ...]] = {}
+        self.containers: dict[int, tuple[Any, dict[Any, Any]]] = {}
         for _, namespace in self.modules.values():
             for value in namespace.values():
                 self._capture(value)
@@ -66,6 +67,10 @@ class _PlatformBindings:
             )
             for cell in value.__closure__ or ():
                 self._capture(cell.cell_contents)
+            for item in value.__defaults__ or ():
+                self._capture(item)
+            for item in (value.__kwdefaults__ or {}).values():
+                self._capture(item)
         elif isinstance(value, type):
             if value in self.classes:
                 return
@@ -85,16 +90,79 @@ class _PlatformBindings:
             self.descriptors[id(value)] = members
             for member in members:
                 self._capture(member)
+        elif type(value) in (dict, list, tuple):
+            if id(value) in self.containers:
+                return
+            contents = dict(value) if type(value) is dict else dict(enumerate(value))
+            self.containers[id(value)] = (value, contents)
+            for member in contents.values():
+                self._capture(member)
 
     def matches(self, module: types.ModuleType, attribute: str) -> bool:
+        if type(module) is not types.ModuleType:
+            return False
         seen: set[int] = set()
 
         def executable(value: Any) -> bool:
             return callable(value) or isinstance(value, (property, staticmethod, classmethod))
 
+        def contains_executable(value: Any, visited: set[int] | None = None) -> bool:
+            if executable(value):
+                return True
+            if type(value) not in (dict, list, tuple):
+                return False
+            if visited is None:
+                visited = set()
+            if id(value) in visited:
+                return False
+            visited.add(id(value))
+            members = value.values() if type(value) is dict else value
+            return any(contains_executable(member, visited) for member in members)
+
+        def binding_matches(current: Any, original: Any) -> bool:
+            if executable(current) or executable(original):
+                return current is original and walk(current)
+            snapshot = self.containers.get(id(original))
+            if snapshot is not None:
+                if current is not original and (
+                    saved_contains_executable(original) or contains_executable(current)
+                ):
+                    return False
+                if type(current) is not type(original):
+                    return True
+                return walk_container(current, snapshot[1])
+            return not contains_executable(current)
+
+        def saved_contains_executable(value: Any, visited: set[int] | None = None) -> bool:
+            if executable(value):
+                return True
+            snapshot = self.containers.get(id(value))
+            if snapshot is None:
+                return False
+            if visited is None:
+                visited = set()
+            if id(value) in visited:
+                return False
+            visited.add(id(value))
+            return any(
+                saved_contains_executable(member, visited) for member in snapshot[1].values()
+            )
+
+        def walk_container(current: Any, contents: dict[Any, Any]) -> bool:
+            if id(current) in seen:
+                return True
+            seen.add(id(current))
+            actual = current if type(current) is dict else dict(enumerate(current))
+            return all(
+                binding_matches(actual.get(key), contents.get(key))
+                for key in actual.keys() | contents.keys()
+            )
+
         def walk(value: Any) -> bool:
             if id(value) in seen:
                 return True
+            if isinstance(value, types.ModuleType) and type(value) is not types.ModuleType:
+                return False
             seen.add(id(value))
             if type(value) is types.FunctionType:
                 saved = self.functions.get(value)
@@ -112,13 +180,25 @@ class _PlatformBindings:
                     )
                 ):
                     return False
+                if namespace.get("__name__") in {
+                    "_frozen_importlib",
+                    "_frozen_importlib_external",
+                    "importlib._bootstrap",
+                    "importlib._bootstrap_external",
+                }:
+                    # The interpreter's import machinery and its dynamic module
+                    # locks/loaders are part of the trusted runtime boundary.
+                    return True
                 current_closure = tuple(cell.cell_contents for cell in value.__closure__ or ())
                 if len(current_closure) != len(closure):
                     return False
                 for current, original in zip(current_closure, closure, strict=True):
-                    if executable(current) or executable(original):
-                        if current is not original or not walk(current):
-                            return False
+                    if not binding_matches(current, original):
+                        return False
+                if not all(binding_matches(item, item) for item in defaults or ()) or not all(
+                    binding_matches(item, item) for item in kwdefaults.values()
+                ):
+                    return False
                 # Include nested code: comprehensions and returned wrappers share
                 # this global namespace even before a wrapper has been created.
                 pending = [code]
@@ -132,10 +212,12 @@ class _PlatformBindings:
                 for name in names & saved_namespace.keys():
                     original = saved_namespace[name]
                     current = namespace.get(name)
+                    if not binding_matches(current, original):
+                        return False
                     if (
                         executable(original)
                         or executable(current)
-                        or type(original) is types.ModuleType
+                        or isinstance(original, types.ModuleType)
                     ):
                         if current is not original or not walk(current):
                             return False
@@ -164,9 +246,8 @@ class _PlatformBindings:
                 for name in current_namespace.keys() | namespace.keys():
                     original = namespace.get(name)
                     current = current_namespace.get(name)
-                    if executable(original) or executable(current):
-                        if current is not original or not walk(current):
-                            return False
+                    if not binding_matches(current, original):
+                        return False
                 return all(walk(base) for base in bases) and walk(metaclass)
             if type(value) in (property, staticmethod, classmethod):
                 members = self.descriptors.get(id(value))

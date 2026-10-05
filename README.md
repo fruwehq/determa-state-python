@@ -277,8 +277,10 @@ package installation, and trusted package initialization. It captures runtime
 executable bindings during initialization and checks them before using decorators
 or rebuilding reference classes. Hosts must exclude concurrent executable
 rebinding between verification and invocation. These checks are not isolation
-from arbitrary code controlling the interpreter; native runtime implementation
-and the verifier itself remain part of the host's trust boundary.
+from arbitrary code controlling the interpreter; native runtime implementation,
+the interpreter's import machinery, and the verifier itself remain part of the
+host's trust boundary. Ordinary mutable data may change; executable entries in
+reachable callback tables, defaults, and closures retain their captured bindings.
 
 `RuntimeProviderRegistry` installs exact native guard and action providers through
 that same common registration boundary. `SourceClosure` binds the loaded Python
