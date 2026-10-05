@@ -14,8 +14,6 @@ import threading
 from pathlib import Path
 from typing import Any
 
-from determa.state.effects import SQLiteCommittedEffectHost
-
 from determa.state.authority import (
     AuthoritySQLiteExecutionStore,
     SQLiteLocalAuthority,
@@ -24,6 +22,7 @@ from determa.state.authority import (
     _parse,
     configure_bundled_sqlite_authority,
 )
+from determa.state.effects import SQLiteCommittedEffectHost
 from determa.state.extensions import bundled_extension_registry
 from determa.state.wire import MemoryArtifactResolver, hash_value
 

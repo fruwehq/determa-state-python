@@ -12,14 +12,26 @@ import json
 import re
 import sqlite3
 from collections.abc import Callable, Mapping
-from functools import cache
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
 from .checkpoint import seal_execution_checkpoint
-from .checkpoint_v1 import admit_checkpoint_v1, restore_execution_checkpoint_v1, step_checkpoint_v1
+from .checkpoint_v1 import (
+    _preflight_checkpoint_admission,
+    admit_checkpoint_v1,
+    restore_execution_checkpoint_v1,
+    step_checkpoint_v1,
+)
 from .host import outbox_intent_digest
-from .wire import ArtifactResolver, _schema_registry, canonical_bytes, hash_value
+from .wire import (
+    ArtifactError,
+    ArtifactResolver,
+    _schema_registry,
+    canonical_bytes,
+    decoded_typed_value,
+    hash_value,
+    typed_value,
+)
 
 _NANOSECONDS = re.compile(r"(?:0|-?[1-9][0-9]*)\Z")
 _OUTCOMES = frozenset({"succeeded", "domain_rejected", "terminal_failure", "cancelled"})
@@ -50,7 +62,6 @@ def seal_journal(journal: Mapping[str, Any]) -> dict[str, Any]:
     return result
 
 
-@cache
 def _journal_validator() -> Any:
     from jsonschema import Draft202012Validator
     from referencing import Resource
@@ -143,11 +154,74 @@ def validate_journal(checkpoint: Mapping[str, Any], journal: Mapping[str, Any]) 
             record[key] is None for key in ("outcome", "result_event_id")
         ):
             raise EffectError("invalid_effect_journal")
-        if (
-            state in {"result_admitted", "closed"}
-            and record["admission_receipt"]["event_id"] != record["result_event_id"]
+        if state == "outcome_recorded" and record["admission_receipt"] is not None:
+            raise EffectError("invalid_effect_journal")
+        if state in {"result_admitted", "closed"} and (
+            record["admission_receipt"] is None
+            or record["admission_receipt"]["event_id"] != record["result_event_id"]
         ):
             raise EffectError("invalid_effect_journal")
+        outcome = record["outcome"]
+        if outcome is not None:
+            if outcome["digest"] != hash_value(
+                [
+                    "determa-effect-outcome-1",
+                    record["effect_id"],
+                    record["operation_token"],
+                    outcome["kind"],
+                    outcome["payload"],
+                    outcome["attempt_fence"],
+                ]
+            ):
+                raise EffectError("invalid_effect_journal")
+            mapping = next(
+                (
+                    item
+                    for item in record["result_mapping"]
+                    if item["outcome_kind"] == outcome["kind"]
+                ),
+                None,
+            )
+            if mapping is None or record["result_event_id"] != hash_value(
+                [
+                    "determa-effect-result-event-1",
+                    record["effect_id"],
+                    mapping["result_slot"],
+                ]
+            ):
+                raise EffectError("invalid_effect_journal")
+            preclaim_cancel = (
+                outcome["kind"] == "cancelled"
+                and outcome["attempt_fence"] == "0"
+                and record["attempt_fence"] == "0"
+                and record["cancellation"] is not None
+                and record["cancellation"]["state"] == "prevented_start"
+            )
+            if preclaim_cancel:
+                if reports:
+                    raise EffectError("invalid_effect_journal")
+            else:
+                report = next(
+                    (item for item in reports if item["attempt_fence"] == outcome["attempt_fence"]),
+                    None,
+                )
+                if (
+                    report is None
+                    or report["report_kind"] != outcome["kind"]
+                    or report["report_digest"]
+                    != hash_value(
+                        [
+                            "determa-effect-attempt-report-1",
+                            record["effect_id"],
+                            record["operation_token"],
+                            outcome["attempt_fence"],
+                            outcome["kind"],
+                            outcome["payload"],
+                            report["reason"],
+                        ]
+                    )
+                ):
+                    raise EffectError("invalid_effect_journal")
 
 
 def _result_response(
@@ -338,6 +412,7 @@ class SQLiteCommittedEffectHost:
             "claims": {},
             "responses": {},
             "result_requests": {},
+            "result_responses": {},
             "cancel_requests": {},
         }
         if claim is not None:
@@ -451,6 +526,7 @@ class SQLiteCommittedEffectHost:
                         raise EffectError("unauthorized_scope")
                     replay = journal_record["invocation_state"] in {
                         "result_admitted",
+                        "outcome_recorded",
                         "closed",
                         "unclaimed",
                         "ambiguous",
@@ -808,15 +884,35 @@ class SQLiteCommittedEffectHost:
     ) -> dict[str, Any]:
         effect_id, fence = request["effect_id"], request["attempt_fence"]
         try:
-            return self._transact(
+            response = self._transact(
                 root,
                 lambda document: self._submit(
-                    document, request, principal, scope, epoch, trusted_now, admit
+                    document, request, principal, scope, epoch, trusted_now, False
                 ),
                 expected_epoch=epoch,
                 authority_mutation=self._mirror_authority,
                 worker_guard=(effect_id, principal, fence, trusted_now),
             )
+            if admit and request["outcome_kind"] in _OUTCOMES:
+                # The authenticated outcome is already durable. Admission is a
+                # separate host-owned transaction; its failure cannot erase it.
+                def admission(document: dict[str, Any]) -> dict[str, Any]:
+                    record = _record(document["journal"], effect_id)
+                    saved = document.setdefault("result_responses", {}).get(effect_id + ":" + fence)
+                    if saved is not None:
+                        return copy.deepcopy(saved)
+                    if record["invocation_state"] == "outcome_recorded":
+                        self._admit(document, record)
+                    response = _result_response(
+                        record, document["journal"], document["checkpoint"], "committed"
+                    )
+                    document["result_responses"][effect_id + ":" + fence] = copy.deepcopy(response)
+                    return response
+
+                return self._transact(
+                    root, admission, expected_epoch=epoch, authority_mutation=self._mirror_authority
+                )
+            return response
         except EffectError as exc:
             return _rejected_result(effect_id, fence, exc.code)
 
@@ -849,8 +945,7 @@ class SQLiteCommittedEffectHost:
             scope,
             epoch,
             trusted_now,
-            allow_replay=retained is not None
-            and (kind not in _OUTCOMES or preexisting["admission_receipt"] is not None),
+            allow_replay=retained is not None,
         )
         key = effect_id + ":" + fence
         prior = document["result_requests"].get(key)
@@ -859,6 +954,9 @@ class SQLiteCommittedEffectHost:
         ):
             if prior is not None and prior != dict(request) or retained is None:
                 raise EffectError("effect_result_conflict")
+            saved = document.setdefault("result_responses", {}).get(key)
+            if saved is not None:
+                return copy.deepcopy(saved)
             if record["invocation_state"] in {"result_admitted", "closed"}:
                 return _result_response(record, journal, checkpoint, "committed")
             if record["invocation_state"] == "outcome_recorded" and admit:
@@ -877,6 +975,8 @@ class SQLiteCommittedEffectHost:
         if record["invocation_state"] != "leased":
             raise EffectError("effect_not_outstanding")
         payload = copy.deepcopy(request["payload"])
+        if kind in _OUTCOMES:
+            self._result_delivery(checkpoint, record, kind, payload)
         reason = _report_reason(request)
         report = {
             "attempt_fence": fence,
@@ -899,7 +999,9 @@ class SQLiteCommittedEffectHost:
         if kind not in _OUTCOMES:
             record["invocation_state"] = "unclaimed" if kind == "retryable_failure" else "ambiguous"
             _bump(journal)
-            return _result_response(record, journal, checkpoint, "report_recorded", report)
+            response = _result_response(record, journal, checkpoint, "report_recorded", report)
+            document.setdefault("result_responses", {})[key] = copy.deepcopy(response)
+            return response
         mapping = _mapping(record, kind)
         record["outcome"] = {
             "kind": kind,
@@ -925,30 +1027,61 @@ class SQLiteCommittedEffectHost:
             self._admit(document, record)
         return _result_response(record, journal, document["checkpoint"], "committed")
 
-    def _admit(self, document: dict[str, Any], record: dict[str, Any]) -> None:
-        checkpoint = document["checkpoint"]
-        mapping = _mapping(record, record["outcome"]["kind"])
+    def _result_delivery(
+        self, checkpoint: dict[str, Any], record: dict[str, Any], kind: str, payload: Any
+    ) -> dict[str, Any]:
+        mapping = _mapping(record, kind)
+        aggregate = checkpoint["root_record"].get("aggregate_state")
         runtime = next(
             (
                 item
-                for item in checkpoint["root_record"]["aggregate_state"]["runtimes"]
+                for item in (aggregate["runtimes"] if aggregate else [])
                 if item["runtime_id"] == record["target"]["runtime_id"]
             ),
             None,
         )
-        if runtime is None or runtime["identity_origin"] != record["target"]["runtime_incarnation"]:
+        if (
+            runtime is None
+            or runtime["identity_origin"] != record["target"]["runtime_incarnation"]
+            or record["target"]["root_instance_id"] != checkpoint["root_instance_id"]
+        ):
             raise EffectError("effect_not_outstanding")
+        event_id = hash_value(
+            ["determa-effect-result-event-1", record["effect_id"], mapping["result_slot"]]
+        )
         envelope = {
             "event": mapping["event"],
-            "event_id": record["result_event_id"],
-            "cause_id": record["result_event_id"],
+            "event_id": event_id,
+            "cause_id": event_id,
             "source": {"host": True},
-            "target": runtime["target_identity"],
-            "payload": record["outcome"]["payload"],
+            "target": copy.deepcopy(runtime["target_identity"]),
+            "payload": copy.deepcopy(payload),
         }
         location = mapping["operation_token_location"]
-        if location is not None and location["kind"] == "correlation_id":
-            envelope["correlation_id"] = record["operation_token"]
+        if location is not None:
+            if location["kind"] == "correlation_id":
+                envelope["correlation_id"] = record["operation_token"]
+            else:
+                try:
+                    logical = decoded_typed_value(payload)
+                    pointer = location["pointer"]
+                    if not pointer.startswith("/") or re.search(r"~(?![01])", pointer):
+                        raise ValueError("invalid token pointer")
+                    parts = [
+                        part.replace("~1", "/").replace("~0", "~")
+                        for part in pointer[1:].split("/")
+                    ]
+                    parent = logical
+                    for part in parts[:-1]:
+                        parent = parent[part]
+                    if not isinstance(parent, dict) or (
+                        parts[-1] in parent and not isinstance(parent[parts[-1]], str)
+                    ):
+                        raise ValueError("token field must be a string")
+                    parent[parts[-1]] = record["operation_token"]
+                    envelope["payload"] = typed_value(logical)
+                except (KeyError, TypeError, ValueError) as exc:
+                    raise EffectError("invalid_host_request") from exc
         from .queueing import _entry_digest
 
         delivery = {
@@ -956,8 +1089,25 @@ class SQLiteCommittedEffectHost:
             "envelope": envelope,
             "envelope_digest": _entry_digest(checkpoint["root_instance_id"], "input", envelope),
         }
+        try:
+            _preflight_checkpoint_admission(
+                checkpoint,
+                [delivery],
+                self.resolver,
+                expected_revision=checkpoint["revision"],
+                expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+            )
+        except ArtifactError as exc:
+            raise EffectError("invalid_host_request") from exc
+        return delivery
+
+    def _admit(self, document: dict[str, Any], record: dict[str, Any]) -> None:
+        checkpoint = document["checkpoint"]
+        delivery = self._result_delivery(
+            checkpoint, record, record["outcome"]["kind"], record["outcome"]["payload"]
+        )
         if self.core_observer is not None:
-            self.core_observer("admit", record["result_event_id"], runtime["target_identity"])
+            self.core_observer("admit", record["result_event_id"], delivery["envelope"]["target"])
         candidate = admit_checkpoint_v1(
             checkpoint,
             [delivery],
@@ -969,6 +1119,10 @@ class SQLiteCommittedEffectHost:
         record["admission_receipt"] = copy.deepcopy(candidate["operation_receipts"][-1])
         record["invocation_state"] = "result_admitted"
         _bump(document["journal"], candidate)
+        key = record["effect_id"] + ":" + record["outcome"]["attempt_fence"]
+        document.setdefault("result_responses", {})[key] = _result_response(
+            record, document["journal"], candidate, "committed"
+        )
 
     def recover(self, root: str) -> dict[str, Any]:
         def change(document: dict[str, Any]) -> dict[str, Any]:
@@ -1060,6 +1214,9 @@ class SQLiteCommittedEffectHost:
                 return replay
             if record["invocation_state"] == "unclaimed" and record["attempt_fence"] == "0":
                 mapping = _mapping(record, "cancelled")
+                self._result_delivery(
+                    document["checkpoint"], record, "cancelled", request["payload"]
+                )
                 state = "prevented_start"
                 outcome = {
                     "kind": "cancelled",
