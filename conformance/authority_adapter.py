@@ -175,7 +175,7 @@ def _seed(ledger: dict[str, Any]) -> SQLiteLocalAuthority:
     authority.setup_schema()
     AuthoritySQLiteExecutionStore(authority, "scope-42", "owner-1", "2").setup_schema()
     if _WORKER_MODE:
-        SQLiteCommittedEffectHost(_PATH, MemoryArtifactResolver(), {}, lambda *_: {}).setup_schema()
+        SQLiteCommittedEffectHost(_PATH, MemoryArtifactResolver(), {}, None).setup_schema()
     if not authority._insert_ledger(_baseline_ledger()):
         raise RuntimeError("fixture scope already allocated")
     _INITIAL_BINDING, authority = _binding_live()

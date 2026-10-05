@@ -150,7 +150,7 @@ def _reset_authority() -> tuple[SQLiteLocalAuthority, dict[str, Any], dict[str, 
     authority = SQLiteLocalAuthority(_PATH, worker_fencing=True, worker_lease_nanoseconds=1)
     authority.setup_schema()
     AuthoritySQLiteExecutionStore(authority, _AUTHORITY_SCOPE, "owner-1", "3").setup_schema()
-    SQLiteCommittedEffectHost(_PATH, MemoryArtifactResolver(), {}, lambda *_: {}).setup_schema()
+    SQLiteCommittedEffectHost(_PATH, MemoryArtifactResolver(), {}, None).setup_schema()
     if not authority._insert_ledger(_authority_ledger()):
         raise RuntimeError("effect scope allocation failed")
     registry = bundled_extension_registry(include_postgresql=False)

@@ -7,8 +7,8 @@ This implementation supports Determa State `format: 1` at specification
 commit `86bb88dd21cb1f799eefe5020b6e49dabf6e7225`. Correctness is determined by
 99 format-1 core cases, 162 version-1 vectors, 142 durable-host vectors, 49 core
 inspection vectors, 47 extension negotiation vectors, 7 native guard-provider
-inspection vectors, 30 runtime-provider vectors, and 476 manifest artifacts at
-conformance commit `ce6c94ee1929597689403080d1790e2f48f8a5fb`. The native
+inspection vectors, 30 runtime-provider vectors, and 484 manifest artifacts at
+conformance commit `7f09321fb483a22eb677a4342f8d9537a7a18e82`. The native
 runtime-provider profile is optional and is exercised through its production adapter.
 
 The package metadata is `0.3.0`. Artifact and checkpoint schema version 1 is the
@@ -391,10 +391,39 @@ health and the same store instance used by the host. Recheck it before relying o
 the guarded profile. A frozen scope retains fencing and inventory claims while
 checkpoint writes remain refused.
 
-The reference boundary does not issue worker claims or retirement grants and
-reports `worker_fencing: false` and `safe_relocation: false`. A copied database,
+The default checkpoint-only configuration reports `worker_fencing: false`.
+An explicitly configured colocated worker journal can issue local claims with
+`worker_fencing=True`; it binds the root, effect identity and operation token
+before issuance, and commits journal state, claim, generation and receipt together.
+The reference topology does not issue retirement grants and reports
+`safe_relocation: false`. A copied database,
 new endpoint, or timeout cannot activate another owner. The pure in-memory API
 needs no scope authority.
+
+## Optional committed native effects
+
+`determa.state.effects.SQLiteCommittedEffectHost` implements the optional local
+SQLite effect journal. Install a `VerifiedNativeHandler` through the ordinary
+`ExtensionRegistry` with a trusted source verifier, exact provider reference,
+configured instance and destination binding. Plain callbacks cannot be installed
+as handlers. A host without a handler may restore or reconcile committed data;
+producing or dispatching external work requires the verified installed handle.
+SDK objects can remain private inside the handler; boundary payloads use declared
+portable typed values.
+
+The host commits a pinned effect intent before dispatch. Worker calls use an
+independently authenticated principal, current scope/epoch/attempt claim and an
+explicit `trusted_clock` callback. Clock failures or expiry fail closed, including
+expiry during outcome recording before its native commit. An expired external
+attempt remains unresolved and requires destination idempotency or reconciliation;
+lease expiry does not prove the call was undone.
+
+Authenticated outcome recording commits before result-event admission. A crash
+between those transactions retains the outcome, and `recover` admits it without
+calling the provider again. Each recoverable effect commits separately. Duplicate
+results retain exact first responses; conflicting or stale work is refused.
+Delivery acknowledgement and business outcome remain separate. The optional host
+does not create a background worker or claim arbitrary external exactly-once work.
 
 ## Develop
 

@@ -530,12 +530,14 @@ class SQLiteCommittedEffectHost:
         path: str | Path,
         resolver: ArtifactResolver,
         route: Mapping[str, Any],
-        handler: VerifiedNativeHandler | Callable[..., Mapping[str, Any]],
+        handler: VerifiedNativeHandler | None,
         *,
         authority_scope: str | None = None,
         core_observer: Callable[[str, str, Mapping[str, Any]], None] | None = None,
         trusted_clock: Callable[[], str] | None = None,
     ) -> None:
+        if handler is not None and type(handler) is not VerifiedNativeHandler:
+            raise EffectError("host_capability_mismatch")
         self.path = str(Path(path).resolve())
         self.resolver = resolver
         self.route = copy.deepcopy(dict(route))

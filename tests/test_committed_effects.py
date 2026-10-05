@@ -96,7 +96,7 @@ def host_fixture(tmp_path, observer=None):
         tmp_path / "effects.sqlite",
         resolver,
         {},
-        lambda *_: {},
+        None,
         core_observer=observer,
         trusted_clock=lambda: "0",
     )
@@ -174,7 +174,7 @@ def test_payload_pointer_inserts_pinned_token_before_declared_input_admission(tm
     bundle = load_bundle((CASE / "machine.yaml").read_text())
     resolver = MemoryArtifactResolver(definitions={bundle.fingerprint: bundle})
     host = SQLiteCommittedEffectHost(
-        tmp_path / "pointer.sqlite", resolver, {}, lambda *_: {}, trusted_clock=lambda: "0"
+        tmp_path / "pointer.sqlite", resolver, {}, None, trusted_clock=lambda: "0"
     )
     host.setup_schema()
     checkpoint = read("pending-checkpoint.json")
@@ -271,7 +271,7 @@ def test_authority_seed_cannot_bypass_scope_or_claim_guard(tmp_path, boundary):
     claim["scope_authority_epoch"] = "0"
     epoch = "9" if boundary == "wrong_epoch" else "0"
     host = SQLiteCommittedEffectHost(
-        authority.path, resolver, {"authority_epoch": epoch}, lambda *_: {}, authority_scope=scope
+        authority.path, resolver, {"authority_epoch": epoch}, None, authority_scope=scope
     )
     host.setup_schema()
     if boundary == "frozen":
@@ -339,7 +339,7 @@ def test_seed_cannot_rewind_an_issued_fence_or_remove_its_claim(tmp_path, journa
         )
         connection.commit()
     host = SQLiteCommittedEffectHost(
-        authority.path, resolver, {"authority_epoch": "0"}, lambda *_: {}, authority_scope=scope
+        authority.path, resolver, {"authority_epoch": "0"}, None, authority_scope=scope
     )
     host.setup_schema()
     with pytest.raises(EffectError, match="stale_attempt_fence"):
@@ -364,7 +364,7 @@ def authority_effect_fixture(tmp_path):
     authority.setup_schema()
     assert authority.allocate(scope, "owner", roots=(root,))
     host = SQLiteCommittedEffectHost(
-        authority.path, resolver, {"authority_epoch": "0"}, lambda *_: {}, authority_scope=scope
+        authority.path, resolver, {"authority_epoch": "0"}, None, authority_scope=scope
     )
     host.setup_schema()
     host.seed(checkpoint, journal)
@@ -726,7 +726,7 @@ def test_multi_effect_recovery_commits_one_journal_revision_per_effect(tmp_path)
     journal["checkpoint_revision"] = checkpoint["revision"]
     journal["checkpoint_digest"] = checkpoint["execution_checkpoint_digest"]
     journal = seal_journal(journal)
-    host = SQLiteCommittedEffectHost(tmp_path / "two.sqlite", original.resolver, {}, lambda *_: {})
+    host = SQLiteCommittedEffectHost(tmp_path / "two.sqlite", original.resolver, {}, None)
     host.setup_schema()
     host.seed(checkpoint, journal)
     for record in journal["effect_records"]:
@@ -856,3 +856,14 @@ def test_verified_native_handle_cannot_shadow_its_trusted_methods(tmp_path, meth
         "accepted": True
     }
     assert len(calls) == 1
+
+
+def test_plain_callback_handler_is_refused_before_opening_storage(tmp_path):
+    path = tmp_path / "unverified.sqlite"
+    calls = []
+    with pytest.raises(EffectError, match="host_capability_mismatch"):
+        SQLiteCommittedEffectHost(
+            path, MemoryArtifactResolver(), {}, lambda *args: calls.append(args) or {}
+        )
+    assert calls == []
+    assert not path.exists()
