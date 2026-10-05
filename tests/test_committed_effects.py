@@ -93,7 +93,12 @@ def host_fixture(tmp_path, observer=None):
     bundle = load_bundle((CASE / "machine.yaml").read_text())
     resolver = MemoryArtifactResolver(definitions={bundle.fingerprint: bundle})
     host = SQLiteCommittedEffectHost(
-        tmp_path / "effects.sqlite", resolver, {}, lambda *_: {}, core_observer=observer
+        tmp_path / "effects.sqlite",
+        resolver,
+        {},
+        lambda *_: {},
+        core_observer=observer,
+        trusted_clock=lambda: "0",
     )
     host.setup_schema()
     checkpoint = read("pending-checkpoint.json")
@@ -168,7 +173,9 @@ def test_invalid_result_payload_is_rejected_before_journal_or_core_mutation(tmp_
 def test_payload_pointer_inserts_pinned_token_before_declared_input_admission(tmp_path):
     bundle = load_bundle((CASE / "machine.yaml").read_text())
     resolver = MemoryArtifactResolver(definitions={bundle.fingerprint: bundle})
-    host = SQLiteCommittedEffectHost(tmp_path / "pointer.sqlite", resolver, {}, lambda *_: {})
+    host = SQLiteCommittedEffectHost(
+        tmp_path / "pointer.sqlite", resolver, {}, lambda *_: {}, trusted_clock=lambda: "0"
+    )
     host.setup_schema()
     checkpoint = read("pending-checkpoint.json")
     journal = read("data/leased-journal.json")
@@ -206,6 +213,45 @@ def test_expired_worker_cannot_admit_recorded_outcome_but_host_recovery_can(tmp_
     assert (
         host.recover(root)["journal"]["effect_records"][0]["invocation_state"] == "result_admitted"
     )
+
+
+def test_worker_result_crossing_expiry_rolls_back_outcome_before_commit(tmp_path, monkeypatch):
+    host, root, request, context = host_fixture(tmp_path)
+    current_time = ["0"]
+    host.trusted_clock = lambda: current_time[0]
+    before = host.snapshot(root)
+    submit = host._submit
+    observed = []
+
+    def expires_during_submission(*args):
+        response = submit(*args)
+        observed.append(args[0]["journal"]["effect_records"][0]["invocation_state"])
+        current_time[0] = read("data/active-claim.json")["expires_at"]
+        return response
+
+    monkeypatch.setattr(host, "_submit", expires_during_submission)
+    assert host.submit_result(root, request, **context)["error_code"] == "stale_attempt_fence"
+    assert observed == ["outcome_recorded"]
+    assert host.snapshot(root) == before
+
+
+@pytest.mark.parametrize("clock_state", ["missing", "unavailable", "invalid", "expired"])
+def test_worker_result_requires_current_host_clock_not_request_time(tmp_path, clock_state):
+    host, root, request, context = host_fixture(tmp_path)
+    before = host.snapshot(root)
+
+    def unavailable():
+        raise RuntimeError("clock unavailable")
+
+    host.trusted_clock = {
+        "missing": None,
+        "unavailable": unavailable,
+        "invalid": lambda: "-0",
+        "expired": lambda: read("data/active-claim.json")["expires_at"],
+    }[clock_state]
+    assert context["trusted_now"] == "0"
+    assert host.submit_result(root, request, **context)["error_code"] == "stale_attempt_fence"
+    assert host.snapshot(root) == before
 
 
 @pytest.mark.parametrize("boundary", ["frozen", "wrong_epoch", "wrong_scope", "unissued_claim"])
@@ -611,10 +657,16 @@ def test_dispatch_crossing_lease_expiry_preserves_unresolved_work_for_recovery(t
         {key: record[key] for key in ("handler_reference", "destination_binding_digest")}
     )
     expiry = read("data/active-claim.json")["expires_at"]
-    readings = iter(["0", expiry])
-    host.trusted_clock = lambda: next(readings)
+    current_time = ["0"]
+    host.trusted_clock = lambda: current_time[0]
     calls = []
-    host = installed_test_handler(host, lambda *args: calls.append(args) or {"accepted": True})
+
+    def external_acceptance(*args):
+        calls.append(args)
+        current_time[0] = expiry
+        return {"accepted": True}
+
+    host = installed_test_handler(host, external_acceptance)
     before = host.snapshot(root)
     with pytest.raises(EffectError, match="stale_attempt_fence"):
         host.dispatch(root, request["effect_id"], credential="test-credential", **context)

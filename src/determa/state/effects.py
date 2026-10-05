@@ -769,6 +769,17 @@ class SQLiteCommittedEffectHost:
             document: dict[str, Any] = json.loads(row[0])
             validate_journal(document["checkpoint"], document["journal"])
             restore_execution_checkpoint_v1(document["checkpoint"], self.resolver)
+            expiry_guard: tuple[Callable[[], str], int] | None = None
+            if worker_guard is not None:
+                effect_id, _principal, _fence, _trusted_now = worker_guard
+                record = _record(document["journal"], effect_id)
+                if record["invocation_state"] in {"leased", "outcome_recorded"}:
+                    claim = document["claims"].get(effect_id)
+                    clock = self.trusted_clock
+                    if clock is None or claim is None:
+                        raise EffectError("stale_attempt_fence")
+                    expiry_guard = (clock, _now(claim["expires_at"]))
+                    self._check_live_clock(*expiry_guard)
             ledger = None
             if self.authority_scope is not None:
                 authority = connection.execute(
@@ -849,8 +860,21 @@ class SQLiteCommittedEffectHost:
                     "UPDATE determa_committed_effects SET document = ? WHERE root_instance_id = ?",
                     (canonical_bytes(document), root),
                 )
+            if expiry_guard is not None:
+                # Keep the original deadline even when this transaction closes
+                # or revokes the claim. Worker rights must still hold at commit.
+                self._check_live_clock(*expiry_guard)
             connection.commit()
             return value
+
+    @staticmethod
+    def _check_live_clock(clock: Callable[[], str], deadline: int) -> None:
+        try:
+            now = _now(clock())
+        except Exception as exc:
+            raise EffectError("stale_attempt_fence") from exc
+        if now >= deadline:
+            raise EffectError("stale_attempt_fence")
 
     def produce(
         self,
