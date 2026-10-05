@@ -205,6 +205,96 @@ def test_other_trusted_root_incarnation_refuses_before_native_seed(tmp_path):
         )
 
 
+@pytest.mark.parametrize("state", ["unclaimed", "leased", "ambiguous"])
+def test_prevented_start_without_cancelled_outcome_cannot_be_native_work(tmp_path, state):
+    checkpoint = read("pending-checkpoint.json")
+    journal = read("data/unclaimed-journal.json")
+    record = journal["effect_records"][0]
+    record["invocation_state"] = state
+    record["attempt_fence"] = "0" if state == "unclaimed" else "1"
+    record["cancellation"] = {
+        "operation_id": "cancel-before-claim",
+        "reason": "user_requested",
+        "state": "prevented_start",
+    }
+    _assert_invalid_native_seed(tmp_path, checkpoint, seal_journal(journal))
+
+
+@pytest.mark.parametrize("state", ["unclaimed", "leased", "ambiguous"])
+def test_stripping_terminal_outcome_never_makes_native_work_claimable(tmp_path, state):
+    checkpoint = read("pending-checkpoint.json")
+    journal = read("data/outcome-recorded-journal.json")
+    journal["effect_records"][0].update(
+        invocation_state=state, outcome=None, result_event_id=None, admission_receipt=None
+    )
+    _assert_invalid_native_seed(tmp_path, checkpoint, seal_journal(journal))
+
+
+def _assert_invalid_native_seed(tmp_path, checkpoint, journal):
+    with pytest.raises(EffectError, match="invalid_effect_journal"):
+        validate_journal(checkpoint, journal)
+    bundle = load_bundle((CASE / "machine.yaml").read_text())
+    resolver = MemoryArtifactResolver(definitions={bundle.fingerprint: bundle})
+    fresh = SQLiteCommittedEffectHost(tmp_path / "bad-seed.sqlite", resolver, {}, None)
+    fresh.setup_schema()
+    with pytest.raises(EffectError, match="invalid_effect_journal"):
+        fresh.seed(checkpoint, journal)
+    with fresh._connect() as connection:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM determa_committed_effects").fetchone()[0] == 0
+        )
+
+
+@pytest.mark.parametrize(
+    ("state", "report_kind", "report_fence"),
+    [
+        ("unclaimed", "retryable_failure", "0"),
+        ("unclaimed", "ambiguous", "1"),
+        ("ambiguous", "retryable_failure", "1"),
+        ("leased", "retryable_failure", "1"),
+    ],
+)
+def test_completed_attempt_report_cannot_disagree_with_native_invocation_state(
+    state, report_kind, report_fence
+):
+    from determa.state.wire import hash_value
+
+    checkpoint = read("pending-checkpoint.json")
+    journal = read("data/leased-journal.json")
+    record = journal["effect_records"][0]
+    reason = (
+        "no_call_proven" if report_kind == "retryable_failure" else "provider_acceptance_unknown"
+    )
+    record["invocation_state"] = state
+    record["attempt_records"] = [
+        {
+            "attempt_fence": report_fence,
+            "report_kind": report_kind,
+            "report_digest": hash_value(
+                [
+                    "determa-effect-attempt-report-1",
+                    record["effect_id"],
+                    record["operation_token"],
+                    report_fence,
+                    report_kind,
+                    ["map", []],
+                    reason,
+                ]
+            ),
+            "reason": reason,
+        }
+    ]
+    with pytest.raises(EffectError, match="invalid_effect_journal"):
+        validate_journal(checkpoint, seal_journal(journal))
+
+
+def test_terminal_outcome_cannot_supersede_a_newer_attempt_fence():
+    journal = read("data/outcome-recorded-journal.json")
+    journal["effect_records"][0]["attempt_fence"] = "2"
+    with pytest.raises(EffectError, match="invalid_effect_journal"):
+        validate_journal(read("pending-checkpoint.json"), seal_journal(journal))
+
+
 @pytest.mark.parametrize("field", ["digest", "attempt_fence"])
 def test_terminal_outcome_rejects_forged_evidence(field):
     journal = copy.deepcopy(read("data/outcome-recorded-journal.json"))

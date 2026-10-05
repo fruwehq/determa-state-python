@@ -332,9 +332,44 @@ def validate_journal(
             raise EffectError("invalid_effect_journal")
         reports = record["attempt_records"]
         fences = [int(item["attempt_fence"]) for item in reports]
-        if fences != sorted(set(fences)) or any(f > int(record["attempt_fence"]) for f in fences):
+        if fences != sorted(set(fences)) or any(
+            f == 0 or f > int(record["attempt_fence"]) for f in fences
+        ):
             raise EffectError("invalid_effect_journal")
         state = record["invocation_state"]
+        outcome = record["outcome"]
+        current_report = next(
+            (item for item in reports if item["attempt_fence"] == record["attempt_fence"]),
+            None,
+        )
+        if state in {"leased", "ambiguous"} and record["attempt_fence"] == "0":
+            raise EffectError("invalid_effect_journal")
+        if state in {"unclaimed", "leased", "ambiguous"} and any(
+            item["report_kind"] in _OUTCOMES for item in reports
+        ):
+            # A committed terminal report cannot become retryable work merely
+            # because its outcome/result fields were stripped.
+            raise EffectError("invalid_effect_journal")
+        if current_report is not None and (
+            state == "leased"
+            or (state == "unclaimed" and current_report["report_kind"] != "retryable_failure")
+            or (state == "ambiguous" and current_report["report_kind"] != "ambiguous")
+        ):
+            raise EffectError("invalid_effect_journal")
+        cancellation = record["cancellation"]
+        if (
+            cancellation is not None
+            and cancellation["state"] == "prevented_start"
+            and (
+                state not in {"outcome_recorded", "result_admitted", "closed"}
+                or record["attempt_fence"] != "0"
+                or reports
+                or outcome is None
+                or outcome["kind"] != "cancelled"
+                or outcome["attempt_fence"] != "0"
+            )
+        ):
+            raise EffectError("invalid_effect_journal")
         if state in {"unclaimed", "leased", "ambiguous"} and any(
             record[key] is not None for key in ("outcome", "result_event_id", "admission_receipt")
         ):
@@ -351,8 +386,9 @@ def validate_journal(
             or record["admission_receipt"] not in checkpoint["operation_receipts"]
         ):
             raise EffectError("invalid_effect_journal")
-        outcome = record["outcome"]
         if outcome is not None:
+            if outcome["attempt_fence"] != record["attempt_fence"]:
+                raise EffectError("invalid_effect_journal")
             if outcome["digest"] != hash_value(
                 [
                     "determa-effect-outcome-1",
