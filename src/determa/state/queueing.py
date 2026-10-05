@@ -946,9 +946,6 @@ def step_aggregate_v1(
         moved["deferral_count"] = str(int(moved["deferral_count"]) + 1)
         deferred.append(moved)
         candidate = copy.deepcopy(before)
-        candidate["next_logical_step_sequence"] = str(
-            int(candidate["next_logical_step_sequence"]) + 1
-        )
         candidate["next_queue_sequence"] = str(int(candidate["next_queue_sequence"]) + 1)
         for runtime in candidate["runtimes"]:
             if runtime["runtime_id"] == target_runtime_id:

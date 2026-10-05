@@ -8,7 +8,7 @@ commit `86bb88dd21cb1f799eefe5020b6e49dabf6e7225`. Correctness is determined by
 99 format-1 core cases, 162 version-1 vectors, 142 durable-host vectors, 49 core
 inspection vectors, 47 extension negotiation vectors, 7 native guard-provider
 inspection vectors, 30 runtime-provider vectors, and 484 manifest artifacts at
-conformance commit `7f09321fb483a22eb677a4342f8d9537a7a18e82`. The native
+conformance commit `affe3fe3bcc4d13fa7c5374471568e94af36f0d1`. The native
 runtime-provider profile is optional and is exercised through its production adapter.
 
 The package metadata is `0.3.0`. Artifact and checkpoint schema version 1 is the
@@ -34,6 +34,23 @@ returns the exact create, admit, or step result after commit; a retained deliver
 returns its receipt before current row input is mapped. The optional aggregate-only
 step path uses the mapping's `reconstruct_aggregate` and `project_aggregate`
 methods when no checkpoint exists.
+
+`determa.state.public_client.PublicHostClient` binds deployment names to
+`EndpointBinding(endpoint, scope_alias)` values. Initialize its SQLite journal with
+`setup_schema()` and supply an authenticated transport callable. Before sending a
+mutation it discovers the immutable scope binding and saves the complete request,
+request digest and endpoint. `retry(operation_id)` and `receipt(operation_id)` use
+that saved endpoint after restart, including when a deployment alias has changed.
+A transport exception leaves the outcome unknown; it does not prove rollback.
+
+`determa.state.public_host.SQLitePublicExecutionHost` implements the closed public
+version-1 capabilities, create, admit, process, read, structural inspect and receipt
+operations for one local scope. The transport authenticates a principal; the host
+authorizes it before root or receipt lookup. Explicit schema setup verifies native
+SQLite tables and retention triggers. A mutation commits its checkpoint and complete
+first public response in one transaction; equal retries return that response before
+calling the core or resolving definitions. This local profile advertises no authority,
+native effects, timers, archive or recovery operations.
 
 ## Install
 
