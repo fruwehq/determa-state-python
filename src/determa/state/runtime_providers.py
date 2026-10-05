@@ -315,6 +315,53 @@ def _loaded_code_matches(
         except Exception:
             return False
 
+    def import_path_verified(name: str) -> bool:
+        parts = name.split(".")
+        parent = None
+        for index, part in enumerate(parts):
+            current = sys.modules.get(".".join(parts[: index + 1]))
+            if not import_verified(current) or (
+                parent is not None and vars(parent).get(part) is not current
+            ):
+                return False
+            parent = current
+        return True
+
+    def imported_member_verified(imported_module: Any, name: str) -> bool:
+        if name == "*" or name not in vars(imported_module):
+            return False
+        member = vars(imported_module)[name]
+        if isinstance(member, types.ModuleType):
+            return import_verified(member)
+        if callable(member):
+            origin_name = getattr(member, "__module__", None)
+            origin = sys.modules.get(origin_name) if isinstance(origin_name, str) else None
+            source = None if origin is None else vars(origin).get("__file__")
+            if not isinstance(source, str) or Path(source).resolve() not in trusted_sources:
+                return host_verified(member)
+            member_name = getattr(member, "__name__", None)
+            declarations = ast.parse(Path(source).read_bytes()).body
+            if (
+                not isinstance(member_name, str)
+                or vars(origin).get(member_name) is not member
+                or not any(
+                    isinstance(declaration, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                    and declaration.name == member_name
+                    for declaration in declarations
+                )
+            ):
+                return host_verified(member)
+            return _loaded_code_matches(
+                Path(source),
+                member,
+                anchors=anchors,
+                capture=capture,
+                identity_verifier=identity_verifier,
+                trusted_sources=trusted_sources,
+                visited=visited,
+            )
+        return True
+
     for node in tree.body:
         if isinstance(node, ast.Import):
             for alias in node.names:
@@ -328,8 +375,7 @@ def _loaded_code_matches(
                     loaded is None
                     or imported is None
                     or vars(module).get(alias.asname or alias.name.split(".", 1)[0]) is not loaded
-                    or not import_verified(loaded)
-                    or (imported is not loaded and not import_verified(imported))
+                    or not import_path_verified(alias.name)
                 ):
                     return False
         elif isinstance(node, ast.ImportFrom) and node.module != "__future__":
@@ -340,7 +386,7 @@ def _loaded_code_matches(
             if loaded is None or not import_verified(loaded):
                 return False
             if any(
-                alias.name == "*"
+                not imported_member_verified(loaded, alias.name)
                 or (
                     isinstance(vars(module).get(alias.asname or alias.name), types.ModuleType)
                     and not import_verified(vars(module)[alias.asname or alias.name])
@@ -367,13 +413,16 @@ def _loaded_code_matches(
         if nested in tree.body:
             continue
         if isinstance(nested, ast.Import):
-            if any(not import_verified(sys.modules.get(alias.name)) for alias in nested.names):
+            if any(not import_path_verified(alias.name) for alias in nested.names):
                 return False
         elif isinstance(nested, ast.ImportFrom) and nested.module != "__future__":
             resolved_name = importlib.util.resolve_name(
                 "." * nested.level + (nested.module or ""), vars(module).get("__package__")
             )
-            if not import_verified(sys.modules.get(resolved_name)):
+            loaded = sys.modules.get(resolved_name)
+            if not import_verified(loaded) or any(
+                not imported_member_verified(loaded, alias.name) for alias in nested.names
+            ):
                 return False
 
     def matches(
