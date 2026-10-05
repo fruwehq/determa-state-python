@@ -7,6 +7,7 @@ journal. A disappeared worker leaves an ambiguous attempt for reconciliation.
 
 from __future__ import annotations
 
+import base64
 import copy
 import json
 import re
@@ -182,6 +183,54 @@ def _pinned_result_target(
 ) -> dict[str, Any]:
     target = record["target"]
     origin = target["runtime_incarnation"]
+    root, runtime_id = checkpoint["root_instance_id"], target["runtime_id"]
+    if target["root_instance_id"] != root:
+        raise EffectError("invalid_effect_journal")
+    definition = origin["definition"]
+    machine = definition["machine"]
+    identity = [machine["namespace"], machine["machine_id"], machine["machine_version"]]
+    if origin["kind"] == "root":
+        expected_id = hash_value(
+            [
+                "determa-root-runtime-identity-1",
+                "1",
+                definition["validated_bundle_fingerprint"],
+                *identity,
+                origin["root_instance_id"],
+            ]
+        )
+    elif origin["kind"] == "component":
+        if origin["declaration_index"] != origin["component_definition_pointer"].rsplit("/", 1)[-1]:
+            raise EffectError("invalid_effect_journal")
+        expected_id = hash_value(
+            [
+                "determa-component-runtime-identity-1",
+                "1",
+                root,
+                origin["owner_runtime_id"],
+                origin["component_definition_pointer"],
+                origin["activation_sequence"],
+                *identity,
+            ]
+        )
+    else:
+        expected_id = hash_value(
+            [
+                "determa-spawned-runtime-identity-1",
+                "1",
+                root,
+                origin["owner_runtime_id"],
+                origin["spawn_action_pointer"],
+                origin["spawn_sequence"],
+                *identity,
+            ]
+        )
+    if expected_id != runtime_id:
+        raise EffectError("invalid_effect_journal")
+    if resolver is not None:
+        from .wire import _origin_machine
+
+        _origin_machine(resolver, origin)
     aggregate = checkpoint["root_record"].get("aggregate_state")
     for runtime in aggregate["runtimes"] if aggregate else []:
         if runtime["runtime_id"] == target["runtime_id"] and runtime["identity_origin"] == origin:
@@ -645,6 +694,29 @@ class VerifiedNativeHandler:
             return _bound_provider_method(provider, "invoke"), instance
         except (ExtensionError, ValueError, TypeError, KeyError) as error:
             raise EffectError("host_capability_mismatch") from error
+
+    def verify_deduplication_evidence(
+        self,
+        reference: Mapping[str, Any],
+        destination: str,
+        evidence: Mapping[str, Any],
+    ) -> None:
+        """Verify actual destination evidence through the installed native provider.
+
+        The provider must independently authenticate receipts against its native
+        destination, rather than trust caller-supplied equal bytes.
+        """
+        from .runtime_providers import _bound_provider_method
+
+        VerifiedNativeHandler.verify(self, reference, destination)
+        try:
+            _descriptor, provider, instance, _evaluator = self._registry._bound(self._configured)
+            method = _bound_provider_method(provider, "verify_deduplication_evidence")
+            if method(instance, copy.deepcopy(dict(evidence))) is not True:
+                raise EffectError("host_capability_mismatch")
+            VerifiedNativeHandler.verify(self, reference, destination)
+        except (ExtensionError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            raise EffectError("host_capability_mismatch") from exc
 
     def invoke(
         self,
@@ -1145,18 +1217,69 @@ class SQLiteCommittedEffectHost:
         *,
         expires_at: str,
         trusted_now: str,
-        deduplication_proven: bool = False,
+        deduplication_evidence: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         def change(document: dict[str, Any]) -> dict[str, Any]:
-            return _issue_effect_claim(
+            record = _record(document["journal"], effect_id)
+            proof = None
+            if deduplication_evidence is not None:
+                if not isinstance(deduplication_evidence, Mapping):
+                    raise EffectError("host_capability_mismatch")
+                proof = copy.deepcopy(dict(deduplication_evidence))
+                fields = {
+                    "scope_identity",
+                    "effect_id",
+                    "destination_binding_digest",
+                    "first_attempt_receipt_bytes_base64",
+                    "repeat_attempt_receipt_bytes_base64",
+                }
+                if (
+                    set(proof) != fields
+                    or proof["scope_identity"] != document["journal"]["scope_identity"]
+                    or proof["effect_id"] != effect_id
+                    or proof["destination_binding_digest"] != record["destination_binding_digest"]
+                ):
+                    raise EffectError("host_capability_mismatch")
+                try:
+                    first = base64.b64decode(
+                        proof["first_attempt_receipt_bytes_base64"], validate=True
+                    )
+                    repeated = base64.b64decode(
+                        proof["repeat_attempt_receipt_bytes_base64"], validate=True
+                    )
+                    if not first or first != repeated:
+                        raise ValueError("destination receipts differ")
+                except (ValueError, TypeError) as exc:
+                    raise EffectError("host_capability_mismatch") from exc
+                handler = self._verified_handler(
+                    record["handler_reference"], record["destination_binding_digest"]
+                )
+                VerifiedNativeHandler.verify_deduplication_evidence(
+                    handler,
+                    record["handler_reference"],
+                    record["destination_binding_digest"],
+                    proof,
+                )
+            claim = _issue_effect_claim(
                 document,
                 effect_id,
                 principal,
                 epoch,
                 expires_at,
                 trusted_now,
-                deduplication_proven=deduplication_proven,
+                deduplication_proven=proof is not None,
             )
+            if proof is not None:
+                document.setdefault("destination_evidence", {}).setdefault(effect_id, []).append(
+                    {
+                        "root_instance_id": root,
+                        "operation_token": record["operation_token"],
+                        "handler_reference": copy.deepcopy(record["handler_reference"]),
+                        "attempt_fence": claim["attempt_fence"],
+                        "evidence": proof,
+                    }
+                )
+            return claim
 
         return self._transact(
             root, change, expected_epoch=epoch, authority_mutation=self._mirror_authority

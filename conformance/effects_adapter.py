@@ -409,6 +409,11 @@ class _FixtureNativeProvider:
     def invoke(self, instance: Any, payload: Any, metadata: Any, attempt: Any) -> Any:
         return self.invocation(payload, metadata, attempt)
 
+    def verify_deduplication_evidence(self, instance: Any, evidence: Any) -> bool:
+        return instance["destination_binding_digest"] == _sha(
+            _destination_configuration()
+        ) and evidence == _destination_proof(evidence["scope_identity"], evidence["effect_id"])
+
 
 def _run_operation(payload: dict[str, Any], control: Path | None = None) -> dict[str, Any]:
     checkpoint, journal = payload["checkpoint_before"], payload["journal_before"]
@@ -473,6 +478,10 @@ def _run_operation(payload: dict[str, Any], control: Path | None = None) -> dict
         return provider
 
     factory_code, handler_code = factory.__code__, handler.__code__
+    destination_codes = {
+        name: globals()[name].__code__
+        for name in ("_destination_proof", "_destination_configuration", "_destination_call")
+    }
     installed_invoke, installed_reply = handler_module.invoke, handler_module.NativeReply
     installed_members = {
         name: member
@@ -499,6 +508,7 @@ def _run_operation(payload: dict[str, Any], control: Path | None = None) -> dict
             and type(provider) is _FixtureNativeProvider
             and provider.invocation is handler
             and handler.__code__ is handler_code
+            and all(globals()[name].__code__ is code for name, code in destination_codes.items())
             and all(
                 getattr(_FixtureNativeProvider, name).__code__ is code
                 for name, code in provider_methods.items()
@@ -631,6 +641,17 @@ def _run_operation(payload: dict[str, Any], control: Path | None = None) -> dict
             caller_kind = "aborted"
     elif operation == "claim":
         try:
+            evidence = None
+            if configuration["destination_deduplication_proven"] and any(
+                record["effect_id"] == arguments["effect_id"]
+                and record["invocation_state"] == "ambiguous"
+                for record in journal["effect_records"]
+            ):
+                # Exercise the actual installed destination twice. The configuration
+                # requests this probe; only native receipt verification permits retry.
+                _destination_call(_AUTHORITY_SCOPE, arguments["effect_id"], None)
+                _destination_call(_AUTHORITY_SCOPE, arguments["effect_id"], None)
+                evidence = _destination_proof(_AUTHORITY_SCOPE, arguments["effect_id"])
             claim = host.claim(
                 _ROOT,
                 arguments["effect_id"],
@@ -638,7 +659,7 @@ def _run_operation(payload: dict[str, Any], control: Path | None = None) -> dict
                 context["scope_authority_epoch"],
                 expires_at=str(int(context["trusted_host_now"]) + 1),
                 trusted_now=context["trusted_host_now"],
-                deduplication_proven=configuration["destination_deduplication_proven"],
+                deduplication_evidence=evidence,
             )
             new_claims.append(
                 {

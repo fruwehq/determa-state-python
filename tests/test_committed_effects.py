@@ -22,8 +22,9 @@ def read(name):
 
 
 class NativeTestProvider:
-    def __init__(self, callback):
+    def __init__(self, callback, proof_verifier=None):
         self.callback = callback
+        self.proof_verifier = proof_verifier
 
     def validate_configuration(self, configuration):
         return copy.deepcopy(configuration)
@@ -37,16 +38,20 @@ class NativeTestProvider:
     def invoke(self, instance, payload, metadata, attempt):
         return self.callback(payload, metadata, attempt)
 
+    def verify_deduplication_evidence(self, instance, evidence):
+        return self.proof_verifier is not None and self.proof_verifier(evidence)
 
-def installed_test_handler(host, callback):
+
+def installed_test_handler(host, callback, proof_verifier=None):
     from determa.state.effects import VerifiedNativeHandler
     from determa.state.extensions import ExtensionRegistry
 
-    provider = NativeTestProvider(callback)
+    provider = NativeTestProvider(callback, proof_verifier)
 
     def factory():
         return provider
 
+    proof_code = proof_verifier.__code__ if proof_verifier is not None else None
     callback_code = callback.__code__
     factory_code = factory.__code__
     methods = {
@@ -68,6 +73,8 @@ def installed_test_handler(host, callback):
             and factory.__code__ is factory_code
             and type(provider) is NativeTestProvider
             and provider.callback is callback
+            and provider.proof_verifier is proof_verifier
+            and (proof_verifier is None or proof_verifier.__code__ is proof_code)
             and callback.__code__ is callback_code
             and all(
                 getattr(NativeTestProvider, name).__code__ is code for name, code in methods.items()
@@ -991,7 +998,10 @@ def test_compact_outbox_location_retains_valid_admitted_journal_pair(tmp_path):
     assert restored.recover(root)["journal"] == journal
 
 
-@pytest.mark.parametrize("changed", ["payload", "token", "event", "target", "receipt_kind", "mode"])
+@pytest.mark.parametrize(
+    "changed",
+    ["payload", "token", "event", "target", "target_root", "origin", "receipt_kind", "mode"],
+)
 def test_admission_receipt_authenticates_exact_pinned_result(tmp_path, changed):
     from determa.state.wire import hash_value
 
@@ -1009,6 +1019,12 @@ def test_admission_receipt_authenticates_exact_pinned_result(tmp_path, changed):
         record["result_mapping"][0]["event"] = "native_cancelled"
     elif changed == "target":
         record["target"]["runtime_id"] = "different-runtime"
+    elif changed == "target_root":
+        record["target"]["root_instance_id"] = "foreign-root"
+    elif changed == "origin":
+        record["target"]["runtime_incarnation"]["definition"]["validated_bundle_fingerprint"] = (
+            "sha256:" + "0" * 64
+        )
     elif changed == "receipt_kind":
         record["admission_receipt"]["operation_kind"] = "event_terminal"
     else:
@@ -1062,3 +1078,125 @@ def test_historical_result_evidence_survives_processing(tmp_path):
     restored.setup_schema()
     restored.seed(checkpoint, journal)
     assert restored.recover(root)["journal"] == journal
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [None, "boolean", "fabricated", "wrong_work", "wrong_destination", "no_native_receipt"],
+)
+def test_ambiguous_retry_requires_verified_native_destination_evidence(tmp_path, damage):
+    import base64
+    import sqlite3
+
+    original, root, request, _ = host_fixture(tmp_path)
+    journal = read("data/ambiguous-journal.json")
+    host = SQLiteCommittedEffectHost(tmp_path / "ambiguous.sqlite", original.resolver, {}, None)
+    host.setup_schema()
+    host.seed(read("pending-checkpoint.json"), journal)
+    record = journal["effect_records"][0]
+    host.route.update(
+        {key: record[key] for key in ("handler_reference", "destination_binding_digest")}
+    )
+    native_path = tmp_path / "destination.sqlite"
+    receipt_bytes = b"actual native receipt for scoped effect"
+    with sqlite3.connect(native_path) as connection:
+        connection.execute(
+            "CREATE TABLE receipts (scope TEXT, effect TEXT, receipt BLOB, calls INTEGER)"
+        )
+        if damage != "no_native_receipt":
+            connection.execute(
+                "INSERT INTO receipts VALUES (?, ?, ?, 2)",
+                (
+                    journal["scope_identity"],
+                    record["effect_id"],
+                    receipt_bytes,
+                ),
+            )
+
+    def verify_receipts(evidence):
+        with sqlite3.connect(native_path) as connection:
+            row = connection.execute(
+                "SELECT receipt, calls FROM receipts WHERE scope = ? AND effect = ?",
+                (
+                    evidence["scope_identity"],
+                    evidence["effect_id"],
+                ),
+            ).fetchone()
+        return (
+            row is not None
+            and row[1] >= 2
+            and all(
+                base64.b64decode(evidence[name], validate=True) == row[0]
+                for name in (
+                    "first_attempt_receipt_bytes_base64",
+                    "repeat_attempt_receipt_bytes_base64",
+                )
+            )
+        )
+
+    host = installed_test_handler(host, lambda *_: {}, verify_receipts)
+    encoded = base64.b64encode(receipt_bytes).decode()
+    proof = {
+        "scope_identity": journal["scope_identity"],
+        "effect_id": record["effect_id"],
+        "destination_binding_digest": record["destination_binding_digest"],
+        "first_attempt_receipt_bytes_base64": encoded,
+        "repeat_attempt_receipt_bytes_base64": encoded,
+    }
+    if damage == "boolean":
+        proof = True
+    elif damage == "fabricated":
+        proof["first_attempt_receipt_bytes_base64"] = proof[
+            "repeat_attempt_receipt_bytes_base64"
+        ] = base64.b64encode(b"fabricated equal bytes").decode()
+    elif damage == "wrong_work":
+        proof["effect_id"] = "sha256:" + "0" * 64
+    elif damage == "wrong_destination":
+        proof["destination_binding_digest"] = "sha256:" + "0" * 64
+    before = host.snapshot(root)
+    if damage is not None:
+        with pytest.raises(EffectError, match="host_capability_mismatch"):
+            host.claim(
+                root,
+                request["effect_id"],
+                "worker",
+                "0",
+                expires_at="10",
+                trusted_now="0",
+                deduplication_evidence=proof,
+            )
+        assert host.snapshot(root) == before
+    else:
+        claim = host.claim(
+            root,
+            request["effect_id"],
+            "worker",
+            "0",
+            expires_at="10",
+            trusted_now="0",
+            deduplication_evidence=proof,
+        )
+        assert int(claim["attempt_fence"]) == int(record["attempt_fence"]) + 1
+        saved = host.snapshot(root)["destination_evidence"][record["effect_id"]][0]
+        assert saved["evidence"] == proof
+        assert saved["root_instance_id"] == root
+        assert saved["attempt_fence"] == claim["attempt_fence"]
+        reopened = SQLiteCommittedEffectHost(host.path, host.resolver, {}, None)
+        assert (
+            reopened.snapshot(root)["destination_evidence"]
+            == host.snapshot(root)["destination_evidence"]
+        )
+
+
+def test_ambiguous_retry_does_not_accept_legacy_boolean_keyword(tmp_path):
+    host, root, request, _ = host_fixture(tmp_path)
+    with pytest.raises(TypeError, match="deduplication_proven"):
+        host.claim(
+            root,
+            request["effect_id"],
+            "worker",
+            "0",
+            expires_at="10",
+            trusted_now="0",
+            deduplication_proven=True,
+        )
