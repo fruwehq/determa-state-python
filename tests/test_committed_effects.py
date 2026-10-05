@@ -464,3 +464,70 @@ def test_confirmed_outbox_does_not_remove_the_business_invocation_payload(tmp_pa
         calls[0][0]
         == host.snapshot(root)["checkpoint"]["terminal_outbox_records"][0]["intent"]["payload"]
     )
+
+
+def test_multi_effect_recovery_commits_one_journal_revision_per_effect(tmp_path):
+    from determa.state.checkpoint_v1 import admit_checkpoint_v1, step_checkpoint_v1
+    from determa.state.host import outbox_intent_digest
+    from determa.state.queueing import _entry_digest
+
+    original, root, _, _ = host_fixture(tmp_path)
+    checkpoint = original.snapshot(root)["checkpoint"]
+    entry = read("accepted-checkpoint.json")["root_record"]["aggregate_state"]["runtimes"][0][
+        "ready_mailbox"
+    ][0]
+    envelope = copy.deepcopy(entry["envelope"])
+    envelope["event_id"] = "invoke-second"
+    envelope["cause_id"] = "invoke-second"
+    delivery = {
+        "delivery_mode": entry["delivery_mode"],
+        "envelope": envelope,
+        "envelope_digest": _entry_digest(root, entry["delivery_mode"], envelope),
+    }
+    admitted = admit_checkpoint_v1(
+        checkpoint,
+        [delivery],
+        original.resolver,
+        expected_revision=checkpoint["revision"],
+        expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+    )
+    checkpoint = step_checkpoint_v1(
+        admitted,
+        checkpoint["root_record"]["aggregate_state"]["root_runtime_id"],
+        original.resolver,
+        expected_revision=admitted["revision"],
+        expected_checkpoint_digest=admitted["execution_checkpoint_digest"],
+    )
+    journal = read("data/unclaimed-journal.json")
+    template = journal["effect_records"][0]
+    journal["effect_records"] = []
+    for item in checkpoint["pending_outbox_intents"]:
+        record = copy.deepcopy(template)
+        record["effect_id"] = item["intent"]["effect_id"]
+        record["intent_digest"] = outbox_intent_digest(root, item["intent"])
+        journal["effect_records"].append(record)
+    journal["effect_records"].sort(key=lambda record: record["effect_id"].encode())
+    journal["checkpoint_revision"] = checkpoint["revision"]
+    journal["checkpoint_digest"] = checkpoint["execution_checkpoint_digest"]
+    journal = seal_journal(journal)
+    host = SQLiteCommittedEffectHost(tmp_path / "two.sqlite", original.resolver, {}, lambda *_: {})
+    host.setup_schema()
+    host.seed(checkpoint, journal)
+    for record in journal["effect_records"]:
+        host.claim(root, record["effect_id"], "worker", "0", expires_at="10", trusted_now="0")
+    initial_revision = int(host.snapshot(root)["journal"]["journal_revision"])
+    committed_revisions = []
+    transact = host._transact
+
+    def observe_transaction(*args, **kwargs):
+        result = transact(*args, **kwargs)
+        committed_revisions.append(int(host.snapshot(root)["journal"]["journal_revision"]))
+        return result
+
+    host._transact = observe_transaction
+    recovered = host.recover(root)
+    assert len(recovered["journal"]["effect_records"]) == 2
+    assert {record["invocation_state"] for record in recovered["journal"]["effect_records"]} == {
+        "ambiguous"
+    }
+    assert committed_revisions == [initial_revision + 1, initial_revision + 2]

@@ -1310,8 +1310,14 @@ class SQLiteCommittedEffectHost:
         )
 
     def recover(self, root: str) -> dict[str, Any]:
-        def change(document: dict[str, Any]) -> dict[str, Any]:
-            for record in document["journal"]["effect_records"]:
+        # Each recovered effect has its own atomic journal transition. A crash
+        # between records leaves the remaining records available to recover.
+        snapshot = self.snapshot(root)
+        for selected in snapshot["journal"]["effect_records"]:
+            effect_id = selected["effect_id"]
+
+            def change(document: dict[str, Any], effect_id: str = effect_id) -> None:
+                record = _record(document["journal"], effect_id)
                 if record["invocation_state"] == "outcome_recorded":
                     self._admit(document, record)
                 elif record["invocation_state"] == "leased":
@@ -1337,19 +1343,14 @@ class SQLiteCommittedEffectHost:
                     record["invocation_state"] = "ambiguous"
                     document["claims"][record["effect_id"]]["state"] = "revoked"
                     _bump(document["journal"])
-            return copy.deepcopy(document)
 
-        snapshot = self.snapshot(root)
-        return (
             self._transact(
                 root,
                 change,
                 expected_epoch=self.route.get("authority_epoch"),
                 authority_mutation=self._mirror_authority,
             )
-            if snapshot["journal"]["effect_records"]
-            else snapshot
-        )
+        return self.snapshot(root)
 
     def cancel(self, root: str, request: Mapping[str, Any]) -> dict[str, Any]:
         def change(document: dict[str, Any]) -> dict[str, Any]:
