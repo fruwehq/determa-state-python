@@ -1060,7 +1060,15 @@ class SQLiteLocalAuthority:
                 return _compact(_result(request, ledger, "stale_scope_authority"))
             # A new mutation cannot certify a scope around a missing private
             # native participant. Historical receipt replay above grants no rights.
-            if ledger.get("native_effect_roots") or ledger.get("native_effect_document_bytes"):
+            if any(
+                key in ledger
+                for key in (
+                    "native_effect_roots",
+                    "native_effect_document_bytes",
+                    "native_effect_journal_bytes",
+                    "native_effect_work",
+                )
+            ):
                 try:
                     _native_checkpoints(connection, ledger)
                 except (ValueError, TypeError, KeyError, sqlite3.Error):

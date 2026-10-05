@@ -274,7 +274,23 @@ def test_freeze_refuses_an_untracked_native_checkpoint_without_committing(tmp_pa
     assert bare_host.read_checkpoint("foreign-root").canonical_bytes == before.canonical_bytes
 
 
-@pytest.mark.parametrize("damage", [None, "row", "table", "history", "ownership"])
+@pytest.mark.parametrize(
+    "damage",
+    [
+        None,
+        "row",
+        "table",
+        "history",
+        "ownership",
+        "missing_indexes",
+        "empty_indexes",
+        "journal_history",
+        "missing_journal_history",
+        "wrong_journal_scope",
+        "unowned_work",
+        "malformed_work",
+    ],
+)
 def test_freeze_requires_complete_private_native_inventory_even_for_zero_effect_roots(
     tmp_path, damage
 ):
@@ -329,8 +345,39 @@ def test_freeze_requires_complete_private_native_inventory_even_for_zero_effect_
                         for source in ledger["native_effect_document_bytes"]
                         if json.loads(source)["checkpoint"]["root_instance_id"] != "root-b"
                     ]
-                else:
+                elif damage == "ownership":
                     ledger["native_effect_roots"].remove("root-b")
+                elif damage in {"missing_indexes", "empty_indexes"}:
+                    for key in ("native_effect_roots", "native_effect_document_bytes"):
+                        if damage == "missing_indexes":
+                            del ledger[key]
+                        else:
+                            ledger[key] = []
+                    connection.execute("DELETE FROM determa_committed_effects")
+                elif damage == "missing_journal_history":
+                    del ledger["native_effect_journal_bytes"]
+                elif damage in {"journal_history", "wrong_journal_scope"}:
+                    latest = json.loads(ledger["native_effect_journal_bytes"][-1])
+                    if damage == "journal_history":
+                        latest["journal_revision"] = "99"
+                    else:
+                        latest["scope_identity"] = "other-scope"
+                    from determa.state.wire import canonical_bytes
+
+                    ledger["native_effect_journal_bytes"][-1] = canonical_bytes(
+                        seal_journal(latest)
+                    ).decode()
+                elif damage == "unowned_work":
+                    ledger["native_effect_work"] = [
+                        {
+                            "participant": "native_effects",
+                            "work_kind": "effect",
+                            "root_instance_id": "unowned-root",
+                        }
+                    ]
+                else:
+                    assert damage == "malformed_work"
+                    ledger["native_effect_work"] = None
                 connection.execute(
                     "UPDATE determa_scope_authority SET ledger=?", (json.dumps(ledger),)
                 )

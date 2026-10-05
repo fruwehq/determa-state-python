@@ -1979,7 +1979,8 @@ def test_dispatch_native_call_excludes_a_real_competing_result_transaction(tmp_p
     assert other.submit_result(root, request, **context)["status"] == "committed"
 
 
-def test_native_authority_seed_cannot_erase_a_committed_dispatch_start(tmp_path):
+@pytest.mark.parametrize("damage", [None, "missing_indexes", "empty_indexes"])
+def test_native_authority_seed_cannot_erase_a_committed_dispatch_start(tmp_path, damage):
     import sqlite3
 
     authority, host, scope, root, record = authority_effect_fixture(tmp_path)
@@ -2000,18 +2001,34 @@ def test_native_authority_seed_cannot_erase_a_committed_dispatch_start(tmp_path)
         "trusted_now": "0",
     }
     host.dispatch(root, record["effect_id"], credential="test-credential", **context)
-    ledger = authority.inspect(scope)
     with sqlite3.connect(host.path) as connection:
+        if damage is not None:
+            retained = json.loads(
+                connection.execute("SELECT ledger FROM determa_scope_authority").fetchone()[0]
+            )
+            for key in ("native_effect_roots", "native_effect_document_bytes"):
+                if damage == "missing_indexes":
+                    del retained[key]
+                else:
+                    retained[key] = []
+            # Dedicated journal/work/issued-claim evidence still proves prior ownership.
+            assert retained["native_effect_journal_bytes"] and retained["native_effect_work"]
+            connection.execute(
+                "UPDATE determa_scope_authority SET ledger=?", (json.dumps(retained),)
+            )
         connection.execute(
             "DELETE FROM determa_committed_effects WHERE root_instance_id=?", (root,)
         )
+    ledger = authority.inspect(scope)
     with pytest.raises(EffectError, match="unauthorized_scope"):
         host.seed(before["checkpoint"], before["journal"], claim)
     assert authority.inspect(scope) == ledger
     assert len(calls) == 1
 
 
-@pytest.mark.parametrize("damage", ["erase_start", "older_document", "missing_native_history"])
+@pytest.mark.parametrize(
+    "damage", ["erase_start", "older_document", "missing_native_history", "missing_native_work"]
+)
 def test_private_dispatch_start_loss_cannot_be_blessed_by_dispatch_or_authority(tmp_path, damage):
     import sqlite3
 
@@ -2041,11 +2058,15 @@ def test_private_dispatch_start_loss_cannot_be_blessed_by_dispatch_or_authority(
         authority, scope, root, record, operation="after-private-start", expected="1"
     )
     with sqlite3.connect(host.path) as connection:
-        if damage == "missing_native_history":
+        if damage in {"missing_native_history", "missing_native_work"}:
             ledger = json.loads(
                 connection.execute("SELECT ledger FROM determa_scope_authority").fetchone()[0]
             )
-            del ledger["native_effect_document_bytes"]
+            del ledger[
+                "native_effect_document_bytes"
+                if damage == "missing_native_history"
+                else "native_effect_work"
+            ]
             connection.execute("UPDATE determa_scope_authority SET ledger=?", (json.dumps(ledger),))
         else:
             corrupted = copy.deepcopy(after if damage == "erase_start" else before)

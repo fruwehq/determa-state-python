@@ -686,31 +686,38 @@ def _reconstruct_producer_response(
     return response
 
 
-def _native_effect_journal(ledger: Mapping[str, Any], root: str) -> dict[str, Any]:
+def _native_effect_journals(ledger: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     """Resolve only host-participant history, never generic proposed mutation bytes."""
     from .authority import _parse
 
-    history = ledger.get("native_effect_journal_bytes")
+    history = ledger.get("native_effect_journal_bytes", [])
     if type(history) is not list or any(type(source) is not str for source in history):
         raise EffectError("unauthorized_scope")
-    latest = None
+    latest = {}
     for source in history:
         try:
             journal = _parse(source)
             if type(journal) is not dict:
                 raise EffectError("unauthorized_scope")
+            root = journal["root_instance_id"]
             if (
                 canonical_bytes(journal).decode() != source
                 or journal.get("host_effect_journal_format") != "determa.host_effect_journal"
                 or journal.get("host_effect_journal_schema_version") != 1
                 or journal.get("scope_identity") != ledger["scope_identity"]
                 or journal.get("host_effect_journal_digest") != journal_digest(journal)
+                or type(root) is not str
+                or not root
             ):
                 raise EffectError("unauthorized_scope")
+            latest[root] = journal
         except (ValueError, TypeError, KeyError) as error:
             raise EffectError("unauthorized_scope") from error
-        if journal["root_instance_id"] == root:
-            latest = journal
+    return latest
+
+
+def _native_effect_journal(ledger: Mapping[str, Any], root: str) -> dict[str, Any]:
+    latest = _native_effect_journals(ledger).get(root)
     if latest is None:
         raise EffectError("unauthorized_scope")
     return latest
@@ -721,8 +728,21 @@ def _native_effect_documents(ledger: Mapping[str, Any]) -> dict[str, dict[str, A
     roots = ledger.get("native_effect_roots", [])
     if (
         not isinstance(roots, list)
-        or any(type(root) is not str for root in roots)
+        or any(type(root) is not str or not root for root in roots)
         or len(set(roots)) != len(roots)
+    ):
+        raise EffectError("unauthorized_scope")
+    journals = _native_effect_journals(ledger)
+    # Losing both indexes cannot turn retained native journal/work into freshness.
+    if set(journals) != set(roots):
+        raise EffectError("unauthorized_scope")
+    work = ledger.get("native_effect_work", [])
+    if type(work) is not list or any(
+        type(item) is not dict
+        or item.get("participant") != "native_effects"
+        or item.get("work_kind") != "effect"
+        or item.get("root_instance_id") not in roots
+        for item in work
     ):
         raise EffectError("unauthorized_scope")
     history = ledger.get("native_effect_document_bytes", [] if not roots else None)
@@ -736,17 +756,38 @@ def _native_effect_documents(ledger: Mapping[str, Any]) -> dict[str, dict[str, A
             value = json.loads(source)
             if not isinstance(value, dict) or canonical_bytes(value).decode() != source:
                 raise ValueError("invalid native participant bytes")
-            if value["journal"]["scope_identity"] != ledger["scope_identity"]:
-                raise ValueError("wrong native scope")
+            if (
+                value["journal"]["scope_identity"] != ledger["scope_identity"]
+                or value["journal"]["host_effect_journal_format"] != "determa.host_effect_journal"
+                or value["journal"]["host_effect_journal_schema_version"] != 1
+                or value["journal"]["host_effect_journal_digest"]
+                != journal_digest(value["journal"])
+            ):
+                raise ValueError("wrong native journal provenance")
             if not isinstance(value["invocation_starts"], dict):
                 raise ValueError("missing private start inventory")
             root = value["checkpoint"]["root_instance_id"]
-            if type(root) is not str or value["journal"]["root_instance_id"] != root:
+            if type(root) is not str or not root or value["journal"]["root_instance_id"] != root:
                 raise ValueError("wrong native root")
             latest[root] = value
         except (ValueError, TypeError, KeyError) as error:
             raise EffectError("unauthorized_scope") from error
-    if set(latest) != set(roots):
+    if set(latest) != set(roots) or any(
+        document["journal"] != journals[root] for root, document in latest.items()
+    ):
+        raise EffectError("unauthorized_scope")
+    expected_work = [
+        {
+            "root_instance_id": root,
+            "work_kind": "effect",
+            "work_identity": record["effect_id"],
+            "operation_token": record["operation_token"],
+            "participant": "native_effects",
+        }
+        for root, document in latest.items()
+        for record in document["journal"]["effect_records"]
+    ]
+    if len(work) != len(expected_work) or any(item not in work for item in expected_work):
         raise EffectError("unauthorized_scope")
     return latest
 
@@ -1057,6 +1098,7 @@ class SQLiteCommittedEffectHost:
                     or journal["scope_identity"] != self.authority_scope
                 ):
                     raise EffectError("unauthorized_scope")
+                _native_effect_documents(ledger)
                 if checkpoint["root_instance_id"] in ledger.get(
                     "native_effect_roots", []
                 ) and journal != _native_effect_journal(ledger, checkpoint["root_instance_id"]):
