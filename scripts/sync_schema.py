@@ -20,14 +20,41 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 DEST = ROOT / "src" / "determa" / "state" / "data"
 SCHEMAS = (
+    "aggregate-state-package-v1.schema.json",
+    "aggregate-state-v1.schema.json",
+    "archive-export-request-v1.schema.json",
+    "archive-import-request-v1.schema.json",
+    "archive-participant-v1.schema.json",
+    "archive-result-v1.schema.json",
+    "archive-v1.schema.json",
+    "compilation-manifest-v1.schema.json",
+    "core-step-result-v1.schema.json",
+    "effect-cancellation-request-v1.schema.json",
+    "effect-cancellation-response-v1.schema.json",
+    "effect-result-request-v1.schema.json",
+    "effect-result-response-v1.schema.json",
+    "execution-checkpoint-v1.schema.json",
+    "extension-capability-report-v1.schema.json",
+    "extension-capability-requirement-v1.schema.json",
+    "extension-descriptor-v1.schema.json",
+    "host-authority-operation-v1.schema.json",
+    "host-authority-profile-report-v1.schema.json",
+    "host-effect-claim-v1.schema.json",
+    "host-effect-journal-v1.schema.json",
+    "inspection-v1.schema.json",
+    "language-source-v1.schema.json",
     "machine.schema.json",
-    "aggregate-state-v2.schema.json",
-    "migration-descriptor-v2.schema.json",
-    "aggregate-state-package-v2.schema.json",
-    "execution-checkpoint-v2.schema.json",
-    "core-step-result-v2.schema.json",
+    "migration-descriptor-v1.schema.json",
+    "provider-reference-v1.schema.json",
+    "public-host-request-v1.schema.json",
+    "public-host-response-v1.schema.json",
+    "recovery-operation-v1.schema.json",
+    "recovery-record-v1.schema.json",
+    "runtime-action-output-v1.schema.json",
+    "runtime-provider-descriptor-v1.schema.json",
+    "timer-helper-operation-v1.schema.json",
 )
-SPEC_COMMIT = "6796b554b976627c68fc746ec5629629aaf2b38e"
+SPEC_COMMIT = "77c0a2e60cd0771a6d44ae170a079ddd51d7d9f0"
 
 
 def _fetch(name: str) -> str:
