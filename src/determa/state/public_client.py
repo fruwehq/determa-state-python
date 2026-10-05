@@ -68,7 +68,12 @@ class EndpointBinding:
     scope_alias: str
 
     def __post_init__(self) -> None:
-        if not self.endpoint or not self.scope_alias:
+        if (
+            not isinstance(self.endpoint, str)
+            or not self.endpoint
+            or not isinstance(self.scope_alias, str)
+            or not self.scope_alias
+        ):
             raise PublicHostError("binding_unavailable")
 
 
@@ -86,7 +91,7 @@ class PublicHostClient:
         bindings: Mapping[str, EndpointBinding],
         transport: Callable[[str, dict[str, Any]], dict[str, Any]],
     ) -> None:
-        if str(path) == ":memory:":
+        if not str(path) or str(path) == ":memory:":
             raise PublicHostError("binding_unavailable")
         self.path = str(path)
         self.bindings = dict(bindings)

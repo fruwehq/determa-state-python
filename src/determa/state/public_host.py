@@ -70,7 +70,7 @@ class SQLitePublicExecutionHost:
         resolver: DefinitionResolver,
     ) -> None:
         if (
-            str(path) == ":memory:"
+            (not str(path) or str(path) == ":memory:")
             or not scope_alias
             or not scope_binding_identity
             or not authorized_principals
@@ -165,7 +165,7 @@ class SQLitePublicExecutionHost:
     def _capabilities(self) -> dict[str, Any]:
         result = {
             "scope_binding_identity": self.scope_binding_identity,
-            "supported_operations": _OPERATIONS,
+            "supported_operations": list(_OPERATIONS),
             "supported_scope_actions": [],
             "supported_determa_capabilities": [],
             "supported_timer_commands": [],
