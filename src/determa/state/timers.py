@@ -1,6 +1,6 @@
 """Explicit foreground SQLite timer records, separate from portable checkpoints.
 
-This implementation checkpoint supports durable schedule/cancel/read operations.
+This implementation checkpoint supports durable schedule/cancel/read and initial claims.
 Fire, coordinated admission, verified provider installation and archive integration
 remain unfinished; no completed timer profile is advertised yet.
 """
@@ -18,7 +18,8 @@ from typing import Any
 
 from .definition import Bundle
 from .engine import _normalize_payload
-from .wire import _schema_registry, canonical_bytes, decoded_typed_value, hash_value
+from .errors import ArtifactError
+from .wire import _schema_registry, canonical_bytes, decoded_typed_value, hash_value, strict_json
 
 _TIME = re.compile(r"(?:0|-?[1-9][0-9]*)\Z")
 _TABLE = (
@@ -93,7 +94,9 @@ def _result(
         if record and record["attempt_fence"] != "0"
         else None,
         "clock_basis": "unix_nanoseconds",
-        "expires_at": None,
+        "expires_at": record["expires_at"]
+        if code is None and request is not None and request["operation"] == "claim_fire" and record
+        else None,
         "event_id": record["event_id"] if record else None,
         "delivery_state": "admitted" if record and record["admission_receipt_digest"] else "none",
         "error_code": code,
@@ -128,6 +131,8 @@ class SQLiteTimerHelper:
         root_runtime_id: str,
         principals: frozenset[str],
         trusted_clock: Callable[[], str],
+        worker_principals: frozenset[str] = frozenset(),
+        claim_lease_nanoseconds: str = "20",
     ) -> None:
         if (
             str(path) == ":memory:"
@@ -145,11 +150,20 @@ class SQLiteTimerHelper:
         self.root_runtime_id = root_runtime_id
         self.principals = frozenset(principals)
         self.trusted_clock = trusted_clock
+        self.worker_principals = frozenset(worker_principals)
+        self.claim_lease_nanoseconds = _time(claim_lease_nanoseconds, duration=True)
+        if self.claim_lease_nanoseconds == 0 or not self.worker_principals <= self.principals:
+            raise ValueError(
+                "workers must be authorized principals and the claim lease must be positive"
+            )
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, isolation_level=None, timeout=30)
-        connection.execute("PRAGMA journal_mode=WAL")
+        journal = connection.execute("PRAGMA journal_mode=WAL").fetchone()
         connection.execute("PRAGMA synchronous=FULL")
+        if journal != ("wal",) or connection.execute("PRAGMA synchronous").fetchone() != (2,):
+            connection.close()
+            raise TimerError("timer_capability_mismatch")
         return connection
 
     def setup_schema(self) -> None:
@@ -184,7 +198,13 @@ class SQLiteTimerHelper:
                     "operation_receipts": [],
                 }
             )
-        artifact: dict[str, Any] = json.loads(bytes(row[0]))
+        try:
+            parsed, raw = strict_json(bytes(row[0]))
+            if not isinstance(parsed, dict) or raw != canonical_bytes(parsed):
+                raise TimerError("timer_capability_mismatch")
+            artifact: dict[str, Any] = parsed
+        except (ArtifactError, TypeError, ValueError) as error:
+            raise TimerError("timer_capability_mismatch") from error
         if (
             not _validator("timer-record-v1.schema.json").is_valid(artifact)
             or seal_timer_records(artifact) != artifact
@@ -231,6 +251,12 @@ class SQLiteTimerHelper:
         if not valid:
             raise TimerError("invalid_timer_request")
 
+    def _now(self) -> int:
+        try:
+            return _time(self.trusted_clock())
+        except Exception as error:
+            raise TimerError("timer_clock_unavailable") from error
+
     def execute(self, request: Mapping[str, Any], *, principal: str) -> dict[str, Any]:
         if not isinstance(request, Mapping) or request.get("interface") != "determa.timer_helper":
             return _result(None, None, "unsupported_timer_protocol")
@@ -247,9 +273,13 @@ class SQLiteTimerHelper:
             for field in ("deadline_at", "delay_nanoseconds"):
                 if field in structural["arguments"]:
                     structural["arguments"][field] = "0"
-        if not _validator("timer-helper-operation-v1.schema.json", "request").is_valid(
-            structural
-        ) or request.get("request_digest") != timer_request_digest(request):
+        try:
+            valid = _validator("timer-helper-operation-v1.schema.json", "request").is_valid(
+                structural
+            ) and request.get("request_digest") == timer_request_digest(request)
+        except (ArtifactError, TypeError, ValueError, OverflowError):
+            valid = False
+        if not valid:
             return _result(None, None, "invalid_timer_request")
         if principal not in self.principals or (
             request["scope_identity"],
@@ -257,6 +287,12 @@ class SQLiteTimerHelper:
             request["root_runtime_id"],
         ) != (self.scope_identity, self.root_instance_id, self.root_runtime_id):
             return _result(request, None, "unauthorized_timer_scope")
+        if request["operation"] in ("claim_fire", "complete_fire") and (
+            principal not in self.worker_principals
+            or request["arguments"]["worker_principal"] != principal
+        ):
+            return _result(request, None, "unauthorized_timer_scope")
+        record = None
         connection = self._connect()
         try:
             self._schema(connection)
@@ -296,10 +332,7 @@ class SQLiteTimerHelper:
                     deadline = _time(arguments["deadline_at"])
                 else:
                     delay = _time(arguments["delay_nanoseconds"], duration=True)
-                    try:
-                        now = _time(self.trusted_clock())
-                    except Exception as error:
-                        raise TimerError("timer_clock_unavailable") from error
+                    now = self._now()
                     deadline = now + delay
                     if not -(2**63) <= deadline <= 2**63 - 1:
                         raise TimerError("timer_deadline_overflow")
@@ -349,6 +382,38 @@ class SQLiteTimerHelper:
                     return _result(request, record, "timer_already_fired")
                 if record["state"] == "pending":
                     record.update(state="cancelled", revision=str(int(record["revision"]) + 1))
+            elif operation == "claim_fire":
+                if record is None:
+                    return _result(request, None, "timer_not_found")
+                if request["arguments"]["expected_revision"] != record["revision"]:
+                    return _result(request, record, "timer_revision_conflict")
+                if record["state"] == "fired":
+                    return _result(request, record, "timer_already_fired")
+                if record["state"] == "cancelled":
+                    return _result(request, record, "timer_cancelled")
+                now = self._now()
+                if record["state"] == "claimed":
+                    # A timeout is not proof that a previous admission did not commit.
+                    # Reclaim is refused until coordinated fate verification is implemented.
+                    return _result(
+                        request,
+                        record,
+                        "delivery_ambiguous"
+                        if now >= _time(record["expires_at"])
+                        else "timer_fire_in_progress",
+                    )
+                if now < _time(record["deadline_at"]):
+                    return _result(request, record, "timer_not_due")
+                expires_at = now + self.claim_lease_nanoseconds
+                if expires_at > 2**63 - 1:
+                    return _result(request, record, "timer_deadline_overflow")
+                record.update(
+                    state="claimed",
+                    revision=str(int(record["revision"]) + 1),
+                    attempt_fence=str(int(record["attempt_fence"]) + 1),
+                    worker_principal=principal,
+                    expires_at=str(expires_at),
+                )
             else:
                 return _result(request, record, "timer_capability_mismatch")
             result = _result(request, record)
@@ -363,7 +428,7 @@ class SQLiteTimerHelper:
             connection.commit()
             return result
         except TimerError as error:
-            return _result(request, None, error.code)
+            return _result(request, record, error.code)
         finally:
             connection.rollback()
             connection.close()

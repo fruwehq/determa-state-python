@@ -158,3 +158,119 @@ def test_invalid_record_digest_refuses_read_after_restart(tmp_path):
     restarted = helper(path, lambda: "100")
     result = restarted.execute(request("read_timer", "read-A", {}), principal="operator")
     assert result["error_code"] == "timer_capability_mismatch"
+
+
+def worker_helper(path, clock):
+    return SQLiteTimerHelper(
+        path,
+        bundle(),
+        scope_identity="scope-archive-example",
+        root_instance_id="server-1",
+        root_runtime_id=_ROOT_RUNTIME,
+        principals=frozenset({"operator", "worker-A", "worker-B"}),
+        worker_principals=frozenset({"worker-A", "worker-B"}),
+        trusted_clock=clock,
+    )
+
+
+def test_due_claim_is_durable_and_replay_does_not_recheck_clock_or_revision(tmp_path):
+    path = tmp_path / "timers.sqlite"
+    now = ["100"]
+    installed = worker_helper(path, lambda: now[0])
+    installed.setup_schema()
+    installed.execute(request(), principal="operator")
+    claim = request(
+        "claim_fire",
+        "claim-A",
+        {
+            "expected_revision": "1",
+            "clock_basis": "unix_nanoseconds",
+            "worker_principal": "worker-A",
+        },
+    )
+    before = installed.snapshot()
+    now[0] = "109"
+    assert installed.execute(claim, principal="worker-A")["error_code"] == "timer_not_due"
+    assert installed.snapshot() == before
+    now[0] = "110"
+    result = installed.execute(claim, principal="worker-A")
+    assert result["status"] == "accepted" and result["attempt_fence"] == "1"
+    assert result["record_revision"] == "2" and result["expires_at"] == "130"
+    committed = installed.snapshot()
+
+    def offline():
+        raise AssertionError("retained claim replay read the clock")
+
+    restarted = worker_helper(path, offline)
+    assert restarted.execute(claim, principal="worker-A") == result
+    assert restarted.snapshot() == committed
+    assert (
+        restarted.execute(
+            request("cancel", "cancel-A", {"expected_revision": "2"}), principal="operator"
+        )["error_code"]
+        == "timer_fire_in_progress"
+    )
+    assert restarted.snapshot() == committed
+
+
+def test_expired_claim_without_commit_fate_proof_never_grants_a_new_fence(tmp_path):
+    path = tmp_path / "timers.sqlite"
+    now = ["100"]
+    installed = worker_helper(path, lambda: now[0])
+    installed.setup_schema()
+    installed.execute(request(), principal="operator")
+    now[0] = "110"
+    claim = request(
+        "claim_fire",
+        "claim-A",
+        {
+            "expected_revision": "1",
+            "clock_basis": "unix_nanoseconds",
+            "worker_principal": "worker-A",
+        },
+    )
+    assert installed.execute(claim, principal="worker-A")["status"] == "accepted"
+    before = installed.snapshot()
+    retry = request(
+        "claim_fire",
+        "retry-B",
+        {
+            "expected_revision": "2",
+            "clock_basis": "unix_nanoseconds",
+            "worker_principal": "worker-B",
+        },
+    )
+    now[0] = "131"
+    refused = worker_helper(path, lambda: now[0]).execute(retry, principal="worker-B")
+    assert refused["error_code"] == "delivery_ambiguous" and refused["attempt_fence"] == "1"
+    assert installed.snapshot() == before
+    assert (
+        installed.execute(retry, principal="worker-A")["error_code"] == "unauthorized_timer_scope"
+    )
+    assert installed.snapshot() == before
+
+
+@pytest.mark.parametrize("encoding", ["duplicate", "noncanonical", "invalid"])
+def test_stored_artifact_requires_strict_canonical_json(tmp_path, encoding):
+    import sqlite3
+
+    from determa.state.wire import canonical_bytes
+
+    path = tmp_path / "timers.sqlite"
+    installed = helper(path, lambda: "100")
+    installed.setup_schema()
+    installed.execute(request(), principal="operator")
+    document = installed.snapshot()
+    raw = canonical_bytes(document)
+    if encoding == "duplicate":
+        raw = b'{"records":[],' + raw[1:]
+    elif encoding == "noncanonical":
+        raw = json.dumps(document, indent=2).encode()
+    else:
+        raw = b"invalid"
+    with sqlite3.connect(path) as connection:
+        connection.execute("UPDATE determa_timer_helpers SET document=?", (raw,))
+    assert (
+        installed.execute(request("read_timer", "read-A", {}), principal="operator")["error_code"]
+        == "timer_capability_mismatch"
+    )
