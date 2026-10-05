@@ -329,7 +329,11 @@ a failed compare-and-swap; the engine does not retry it automatically.
 `compile_language_source(source, registry, manifest=manifest)` verifies the exact
 source and compiler closure, compiles disjoint regions in order, strictly loads the
 generated format-1 bundle, and checks the manifest fingerprint and proved source
-capabilities. A generated CEL bundle restores without an installed compiler.
+capabilities. Only executable grammar slots can be compiled; metadata and variable
+values are inert. Every successful result retains sealed version-1 source and
+manifest artifacts in `bundle.source_compilation`, including when no manifest was
+supplied. That evidence discloses historical source guarantees independently of
+the generated runtime profile. A generated CEL bundle restores without an installed compiler.
 Semantic inspection calls only a separately proved, bounded `inspect_guard` method;
 structural inspection never invokes a native provider.
 

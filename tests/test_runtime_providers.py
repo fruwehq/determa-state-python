@@ -196,9 +196,63 @@ def test_exact_compilation_and_manifest_fingerprint() -> None:
     manifest = json.loads((_PROFILE / "source-manifest.json").read_text())
     bundle = compile_language_source(source, registry, manifest=manifest)
     assert bundle.fingerprint == manifest["content"]["generated_validated_bundle_fingerprint"]
+    assert bundle.source_compilation == {"source": source, "manifest": manifest}
     manifest["content"]["generated_validated_bundle_fingerprint"] = "sha256:" + "0" * 64
     with pytest.raises(RuntimeProviderError, match="language_compilation_failed"):
         compile_language_source(source, registry, manifest=manifest)
+
+
+@pytest.mark.parametrize("slot", ["metadata", "value"])
+def test_compiler_rejects_inert_slot_before_resolution(slot: str) -> None:
+    _, source = _installed_compiler(_PROFILE)
+    region = source["content"]["regions"][0]
+    template = source["content"]["template"]
+    if slot == "metadata":
+        template["meta"] = {"guard": "true"}
+        region["locator"] = "/meta/guard"
+    else:
+        template["machines"][0]["root"]["variables"] = {
+            "data": {"type": "map", "init": {"action": []}}
+        }
+        region.update(kind="actions", locator="/machines/0/root/variables/data/init/action")
+    source["artifact_digest"] = hash_value(
+        [source["artifact_format"], "1", typed_value(source["content"])]
+    )
+    # No dependency/compiler is installed: grammar rejection must precede resolution.
+    with pytest.raises(RuntimeProviderError, match="language_compilation_failed"):
+        compile_language_source(source, RuntimeProviderRegistry())
+
+
+def test_weak_compiler_retains_source_evidence_without_manifest() -> None:
+    registry, source = _installed_compiler(_PROFILE)
+    key = tuple(
+        source["content"]["regions"][0]["provider_reference"][name]
+        for name in ("identifier", "version", "content_digest")
+    )
+    registry._compiler_proofs[key] = None
+    bundle = compile_language_source(source, registry)
+    assert bundle.source_compilation is not None
+    evidence = bundle.source_compilation
+    assert evidence["source"] == source
+    assert evidence["manifest"]["content"]["source_capabilities"] == {
+        "deterministic": False,
+        "pure": False,
+        "portable": False,
+        "semantically_introspectable": False,
+        "process_contained": False,
+        "external_io_capable": True,
+    }
+    assert (
+        evidence["manifest"]["content"]["generated_validated_bundle_fingerprint"]
+        == bundle.fingerprint
+    )
+    generated = load_bundle(bundle.raw)
+    created = create(generated, "order", "generated-root", "generated-create", {})
+    restored = restore_aggregate(
+        created["state"], MemoryArtifactResolver(definitions={generated.fingerprint: generated})
+    )
+    assert restored.bundle.source_compilation is None
+    assert restored.bundle.fingerprint == bundle.fingerprint
 
 
 def test_compiler_source_drift_refused_before_callback(tmp_path: Path) -> None:

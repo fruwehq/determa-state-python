@@ -63,7 +63,7 @@ def _empty() -> dict[str, Any]:
         "result": "rejected",
         "code": None,
         "value": None,
-        "calls": {"guard": 0, "actions": 0, "inspect_guard": 0, "external": 0},
+        "calls": {"guard": 0, "actions": 0, "inspect_guard": 0, "compile_region": 0, "external": 0},
         "external_effects": [],
         "irreversible_side_effects": 0,
         "determa_state_committed": False,
@@ -149,7 +149,9 @@ def _installed(
             module.compile_region,
             closure,
             capability_proof=lambda selected: (
-                _PURE_CLAIMS if selected is module.compile_region else frozenset()
+                _PURE_CLAIMS
+                if selected is module.compile_region and not arguments.get("weak_compiler", False)
+                else frozenset()
             ),
         )
     else:
@@ -603,9 +605,27 @@ def execute(payload: dict[str, Any]) -> dict[str, Any]:
                 source["artifact_digest"] = hash_value(
                     [source["artifact_format"], "1", typed_value(source["content"])]
                 )
-            from determa.state.compilation import _artifact
+            if "invalid_slot" in arguments:
+                content = source["content"]
+                region = content["regions"][0]
+                if arguments["invalid_slot"] == "metadata_guard":
+                    content["template"]["meta"] = {"guard": "true"}
+                    region["locator"] = "/meta/guard"
+                else:
+                    content["template"]["machines"][0]["root"]["variables"] = {
+                        "data": {"type": "map", "init": {"action": []}}
+                    }
+                    region.update(
+                        kind="actions", locator="/machines/0/root/variables/data/init/action"
+                    )
+                from determa.state.wire import hash_value, typed_value
 
-            _artifact(source, "language-source-v1.schema.json", "determa.language_source")
+                source["artifact_digest"] = hash_value(
+                    [source["artifact_format"], "1", typed_value(content)]
+                )
+            from determa.state.compilation import _source_preflight, _verify_compilation_manifest
+
+            _source_preflight(source)
             observation["stages"].append("resolve_compiler_closure")
             registry, _module, loaded = _installed(
                 root, payload, installed, arguments, compiler=True
@@ -626,15 +646,30 @@ def execute(payload: dict[str, Any]) -> dict[str, Any]:
                     ]
             else:
                 manifest = None
-            bundle = compile_language_source(
-                source,
-                registry,
-                maximum_compilation_steps=arguments.get("maximum_compilation_steps", 1000),
-            )
-            observation["stages"].append("strict_load")
-            if manifest is not None:
-                observation["stages"].append("verify_manifest")
-                bundle = compile_language_source(source, registry, manifest=manifest)
+            previous_profile = sys.getprofile()
+
+            def trace(frame, event, arg):
+                if event == "call":
+                    if frame.f_code is _module.compile_region.__code__:
+                        observation["calls"]["compile_region"] += 1
+                    elif (
+                        frame.f_code is load_bundle.__code__
+                        and frame.f_back.f_code is compile_language_source.__code__
+                    ):
+                        observation["stages"].append("strict_load")
+                    elif frame.f_code is _verify_compilation_manifest.__code__:
+                        observation["stages"].append("verify_manifest")
+
+            sys.setprofile(trace)
+            try:
+                bundle = compile_language_source(
+                    source,
+                    registry,
+                    manifest=manifest,
+                    maximum_compilation_steps=arguments.get("maximum_compilation_steps", 1000),
+                )
+            finally:
+                sys.setprofile(previous_profile)
             if "generated_bundle_file" in arguments:
                 supplied = load_bundle(
                     json.loads((root / arguments["generated_bundle_file"]).read_text())
@@ -647,9 +682,37 @@ def execute(payload: dict[str, Any]) -> dict[str, Any]:
                     "on_events"
                 ]["submit"]["guard"]
             }
-            observation["effective_capabilities"] = registry.compiler_capabilities(
-                source["content"]["regions"][0]["provider_reference"]
-            )
+            assert bundle.source_compilation is not None
+            evidence = bundle.source_compilation["manifest"]["content"]
+            observation["effective_capabilities"] = evidence["source_capabilities"]
+            if arguments.get("without_manifest") and arguments.get("weak_compiler"):
+                generated_registry = RuntimeProviderRegistry()
+                generated = load_bundle(bundle.raw, runtime_providers=generated_registry)
+                created = create(generated, "order", "compiled-restore-root", "compiled-create", {})
+                before_restore_calls = observation["calls"]["compile_region"]
+                sys.setprofile(trace)
+                try:
+                    restored = restore_aggregate(
+                        created["state"],
+                        MemoryArtifactResolver(definitions={generated.fingerprint: generated}),
+                    )
+                finally:
+                    sys.setprofile(previous_profile)
+                observation["value"].update(
+                    source_artifact_digest=evidence["source_artifact_digest"],
+                    compiler_providers=evidence["compiler_providers"],
+                    generated_validated_bundle_fingerprint=evidence[
+                        "generated_validated_bundle_fingerprint"
+                    ],
+                    generated_runtime_capabilities=generated_registry.effective_capabilities(
+                        generated.raw
+                    ),
+                    restored_runtime_capabilities=generated_registry.effective_capabilities(
+                        restored.bundle.raw
+                    ),
+                    restore_compiler_calls=observation["calls"]["compile_region"]
+                    - before_restore_calls,
+                )
         else:
             observation["stages"].append(
                 "resolve_runtime_closure" if operation == "restore" else "resolve_closure"

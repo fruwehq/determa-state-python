@@ -163,6 +163,9 @@ class Bundle:
     required_capabilities: frozenset[str] = dataclass_field(
         default=frozenset(), compare=False, repr=False
     )
+    source_compilation: dict[str, Any] | None = dataclass_field(
+        default=None, compare=False, repr=False
+    )
 
     def verify_runtime_policy(self) -> None:
         """Recheck exact provider closure, current health, and host requirements."""

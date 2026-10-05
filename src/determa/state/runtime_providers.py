@@ -27,35 +27,52 @@ def _runtime_bindings(
 ) -> Iterator[tuple[str, Mapping[str, Any]]]:
     """Visit only executable grammar slots; metadata and values remain inert."""
 
-    def actions(items: Any) -> Iterator[tuple[str, Mapping[str, Any]]]:
-        for action in items or []:
-            if "provider_actions" in action:
-                yield "actions", action["provider_actions"]
+    for kind, _, value in _executable_slots(definition):
+        if kind == "guard" and isinstance(value, Mapping) and "provider" in value:
+            yield kind, value["provider"]
+        elif kind == "actions" and isinstance(value, list):
+            for action in value:
+                if isinstance(action, Mapping) and "provider_actions" in action:
+                    yield kind, action["provider_actions"]
 
-    def transitions(value: Any) -> Iterator[tuple[str, Mapping[str, Any]]]:
-        for transition in value if isinstance(value, list) else [value]:
-            if not transition:
+
+def _executable_slots(
+    definition: Mapping[str, Any],
+) -> Iterator[tuple[str, tuple[str, ...], Any]]:
+    """Enumerate grammar-owned guards and action blocks, never arbitrary values."""
+
+    def transitions(
+        value: Any, path: tuple[str, ...]
+    ) -> Iterator[tuple[str, tuple[str, ...], Any]]:
+        entries = enumerate(value) if isinstance(value, list) else [(None, value)]
+        for index, transition in entries:
+            if not isinstance(transition, Mapping):
                 continue
-            guard = transition.get("guard")
-            if isinstance(guard, Mapping) and "provider" in guard:
-                yield "guard", guard["provider"]
-            yield from actions(transition.get("action"))
+            current = path if index is None else (*path, str(index))
+            if "guard" in transition:
+                yield "guard", (*current, "guard"), transition["guard"]
+            if "action" in transition:
+                yield "actions", (*current, "action"), transition["action"]
 
-    def state(value: Mapping[str, Any]) -> Iterator[tuple[str, Mapping[str, Any]]]:
-        yield from actions(value.get("entry"))
-        yield from actions(value.get("exit"))
-        yield from transitions(value.get("initial"))
-        yield from transitions(value.get("choice"))
-        for handler in (value.get("on_events") or {}).values():
-            yield from transitions(handler)
-        for child in (value.get("states") or {}).values():
-            yield from state(child)
-        for component in value.get("components") or []:
-            if "root" in component:
-                yield from state(component["root"])
+    def state(value: Any, path: tuple[str, ...]) -> Iterator[tuple[str, tuple[str, ...], Any]]:
+        if not isinstance(value, Mapping):
+            return
+        for name in ("entry", "exit"):
+            if name in value:
+                yield "actions", (*path, name), value[name]
+        for name in ("initial", "choice"):
+            yield from transitions(value.get(name), (*path, name))
+        for name, handler in (value.get("on_events") or {}).items():
+            yield from transitions(handler, (*path, "on_events", name))
+        for name, child in (value.get("states") or {}).items():
+            yield from state(child, (*path, "states", name))
+        for index, component in enumerate(value.get("components") or []):
+            if isinstance(component, Mapping) and "root" in component:
+                yield from state(component["root"], (*path, "components", str(index), "root"))
 
-    for machine in definition.get("machines") or []:
-        yield from state(machine["root"])
+    for index, machine in enumerate(definition.get("machines") or []):
+        if isinstance(machine, Mapping):
+            yield from state(machine.get("root"), ("machines", str(index), "root"))
 
 
 SourceIdentityVerifier = Callable[[Path, Any], bool]
