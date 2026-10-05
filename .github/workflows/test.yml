@@ -151,7 +151,7 @@ jobs:
           PYTHONPATH=src python "$DETERMA_CONFORMANCE_DIR/scripts/run_host_authority_profile.py" \
             --spec-root "$DETERMA_SPEC_DIR" \
             --adapter python conformance/authority_adapter.py
-          PYTHONPATH=src python "$DETERMA_CONFORMANCE_DIR/scripts/run_committed_native_effects_profile.py" \
+          PYTHONPATH=src:. python "$DETERMA_CONFORMANCE_DIR/scripts/run_committed_native_effects_profile.py" \
             --spec-root "$DETERMA_SPEC_DIR" \
             --adapter "python conformance/effects_adapter.py" \
             --authority-adapter "python conformance/worker_authority_adapter.py"
