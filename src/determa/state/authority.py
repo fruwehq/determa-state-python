@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from .__about__ import __version__
+from .checkpoint import execution_checkpoint_digest, validate_execution_checkpoint_member
 from .extensions import ConfiguredExtension, ExtensionRegistry
 from .stores.base import ExecutionStoreError, ExecutionStoreTransaction, checkpoint_metadata
 from .stores.sqlite import SQLiteExecutionStore, _SQLiteTransaction
@@ -193,7 +194,9 @@ def _valid_request(request: Any) -> str | None:
     return None
 
 
-def _inventory(ledger: Mapping[str, Any]) -> list[dict[str, str]]:
+def _inventory(
+    ledger: Mapping[str, Any], checkpoints: list[dict[str, Any]]
+) -> list[dict[str, str]]:
     members: list[dict[str, str]] = []
     for field, kind in (
         ("roots", "root"),
@@ -217,7 +220,180 @@ def _inventory(ledger: Mapping[str, Any]) -> list[dict[str, str]]:
     members.extend(
         {"kind": "participant", "identity": item} for item in ledger["required_participant_records"]
     )
-    return sorted(members, key=lambda item: (item["kind"], item["identity"]))
+    # Discover logical references in retained checkpoint bytes as well as the
+    # current native rows. Allocation-time hints cannot establish completeness.
+    retained = []
+    for source in ledger["checkpoint_bytes"]:
+        document = _parse(source)
+        if (
+            isinstance(document, dict)
+            and document.get("execution_checkpoint_format") == "determa.execution_checkpoint"
+        ):
+            if not validate_execution_checkpoint_member("executionCheckpoint", document):
+                raise ValueError("invalid retained checkpoint inventory")
+            if document["execution_checkpoint_digest"] != execution_checkpoint_digest(document):
+                raise ValueError("invalid retained checkpoint digest")
+            retained.append(document)
+    for document in retained + checkpoints:
+        root = document["root_instance_id"]
+        members.append({"kind": "root", "identity": root})
+        if document["root_record"]["status"] == "tombstone":
+            members.append({"kind": "tombstone", "identity": root})
+        for receipt in document["operation_receipts"]:
+            members.append(
+                {
+                    "kind": "receipt",
+                    "identity": _compact([root, "receipt", receipt["receipt_sequence"]]),
+                }
+            )
+        for record in document["migration_audit_records"]:
+            members.append({"kind": "migration", "identity": record["migration_descriptor_digest"]})
+        for field, identity in (
+            ("event_identity_tombstones", "event_id"),
+            ("outbox_effect_tombstones", "effect_id"),
+        ):
+            members.extend(
+                {"kind": "tombstone", "identity": _compact([root, identity, item[identity]])}
+                for item in document[field]
+            )
+        pending: list[Any] = [document]
+        while pending:
+            value = pending.pop()
+            if isinstance(value, dict):
+                for key, item in value.items():
+                    if key in {
+                        "validated_bundle_fingerprint",
+                        "source_validated_bundle_fingerprint",
+                        "target_validated_bundle_fingerprint",
+                    }:
+                        members.append({"kind": "definition", "identity": item})
+                    pending.append(item)
+            elif isinstance(value, list):
+                pending.extend(value)
+    for document in checkpoints:
+        root = document["root_instance_id"]
+        members.append(
+            {
+                "kind": "checkpoint",
+                "identity": (
+                    f"{root}:{document['revision']}:{document['execution_checkpoint_digest']}"
+                ),
+            }
+        )
+        for field, kind in (
+            ("pending_outbox_intents", "pending_intent"),
+            ("terminal_outbox_records", "terminal_intent"),
+        ):
+            members.extend(
+                {"kind": kind, "identity": _compact([root, "effect", item["effect_id"]])}
+                for item in document[field]
+            )
+    return [
+        {"kind": kind, "identity": identity}
+        for kind, identity in sorted({(item["kind"], item["identity"]) for item in members})
+    ]
+
+
+def _native_checkpoints(
+    connection: sqlite3.Connection, ledger: Mapping[str, Any]
+) -> list[dict[str, Any]]:
+    """Read the entire dedicated checkpoint table under the freeze transaction."""
+    if (
+        connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'determa_execution_checkpoints'"
+        ).fetchone()
+        is None
+    ):
+        return []
+    documents = []
+    for root, payload in connection.execute(
+        "SELECT root_instance_id, checkpoint FROM determa_execution_checkpoints "
+        "ORDER BY root_instance_id"
+    ):
+        source = bytes(payload).decode("utf-8", "strict")
+        if root not in ledger["roots"] or source not in ledger["checkpoint_bytes"]:
+            raise ValueError("untracked native checkpoint")
+        document = _parse(source)
+        if not validate_execution_checkpoint_member("executionCheckpoint", document):
+            raise ValueError("invalid native checkpoint")
+        if document["root_instance_id"] != root or document[
+            "execution_checkpoint_digest"
+        ] != execution_checkpoint_digest(document):
+            raise ValueError("native checkpoint identity mismatch")
+        documents.append(document)
+    return documents
+
+
+def _compose_authority_profile(
+    facts: Mapping[str, Any],
+    verified: set[str],
+    *,
+    scope_identity: str,
+    authority_epoch: str,
+    scope_generation: str,
+) -> dict[str, Any]:
+    """Compose guarantees from configured identity and independently proved operations."""
+    requirement = facts["extension_requirement"]
+    claims = set(requirement["required_claims"]) if requirement else set()
+    guarded = (
+        requirement is not None
+        and "authoritative_scope_fencing" in claims
+        and "scope_guard_through_native_commit" in verified
+    )
+    inventory = (
+        requirement is not None
+        and "consistent_scope_inventory" in claims
+        and "frozen_authoritative_inventory" in verified
+    )
+    worker = (
+        guarded
+        and {"guarded_journal_claim", "authenticated_worker_checks"} <= verified
+        and {item["role"] for item in facts["required_participants"]} >= {"journal", "worker"}
+    )
+    relocation = (
+        guarded
+        and inventory
+        and "safe_relocation" in claims
+        and "same_authority_transfer_proof" in verified
+        and facts["destination_binding_digest"] is not None
+    )
+    if (requirement is None and verified) or (
+        requirement is not None and not guarded and not inventory
+    ):
+        return {"status": "rejected", "code": "host_capability_mismatch"}
+    if "safe_relocation" in verified and not relocation:
+        return {"status": "rejected", "code": "host_capability_mismatch"}
+    report = {
+        "profile_report_format": "determa.host_authority_profile_report",
+        "profile_report_schema_version": 1,
+        "scope_identity": scope_identity,
+        "authority_epoch": authority_epoch if requirement else None,
+        "scope_generation": scope_generation if requirement else None,
+        "extension_report": {
+            "category": "authority",
+            "provider_reference": requirement["provider_reference"],
+            "instance_id": requirement["instance_id"],
+            "health": "healthy",
+            "claims": requirement["required_claims"],
+        }
+        if requirement
+        else None,
+        "authority_storage_boundary": facts["storage_boundary"],
+        "topology": facts["topology"],
+        "source_binding_digest": facts["source_binding_digest"],
+        "destination_binding_digest": facts["destination_binding_digest"],
+        "required_participants": facts["required_participants"],
+        "guarantees": {
+            "guarded_local_writes": guarded,
+            "worker_fencing": worker,
+            "complete_scope_inventory": inventory,
+            "safe_relocation": relocation,
+        },
+    }
+    if facts["destination_binding_digest"] is None and "safe_relocation" in verified:
+        return {"status": "rejected", "code": "host_capability_mismatch"}
+    return {"status": "accepted", "report_bytes": _compact(report)}
 
 
 class SQLiteLocalAuthority:
@@ -315,7 +491,7 @@ class SQLiteLocalAuthority:
                 "outbox_retention": execution_store.outbox_retention,
             }
         ).encode()
-        return {
+        descriptor: dict[str, Any] = {
             "extension_report": extension_report,
             "authority_storage_boundary": "local-sqlite-authority-db",
             "topology": {
@@ -327,12 +503,6 @@ class SQLiteLocalAuthority:
             "source_binding_digest": hash_value(["determa-local-authority-source-1", self.path]),
             "destination_binding_digest": None,
             "required_participants": [],
-            "guarantees": {
-                "guarded_local_writes": True,
-                "worker_fencing": False,
-                "complete_scope_inventory": True,
-                "safe_relocation": False,
-            },
             "installation_evidence": {
                 "closure_bytes_base64": base64.b64encode(closure).decode(),
                 "configuration_bytes_base64": base64.b64encode(configuration).decode(),
@@ -340,6 +510,36 @@ class SQLiteLocalAuthority:
                 "participant_installations": [],
             },
         }
+        ledger = self.inspect(execution_store.scope_identity)
+        if ledger is None:
+            raise ValueError("host_capability_mismatch")
+        composed = _compose_authority_profile(
+            {
+                "extension_requirement": {
+                    "provider_reference": extension_report["provider_reference"],
+                    "instance_id": extension_report["instance_id"],
+                    "required_claims": extension_report["claims"],
+                },
+                "storage_boundary": descriptor["authority_storage_boundary"],
+                **{
+                    key: descriptor[key]
+                    for key in (
+                        "topology",
+                        "source_binding_digest",
+                        "destination_binding_digest",
+                        "required_participants",
+                    )
+                },
+            },
+            {"scope_guard_through_native_commit", "frozen_authoritative_inventory"},
+            scope_identity=execution_store.scope_identity,
+            authority_epoch=ledger["authority_epoch"],
+            scope_generation=ledger["scope_generation"],
+        )
+        if composed["status"] != "accepted":
+            raise ValueError("host_capability_mismatch")
+        descriptor["guarantees"] = _parse(composed["report_bytes"])["guarantees"]
+        return descriptor
 
     def profile_report(
         self,
@@ -587,6 +787,11 @@ class SQLiteLocalAuthority:
                     or ledger["active_claims"]
                 ):
                     return _compact(_result(request, ledger, "host_capability_mismatch"))
+                try:
+                    checkpoints = _native_checkpoints(connection, ledger)
+                    _inventory(ledger, checkpoints)
+                except (ValueError, TypeError, KeyError):
+                    return _compact(_result(request, ledger, "scope_fence_unproven"))
             ledger["scope_generation"] = str(int(ledger["scope_generation"]) + 1)
             if operation == "freeze_scope":
                 ledger["state"] = "frozen"
@@ -602,7 +807,7 @@ class SQLiteLocalAuthority:
                 }
             )
             if operation == "freeze_scope":
-                ledger["inventory"] = _inventory(ledger)
+                ledger["inventory"] = _inventory(ledger, checkpoints)
                 ledger["freeze"] = {
                     "evidence_digest": response["evidence_digest"],
                     "generation": ledger["scope_generation"],

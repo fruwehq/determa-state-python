@@ -18,6 +18,7 @@ from determa.state.authority import (
     AuthoritySQLiteExecutionStore,
     SQLiteLocalAuthority,
     _compact,
+    _compose_authority_profile,
     _parse,
     configure_bundled_sqlite_authority,
 )
@@ -363,67 +364,9 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _common_rule(facts: dict[str, Any], verified: set[str]) -> dict[str, Any]:
-    """Compose only the hypothetical common-rule premises supplied by the suite."""
-    requirement = facts["extension_requirement"]
-    claims = set(requirement["required_claims"]) if requirement else set()
-    guarded = (
-        requirement is not None
-        and "authoritative_scope_fencing" in claims
-        and "scope_guard_through_native_commit" in verified
+    return _compose_authority_profile(
+        facts, verified, scope_identity="scope-42", authority_epoch="2", scope_generation="4"
     )
-    inventory = (
-        requirement is not None
-        and "consistent_scope_inventory" in claims
-        and "frozen_authoritative_inventory" in verified
-    )
-    worker = (
-        guarded
-        and {"guarded_journal_claim", "authenticated_worker_checks"} <= verified
-        and {item["role"] for item in facts["required_participants"]} >= {"journal", "worker"}
-    )
-    relocation = (
-        guarded
-        and inventory
-        and "safe_relocation" in claims
-        and "same_authority_transfer_proof" in verified
-        and facts["destination_binding_digest"] is not None
-    )
-    if (requirement is None and verified) or (
-        requirement is not None and not guarded and not inventory
-    ):
-        return {"status": "rejected", "code": "host_capability_mismatch"}
-    if "safe_relocation" in verified and not relocation:
-        return {"status": "rejected", "code": "host_capability_mismatch"}
-    report = {
-        "profile_report_format": "determa.host_authority_profile_report",
-        "profile_report_schema_version": 1,
-        "scope_identity": "scope-42",
-        "authority_epoch": "2" if requirement else None,
-        "scope_generation": "4" if requirement else None,
-        "extension_report": {
-            "category": "authority",
-            "provider_reference": requirement["provider_reference"],
-            "instance_id": requirement["instance_id"],
-            "health": "healthy",
-            "claims": requirement["required_claims"],
-        }
-        if requirement
-        else None,
-        "authority_storage_boundary": facts["storage_boundary"],
-        "topology": facts["topology"],
-        "source_binding_digest": facts["source_binding_digest"],
-        "destination_binding_digest": facts["destination_binding_digest"],
-        "required_participants": facts["required_participants"],
-        "guarantees": {
-            "guarded_local_writes": guarded,
-            "worker_fencing": worker,
-            "complete_scope_inventory": inventory,
-            "safe_relocation": relocation,
-        },
-    }
-    if facts["destination_binding_digest"] is None and "safe_relocation" in verified:
-        return {"status": "rejected", "code": "host_capability_mismatch"}
-    return {"status": "accepted", "report_bytes": _compact(report)}
 
 
 if __name__ == "__main__":

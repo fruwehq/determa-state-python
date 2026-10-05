@@ -181,7 +181,6 @@ machines:
         "scope-1",
         "owner-1",
         roots=("root-1",),
-        definition_references=(bundle.fingerprint,),
     )
     registry = bundled_extension_registry(include_postgresql=False)
     configured, authority, store = configure_bundled_sqlite_authority(
@@ -222,6 +221,13 @@ machines:
         "guarantees"
     ]["complete_scope_inventory"]
     assert json.loads(response)["state"] == "frozen"
+    inventory = authority.inspect("scope-1")["inventory"]
+    assert {"kind": "definition", "identity": bundle.fingerprint} in inventory
+    assert {
+        "kind": "receipt",
+        "identity": json.dumps(["root-1", "receipt", "0"], separators=(",", ":")),
+    } in inventory
+    assert any(item["kind"] == "checkpoint" for item in inventory)
     with pytest.raises(ExecutionStoreError, match="stale_scope_authority"):
         host.read_checkpoint("root-1")
     with store._connect() as connection:
@@ -230,6 +236,33 @@ machines:
             ("root-1",),
         ).fetchone()
     assert actual is not None and bytes(actual[0]) == checkpoint.canonical_bytes
+
+
+def test_freeze_refuses_an_untracked_native_checkpoint_without_committing(tmp_path) -> None:
+    bundle = load_bundle(
+        "format: 1\nnamespace: test.inventory\nmachines:\n"
+        "  - machine_id: simple\n    root: {type: simple}\n"
+    )
+    resolver = MemoryArtifactResolver(definitions={bundle.fingerprint: bundle})
+    path = tmp_path / "untracked.sqlite"
+    bare_store = SQLiteExecutionStore(path)
+    bare_store.setup_schema()
+    bare_host = ExecutionHost(bare_store, resolver)
+    bare_host.create_v1(bundle, "simple", "foreign-root", "create-foreign", {})
+    before = bare_host.read_checkpoint("foreign-root")
+    authority = SQLiteLocalAuthority(path)
+    authority.setup_schema()
+    assert authority.allocate("scope-1", "owner-1", roots=("owned-root",))
+    ledger = authority.inspect("scope-1")
+    invocation = {
+        "authenticated_principal": "owner-1",
+        "authorized_scopes": ["scope-1"],
+        "operation_rights": ["freeze_scope"],
+    }
+    response = authority.perform(_request("freeze_scope", "freeze-untracked", "0", {}), invocation)
+    assert json.loads(response)["error_code"] == "scope_fence_unproven"
+    assert authority.inspect("scope-1") == ledger
+    assert bare_host.read_checkpoint("foreign-root").canonical_bytes == before.canonical_bytes
 
 
 def test_public_checkpoint_commit_serializes_with_freeze(tmp_path) -> None:
