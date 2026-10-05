@@ -2200,12 +2200,22 @@ class _Execution:
         if literal_values:
             from .wire import decoded_typed_value
 
-            if send["event"] == "env" or declaration is None:
+            if declaration is None and send["event"] != "env":
                 raise StepFault(FaultCode.ACTION_FAULT, pointer)
             decoded = decoded_typed_value(send["payload"])
             if not isinstance(decoded, dict):
                 raise StepFault(FaultCode.ACTION_FAULT, pointer)
             payload_values = decoded
+            if send["event"] == "env" and (
+                "targets" in send
+                or "correlation_id" in send
+                or not isinstance(send.get("to"), dict)
+                or set(send["to"]) != {"component"}
+                or set(payload_values) != {"changed"}
+                or not isinstance(payload_values["changed"], dict)
+                or not payload_values["changed"]
+            ):
+                raise StepFault(FaultCode.ACTION_FAULT, pointer)
         elif send["event"] == "env":
             changed_expression = payload_expressions["changed"]
             payload_values["changed"] = self.evaluate(
@@ -2263,6 +2273,24 @@ class _Execution:
             self.resolve_send_target(runtime, target_spec, value, pointer, index, "targets" in send)
             for index, (target_spec, value) in enumerate(evaluated_targets)
         ]
+        if literal_values and send["event"] == "env":
+            component_target = resolved[0]
+            if not isinstance(component_target, dict):
+                raise StepFault(FaultCode.ACTION_FAULT, pointer)
+            child = self.state["runtimes"][_target_runtime_id(component_target)]
+            root = _pointer_get(self.bundle.raw, child["root_pointer"])
+            external = {
+                name: item
+                for name, item in (root.get("variables") or {}).items()
+                if item.get("external") is True
+            }
+            changed = normalized_payload["changed"]
+            if set(changed) - set(external):
+                raise StepFault(FaultCode.ACTION_FAULT, pointer)
+            normalized_payload["changed"] = {
+                name: _normalize_value(value, str(external[name]["type"]))
+                for name, value in changed.items()
+            }
         if (
             literal_values
             and declaration is not None

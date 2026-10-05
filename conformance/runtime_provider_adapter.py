@@ -184,6 +184,11 @@ def _installed(
                         "external_io": bool(arguments.get("action_external_io", False)),
                         **({"repeat_send": True} if arguments.get("repeat_send") else {}),
                         **({"mixed_send": True} if arguments.get("mixed_send") else {}),
+                        **(
+                            {"environment_send": arguments["environment_send"]}
+                            if "environment_send" in arguments
+                            else {}
+                        ),
                     }
                 ),
             )
@@ -219,6 +224,24 @@ def _state(aggregate: dict[str, Any]) -> dict[str, Any]:
         "deferred_mailbox_length": len(runtime["deferred_mailbox"]),
         "output_count": int(aggregate["next_output_sequence"]),
     }
+
+
+def _component_states(aggregate: dict[str, Any]) -> dict[str, Any]:
+    result = {}
+    for runtime in aggregate["runtimes"]:
+        component = runtime["target_identity"].get("component")
+        if component is not None:
+            observed = _state({**aggregate, "root_runtime_id": runtime["runtime_id"]})
+            result[component["component_id"]] = {
+                key: observed[key]
+                for key in (
+                    "status",
+                    "variables",
+                    "ready_mailbox_length",
+                    "deferred_mailbox_length",
+                )
+            }
+    return result
 
 
 def _run_step(
@@ -271,6 +294,12 @@ def _run_step(
         observation["result"] = "faulted"
         observation["code"] = result["fault"]["code"]
         observation["state_after"] = observation["state_before"]
+        if "environment_send" in request["arguments"]:
+            observation["value"] = {
+                "source_locator": result["fault"]["source_locator"],
+                "component_states_before": _component_states(aggregate),
+                "component_states_after": _component_states(result["state"]),
+            }
         if request["arguments"].get("invalid_output") or request["arguments"].get(
             "destroyed_write"
         ):
@@ -285,6 +314,49 @@ def _run_step(
     observation["determa_state_committed"] = True
     observation["state_after"] = _state(result["state"])
     observation["value"] = {"emissions": len(result["emissions"])}
+    if "environment_send" in request["arguments"]:
+        before_child = next(
+            item
+            for item in aggregate["runtimes"]
+            if item.get("target_identity", {}).get("component", {}).get("component_id") == "replica"
+        )
+        after_child = next(
+            item
+            for item in result["state"]["runtimes"]
+            if item.get("target_identity", {}).get("component", {}).get("component_id") == "replica"
+        )
+        internal = next(
+            item for item in result["emissions"] if item.get("kind") == "internal_mailbox"
+        )
+        emission = next(
+            item["envelope"]
+            for item in after_child["ready_mailbox"]
+            if item["envelope"]["event_id"] == internal["event_id"]
+        )
+        observation["value"].update(
+            forwarded_event={
+                "event": emission["event"],
+                "component_id": after_child["target_identity"]["component"]["component_id"],
+                "payload": emission["payload"],
+            },
+            component_variables_before=_state(
+                {**aggregate, "root_runtime_id": before_child["runtime_id"]}
+            )["variables"],
+            component_ready_before_delivery=len(after_child["ready_mailbox"]),
+        )
+        delivered = step(result["state"], after_child["runtime_id"], resolver)
+        observation["stages"].append("deliver_env")
+        refreshed = next(
+            item
+            for item in delivered["state"]["runtimes"]
+            if item["runtime_id"] == after_child["runtime_id"]
+        )
+        observation["value"].update(
+            component_variables_after=_state(
+                {**delivered["state"], "root_runtime_id": refreshed["runtime_id"]}
+            )["variables"],
+            component_ready_after_delivery=len(refreshed["ready_mailbox"]),
+        )
     if "accepted" in observation["state_after"]["variables"]:
         observation["value"]["accepted"] = observation["state_after"]["variables"]["accepted"]
     if observation["state_after"]["status"] == "completed":
