@@ -10,6 +10,12 @@ from .application_projection import (
     ApplicationRowMapping,
     ProjectionError,
 )
+from .authority import (
+    AuthoritySQLiteExecutionStore,
+    SQLiteLocalAuthority,
+    bundled_authority_descriptor,
+    configure_bundled_sqlite_authority,
+)
 from .checkpoint import (
     execution_checkpoint_digest,
     seal_execution_checkpoint,
@@ -210,6 +216,10 @@ __all__ = [
     "SchemaError",
     "SharedExecutionTransaction",
     "SQLiteExecutionStore",
+    "SQLiteLocalAuthority",
+    "AuthoritySQLiteExecutionStore",
+    "bundled_authority_descriptor",
+    "configure_bundled_sqlite_authority",
     "SQLiteDurableHostStore",
     "StagedExecutionResult",
     "ValidationError",

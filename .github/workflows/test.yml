@@ -140,11 +140,17 @@ jobs:
           cache: pip
       - name: Install
         run: pip install -e '.[dev]'
+      - name: Install pinned conformance validator dependencies
+        run: python -m pip install -r .pinned/determa-state-conformance/scripts/validation-requirements.txt
       - name: Conformance suite
         env:
           DETERMA_CONFORMANCE_DIR: ${{ github.workspace }}/.pinned/determa-state-conformance
           DETERMA_SPEC_DIR: ${{ github.workspace }}/.pinned/determa-state-spec
-        run: pytest conformance -q
+        run: |
+          pytest conformance -q
+          PYTHONPATH=src python "$DETERMA_CONFORMANCE_DIR/scripts/run_host_authority_profile.py" \
+            --spec-root "$DETERMA_SPEC_DIR" \
+            --adapter python conformance/authority_adapter.py
 
   postgresql:
     runs-on: ubuntu-24.04
