@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import copy
 
+import pytest
+
 import determa.state as ds
 from determa.state.public_client import validate_public_message
 from determa.state.public_host import SQLitePublicExecutionHost
@@ -300,3 +302,35 @@ def test_changed_native_schema_refuses_before_mutation(tmp_path):
     assert response["error"]["code"] == "host_capability_mismatch"
     with sqlite3.connect(host.path) as db:
         assert db.execute("SELECT COUNT(*) FROM determa_public_host_checkpoints").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("column", ["singleton", "schema_version"])
+@pytest.mark.parametrize("operator", [">=", "!=", "<=", "<>"])
+def test_setup_rejects_changed_constraint_operators_before_binding_write(
+    tmp_path, column, operator
+):
+    import sqlite3
+
+    from determa.state.public_client import PublicHostError
+    from determa.state.public_host import _TABLES
+
+    path = tmp_path / "host.db"
+    definition = _TABLES["determa_public_host_binding"].replace(
+        f"CHECK({column}=1)", f"CHECK({column}{operator}1)"
+    )
+    with sqlite3.connect(path) as db:
+        db.execute(f"CREATE TABLE determa_public_host_binding ({definition})")
+    with pytest.raises(PublicHostError, match="host_capability_mismatch"):
+        open_host(tmp_path)
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT COUNT(*) FROM determa_public_host_binding").fetchone()[0] == 0
+
+
+def test_schema_comparison_preserves_literal_case_and_operator_tokens():
+    from determa.state.public_host import _sql_tokens
+
+    assert _sql_tokens("CHECK (singleton = 1)") == _sql_tokens("check(singleton=1)")
+    assert _sql_tokens("CHECK(singleton>=1)") != _sql_tokens("CHECK(singleton=1)")
+    assert _sql_tokens("RAISE(ABORT,'PUBLIC_HOST_IMMUTABLE')") != _sql_tokens(
+        "RAISE(ABORT,'public_host_immutable')"
+    )

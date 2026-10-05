@@ -49,7 +49,11 @@ _TRIGGERS = {
 
 
 def _sql_tokens(source: str) -> list[str]:
-    return re.findall(r"[a-z_][a-z0-9_]*|[0-9]+|[(),=]", source.lower())
+    tokens = re.findall(
+        r"'(?:(?:'')|[^'])*'|\"(?:(?:\"\")|[^\"])*\"|[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[^\s]",
+        source,
+    )
+    return [token if token.startswith(("'", '"')) else token.lower() for token in tokens]
 
 
 class SQLitePublicExecutionHost:
@@ -104,6 +108,7 @@ class SQLitePublicExecutionHost:
             db.execute("BEGIN IMMEDIATE")
             for name, columns in _TABLES.items():
                 db.execute(f"CREATE TABLE IF NOT EXISTS {name} ({columns})")
+            self._check_tables(db)
             if not db.execute("SELECT 1 FROM determa_public_host_binding").fetchone():
                 db.execute(
                     "INSERT INTO determa_public_host_binding VALUES (1,1,?)",
@@ -118,7 +123,7 @@ class SQLitePublicExecutionHost:
             self._check_binding(db)
 
     @staticmethod
-    def _check_schema(db: sqlite3.Connection) -> None:
+    def _check_tables(db: sqlite3.Connection) -> None:
         for name, columns in _TABLES.items():
             row = db.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (name,)
@@ -127,6 +132,10 @@ class SQLitePublicExecutionHost:
                 f"CREATE TABLE {name} ({columns})"
             ):
                 raise PublicHostError("host_capability_mismatch")
+
+    @staticmethod
+    def _check_schema(db: sqlite3.Connection) -> None:
+        SQLitePublicExecutionHost._check_tables(db)
         actual = dict(
             db.execute(
                 "SELECT name,sql FROM sqlite_master WHERE type='trigger' AND tbl_name IN (?,?,?)",
