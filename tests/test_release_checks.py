@@ -28,12 +28,20 @@ def test_required_workflow_context_remains_stable() -> None:
     assert "name" not in baseline
     assert baseline["runs-on"] == "${{ matrix.os }}"
     assert baseline["strategy"]["matrix"] == {"os": ["ubuntu-24.04"]}
-    assert baseline["steps"][1]["with"]["python-version"] == "3.13"
+    assert [
+        step["with"]["python-version"]
+        for step in baseline["steps"]
+        if "python-version" in step.get("with", {})
+    ] == ["3.13"]
 
     compatibility = jobs["python-311-compatibility"]
     assert compatibility["name"] == "Python 3.11 compatibility"
     assert compatibility["runs-on"] == "ubuntu-24.04"
-    assert compatibility["steps"][1]["with"]["python-version"] == "3.11"
+    assert [
+        step["with"]["python-version"]
+        for step in compatibility["steps"]
+        if "python-version" in step.get("with", {})
+    ] == ["3.11"]
 
     expected_gate_commands = ["ruff check .", "mypy src/determa", "pytest -q"]
     for job in (baseline, compatibility):

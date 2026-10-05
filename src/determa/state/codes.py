@@ -169,6 +169,14 @@ class PersistenceFailureCode(StrEnum):
     )
 
 
+class ProjectionFailureCode(StrEnum):
+    INVALID_PROJECTION_INPUT = "invalid_projection_input"
+    INVALID_PROJECTION_SELECTION = "invalid_projection_selection"
+    PROJECTION_NOT_LOSSLESS = "projection_not_lossless"
+    PROJECTION_TRANSACTION_UNAVAILABLE = "projection_transaction_unavailable"
+    UNSUPPORTED_PROJECTION_BOUNDARY = "unsupported_projection_boundary"
+
+
 _CATEGORY_TYPES: Mapping[str, type[StrEnum]] = MappingProxyType(
     {
         "checkpoint_artifact_failure": CheckpointArtifactFailureCode,
@@ -185,6 +193,7 @@ _CATEGORY_TYPES: Mapping[str, type[StrEnum]] = MappingProxyType(
         "inspection_reason": InspectionReasonCode,
         "machine_load_failure": MachineLoadFailureCode,
         "persistence_failure": PersistenceFailureCode,
+        "projection_failure": ProjectionFailureCode,
     }
 )
 
