@@ -14,12 +14,49 @@ import importlib.util
 import json
 import sys
 import types
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .extensions import ExtensionError, ExtensionRegistry
+
+
+def _runtime_bindings(
+    definition: Mapping[str, Any],
+) -> Iterator[tuple[str, Mapping[str, Any]]]:
+    """Visit only executable grammar slots; metadata and values remain inert."""
+
+    def actions(items: Any) -> Iterator[tuple[str, Mapping[str, Any]]]:
+        for action in items or []:
+            if "provider_actions" in action:
+                yield "actions", action["provider_actions"]
+
+    def transitions(value: Any) -> Iterator[tuple[str, Mapping[str, Any]]]:
+        for transition in value if isinstance(value, list) else [value]:
+            if not transition:
+                continue
+            guard = transition.get("guard")
+            if isinstance(guard, Mapping) and "provider" in guard:
+                yield "guard", guard["provider"]
+            yield from actions(transition.get("action"))
+
+    def state(value: Mapping[str, Any]) -> Iterator[tuple[str, Mapping[str, Any]]]:
+        yield from actions(value.get("entry"))
+        yield from actions(value.get("exit"))
+        yield from transitions(value.get("initial"))
+        yield from transitions(value.get("choice"))
+        for handler in (value.get("on_events") or {}).values():
+            yield from transitions(handler)
+        for child in (value.get("states") or {}).values():
+            yield from state(child)
+        for component in value.get("components") or []:
+            if "root" in component:
+                yield from state(component["root"])
+
+    for machine in definition.get("machines") or []:
+        yield from state(machine["root"])
+
 
 SourceIdentityVerifier = Callable[[Path, Any], bool]
 
@@ -1079,19 +1116,8 @@ class RuntimeProviderRegistry:
     def resolve_definition(self, definition: Mapping[str, Any]) -> None:
         """Preflight every executable slot, including unreachable declarations."""
 
-        def visit(value: Any) -> None:
-            if isinstance(value, dict):
-                if isinstance(value.get("guard"), dict) and "provider" in value["guard"]:
-                    self.resolve("guard", value["guard"]["provider"])
-                if "provider_actions" in value:
-                    self.resolve("actions", value["provider_actions"])
-                for child in value.values():
-                    visit(child)
-            elif isinstance(value, list):
-                for child in value:
-                    visit(child)
-
-        visit(definition)
+        for kind, binding in _runtime_bindings(definition):
+            self.resolve(kind, binding)
 
     def effective_capabilities(self, definition: Mapping[str, Any]) -> dict[str, bool]:
         """Compose verified provider guarantees for one complete definition."""
@@ -1105,18 +1131,6 @@ class RuntimeProviderRegistry:
         report = dict.fromkeys(names, True)
         report["external_io_capable"] = False
 
-        def visit(value: Any) -> None:
-            if isinstance(value, dict):
-                if isinstance(value.get("guard"), dict) and "provider" in value["guard"]:
-                    combine(self.resolve("guard", value["guard"]["provider"]).capabilities)
-                if "provider_actions" in value:
-                    combine(self.resolve("actions", value["provider_actions"]).capabilities)
-                for child in value.values():
-                    visit(child)
-            elif isinstance(value, list):
-                for child in value:
-                    visit(child)
-
         def combine(claims: Mapping[str, bool]) -> None:
             for name in names:
                 report[name] = report[name] and claims.get(name) is True
@@ -1124,7 +1138,8 @@ class RuntimeProviderRegistry:
                 report["external_io_capable"] or claims.get("external_io_capable") is True
             )
 
-        visit(definition)
+        for kind, binding in _runtime_bindings(definition):
+            combine(self.resolve(kind, binding).capabilities)
         return report
 
     def invoke_guard(self, binding: Mapping[str, Any], snapshot: Mapping[str, Any]) -> bool:

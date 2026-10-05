@@ -26,6 +26,7 @@ from determa.state import (
     RuntimeProviderError,
     RuntimeProviderRegistry,
     SourceClosure,
+    ValidationError,
     admit,
     compile_language_source,
     create,
@@ -112,19 +113,11 @@ def _installed(
     )
     descriptors: list[dict[str, Any]] = []
 
-    def scan(value: Any) -> None:
-        if type(value) is dict:
-            if type(value.get("guard")) is dict and "provider" in value["guard"]:
-                descriptors.append({"kind": "guard", "binding": value["guard"]["provider"]})
-            if "provider_actions" in value:
-                descriptors.append({"kind": "actions", "binding": value["provider_actions"]})
-            for child in value.values():
-                scan(child)
-        elif type(value) is list:
-            for child in value:
-                scan(child)
+    from determa.state.runtime_providers import _runtime_bindings
 
-    scan(bundle_document)
+    descriptors = [
+        {"kind": kind, "binding": binding} for kind, binding in _runtime_bindings(bundle_document)
+    ]
     names = (
         {"example.native-common", "example.guard-compiler"}
         if compiler
@@ -187,6 +180,8 @@ def _installed(
                         "invalid": bool(arguments.get("invalid_output", False)),
                         "fail": bool(arguments.get("action_fail", False)),
                         "external_io": bool(arguments.get("action_external_io", False)),
+                        **({"repeat_send": True} if arguments.get("repeat_send") else {}),
+                        **({"mixed_send": True} if arguments.get("mixed_send") else {}),
                     }
                 ),
             )
@@ -208,7 +203,11 @@ def _state(aggregate: dict[str, Any]) -> dict[str, Any]:
         item for item in aggregate["runtimes"] if item["runtime_id"] == aggregate["root_runtime_id"]
     )
     return {
-        "active_leaf": runtime["active_leaf_state_definition_pointers"][-1],
+        "active_leaf": (
+            runtime["active_leaf_state_definition_pointers"][-1]
+            if runtime["active_leaf_state_definition_pointers"]
+            else None
+        ),
         "status": runtime["status"],
         "variables": {
             item["variable_declaration_pointer"].split("/")[-1]: item["value"]
@@ -251,7 +250,14 @@ def _run_step(
     observation["stages"].append("admit")
     observation["state_before"] = _state(aggregate)
     observation["stages"].append("evaluate_cel")
-    result = step(aggregate, setup["target_runtime_id"], resolver)
+    result = step(
+        aggregate,
+        setup["target_runtime_id"],
+        resolver,
+        _include_host_evidence=bool(
+            request["arguments"].get("repeat_send") or request["arguments"].get("mixed_send")
+        ),
+    )
     _provider_counts(registry, observation)
     if observation["calls"]["guard"]:
         observation["stages"].append("evaluate_guard")
@@ -263,8 +269,12 @@ def _run_step(
         observation["result"] = "faulted"
         observation["code"] = result["fault"]["code"]
         observation["state_after"] = observation["state_before"]
-        if request["arguments"].get("invalid_output"):
+        if request["arguments"].get("invalid_output") or request["arguments"].get(
+            "destroyed_write"
+        ):
             observation["value"] = {"boundary_code": "runtime_provider_output_invalid"}
+            if request["arguments"].get("destroyed_write"):
+                observation["value"]["source_locator"] = result["fault"]["source_locator"]
         return
     observation["stages"].append("commit")
     observation["result"] = (
@@ -272,10 +282,68 @@ def _run_step(
     )
     observation["determa_state_committed"] = True
     observation["state_after"] = _state(result["state"])
-    observation["value"] = {
-        "accepted": observation["state_after"]["variables"]["accepted"],
-        "emissions": len(result["emissions"]),
-    }
+    observation["value"] = {"emissions": len(result["emissions"])}
+    if "accepted" in observation["state_after"]["variables"]:
+        observation["value"]["accepted"] = observation["state_after"]["variables"]["accepted"]
+    if observation["state_after"]["status"] == "completed":
+        observation["value"].update(
+            status="completed", exit_correlation=result["emissions"][-1]["correlation_id"]
+        )
+    if request["arguments"].get("repeat_send") or request["arguments"].get("mixed_send"):
+        observation["value"]["emission_identities"] = [
+            (
+                {
+                    "event_id": item["event_id"],
+                    "emission_index": item["emission_index"],
+                    "acceptance_sequence": item["acceptance_sequence"],
+                    "queue_sequence": item["queue_sequence"],
+                }
+                if "kind" in item
+                else {
+                    "effect_id": item["effect_id"],
+                    "sequence": item["sequence"],
+                    "emission_index": item["_determa_v1_emission_index"],
+                }
+            )
+            for item in result["emissions"]
+        ]
+
+    if request["arguments"].get("capture_snapshot"):
+        for active in registry._active.values():
+            for key in ("guard_snapshot", "action_snapshot"):
+                captured = getattr(active.provider, key, None)
+                if captured is not None:
+                    observation["value"][key] = captured
+
+
+def _run_create(
+    bundle: Any,
+    registry: RuntimeProviderRegistry,
+    request: dict[str, Any],
+    observation: dict[str, Any],
+) -> None:
+    creation = request["setup"]["create_request"]
+    result = create(
+        bundle,
+        creation["machine_id"],
+        creation["root_instance_id"],
+        creation["creation_id"],
+        creation["bindings"],
+    )
+    observation["stages"].append("create")
+    _provider_counts(registry, observation)
+    if observation["calls"]["actions"]:
+        observation["stages"].extend(("evaluate_actions", "validate_output"))
+    observation["state_after"] = _state(result["state"])
+    observation["result"] = result["status"]
+    observation["code"] = result["fault"]["code"] if result["fault"] else None
+    if result["fault"]:
+        observation["value"] = {
+            "boundary_code": "runtime_provider_output_invalid",
+            "source_locator": result["fault"]["source_locator"],
+            "emissions": len(result["emissions"]),
+            "status": result["status"],
+        }
 
 
 class _ConflictStore(MemoryExecutionStore):
@@ -356,17 +424,17 @@ def _run_host_commit(
     entry = runtime["ready_mailbox"][0]
     store.conflict = request["arguments"]["cas_conflict"]
     store.replace_attempts = 0
+    process_arguments = {
+        "expected_revision": checkpoint["revision"],
+        "expected_checkpoint_digest": checkpoint["execution_checkpoint_digest"],
+        "event_id": entry["envelope"]["event_id"],
+        "envelope_digest": entry["envelope_digest"],
+        "acceptance_sequence": entry["acceptance_sequence"],
+        "queue_sequence": entry["queue_sequence"],
+    }
     try:
-        host.process_ready_v1(
-            root_id,
-            setup["target_runtime_id"],
-            expected_revision=checkpoint["revision"],
-            expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
-            event_id=entry["envelope"]["event_id"],
-            envelope_digest=entry["envelope_digest"],
-            acceptance_sequence=entry["acceptance_sequence"],
-            queue_sequence=entry["queue_sequence"],
-        )
+        first = host.process_ready_v1(root_id, setup["target_runtime_id"], **process_arguments)
+
     except ExecutionHostError as exc:
         _provider_counts(registry, observation)
         if observation["calls"]["guard"]:
@@ -381,7 +449,58 @@ def _run_host_commit(
         after = host.read_checkpoint(root_id)
         assert after is not None and after.source_bytes == admitted.source_bytes
         return
-    raise AssertionError("expected one real store compare-and-swap conflict")
+    if request["arguments"]["cas_conflict"]:
+        raise AssertionError("expected one real store compare-and-swap conflict")
+    _provider_counts(registry, observation)
+    if observation["calls"]["guard"]:
+        observation["stages"].append("evaluate_guard")
+    if observation["calls"]["actions"]:
+        observation["stages"].extend(("evaluate_actions", "validate_output"))
+    observation["stages"].extend(("compare_and_swap", "commit"))
+    committed = host.read_checkpoint(root_id)
+    assert committed is not None and store.replace_attempts == 1
+    observation["state_after"] = _state(committed.document["root_record"]["aggregate_state"])
+    receipt = first["receipt"]
+    references = receipt["emission_references"]
+    intents = committed.document["pending_outbox_intents"]
+    observation["value"] = {
+        "accepted": observation["state_after"]["variables"]["accepted"],
+        "emissions": len(first["core_result"]["emissions"]),
+        "emission_identities": [
+            {
+                "effect_id": item["effect_id"],
+                "emission_index": next(
+                    reference["emission_index"]
+                    for reference in references
+                    if reference.get("effect_id") == item["effect_id"]
+                ),
+                "sequence": item["sequence"],
+            }
+            for item in first["core_result"]["emissions"]
+        ],
+        "checkpoint_revision": committed.document["revision"],
+        "retained_effect_references": copy.deepcopy(references),
+        "pending_outbox_entries": copy.deepcopy(intents),
+    }
+    providers_before = [
+        copy.deepcopy(active.provider.__dict__) for active in registry._active.values()
+    ]
+    replay = host.process_ready_v1(root_id, setup["target_runtime_id"], **process_arguments)
+    after_replay = host.read_checkpoint(root_id)
+    assert after_replay is not None
+    observation["value"].update(
+        replay_receipt_equal=replay == receipt,
+        replay_checkpoint_unchanged=after_replay.source_bytes == committed.source_bytes,
+        replay_provider_calls_unchanged=providers_before
+        == [active.provider.__dict__ for active in registry._active.values()],
+    )
+    observation["stages"].append("replay")
+    observation["result"] = (
+        "handled_now"
+        if receipt["outcome"]["disposition"] == "handled"
+        else receipt["outcome"]["disposition"]
+    )
+    observation["determa_state_committed"] = True
 
 
 def _run_inspect(
@@ -565,6 +684,8 @@ def execute(payload: dict[str, Any]) -> dict[str, Any]:
                 observation["result"] = "accepted"
             elif operation == "step":
                 _run_step(bundle, registry, request, observation)
+            elif operation == "create":
+                _run_create(bundle, registry, request, observation)
             elif operation == "host_commit":
                 _run_host_commit(bundle, registry, request, observation)
             elif operation == "inspect":
@@ -583,6 +704,12 @@ def execute(payload: dict[str, Any]) -> dict[str, Any]:
                     observation["effective_capabilities"] = _profile()
                 else:
                     _provider_counts(registry, observation)
+    except ValidationError as exc:
+        # Static validation precedes provider capability verification inside the loader.
+        if observation["stages"][-1:] == ["verify_capabilities"]:
+            observation["stages"].pop()
+        observation["stages"].append("load")
+        observation["code"] = exc.code
     except RuntimeProviderError as exc:
         observation["code"] = exc.code
     return {

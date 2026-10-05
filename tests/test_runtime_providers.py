@@ -409,13 +409,13 @@ def test_semantic_and_ordinary_guards_see_same_native_event(tmp_path: Path) -> N
         source_path.read_text()
         .replace(
             "self.ordinary_calls += 1\n        return True",
-            'self.ordinary_calls += 1\n        return "source" not in snapshot["event"] '
-            'and "cause_id" not in snapshot["event"]',
+            'self.ordinary_calls += 1\n        return snapshot["event"]["source"]["host"] is True '
+            'and snapshot["event"]["cause_id"] == snapshot["event"]["event_id"]',
         )
         .replace(
             "return True, 1, 2",
-            'return "source" not in snapshot["event"] '
-            'and "cause_id" not in snapshot["event"], 1, 2',
+            'return snapshot["event"]["source"]["host"] is True '
+            'and snapshot["event"]["cause_id"] == snapshot["event"]["event_id"], 1, 2',
         )
     )
     source_path.write_text(source)

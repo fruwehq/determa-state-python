@@ -245,7 +245,15 @@ def inspect_candidate(
                     from .runtime_providers import RuntimeProviderError, guard_snapshot
 
                     binding = guard["provider"]
-                    snapshot = guard_snapshot(activation, candidate, binding)
+                    snapshot = guard_snapshot(
+                        activation,
+                        {
+                            **candidate,
+                            "source": copy.deepcopy(envelope["source"]),
+                            "cause_id": envelope["cause_id"],
+                        },
+                        binding,
+                    )
                     try:
                         value, _charged, cost = runtime_providers.inspect_guard(
                             binding, snapshot, guard_count + 1, remaining
