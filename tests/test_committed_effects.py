@@ -157,6 +157,54 @@ def test_terminal_outcome_requires_immutable_attempt_evidence():
         validate_journal(read("pending-checkpoint.json"), seal_journal(journal))
 
 
+def test_other_trusted_root_incarnation_refuses_before_native_seed(tmp_path):
+    """An independently resolvable origin is not this checkpoint's root identity."""
+    from determa.state.wire import hash_value
+
+    checkpoint = read("pending-checkpoint.json")
+    journal = read("data/leased-journal.json")
+    original = load_bundle((CASE / "machine.yaml").read_text())
+    alternate = load_bundle(
+        (CASE / "machine.yaml")
+        .read_text()
+        .replace(
+            "namespace: conformance.committed_native_effects",
+            "namespace: conformance.other_trusted_definition",
+        )
+    )
+    resolver = MemoryArtifactResolver(
+        definitions={original.fingerprint: original, alternate.fingerprint: alternate}
+    )
+    record = journal["effect_records"][0]
+    origin = record["target"]["runtime_incarnation"]
+    definition = origin["definition"]
+    definition["validated_bundle_fingerprint"] = alternate.fingerprint
+    definition["machine"]["namespace"] = alternate.namespace
+    machine = definition["machine"]
+    record["target"]["runtime_id"] = hash_value(
+        [
+            "determa-root-runtime-identity-1",
+            "1",
+            alternate.fingerprint,
+            machine["namespace"],
+            machine["machine_id"],
+            machine["machine_version"],
+            checkpoint["root_instance_id"],
+        ]
+    )
+    journal = seal_journal(journal)
+    with pytest.raises(EffectError, match="invalid_effect_journal"):
+        validate_journal(checkpoint, journal, resolver)
+    host = SQLiteCommittedEffectHost(tmp_path / "invalid-seed.sqlite", resolver, {}, None)
+    host.setup_schema()
+    with pytest.raises(EffectError, match="invalid_effect_journal"):
+        host.seed(checkpoint, journal)
+    with host._connect() as connection:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM determa_committed_effects").fetchone()[0] == 0
+        )
+
+
 @pytest.mark.parametrize("field", ["digest", "attempt_fence"])
 def test_terminal_outcome_rejects_forged_evidence(field):
     journal = copy.deepcopy(read("data/outcome-recorded-journal.json"))
@@ -1537,6 +1585,8 @@ def test_native_producer_replay_retains_exact_kind_and_request_identity(tmp_path
 
 
 def test_portable_producer_identity_is_not_inferred_from_result_destination(tmp_path):
+    from determa.state.effects import _reconstruct_producer_response
+
     original, root, _, _ = host_fixture(tmp_path)
     checkpoint = read("pending-checkpoint.json")
     journal = read("data/unclaimed-journal.json")
@@ -1547,15 +1597,23 @@ def test_portable_producer_identity_is_not_inferred_from_result_destination(tmp_
         tmp_path / "different-target.sqlite", original.resolver, {}, None
     )
     host.setup_schema()
-    host.seed(checkpoint, seal_journal(journal))
-    arguments = {
-        "expected_revision": "stale",
-        "expected_digest": "stale",
-        "route_generation": "999",
+    journal = seal_journal(journal)
+    # This deliberately inconsistent destination must not become native work.
+    # The pure receipt reconstruction still identifies its producing operation
+    # from retained checkpoint evidence, rather than the result destination.
+    with pytest.raises(EffectError, match="invalid_effect_journal"):
+        host.seed(checkpoint, journal)
+    identity = {
+        "operation_kind": "produce",
+        "root_instance_id": root,
+        "target_runtime_id": source_runtime,
         "operation_token": record["operation_token"],
     }
-    assert host.produce(root, "produce-1", source_runtime, **arguments) == read(
-        "data/producer-response.json"
-    )
+    assert _reconstruct_producer_response(
+        checkpoint, journal, "produce-1", identity, original.resolver
+    ) == read("data/producer-response.json")
+    identity["target_runtime_id"] = record["target"]["runtime_id"]
     with pytest.raises(EffectError, match="replay_evidence_expired"):
-        host.produce(root, "produce-1", record["target"]["runtime_id"], **arguments)
+        _reconstruct_producer_response(
+            checkpoint, journal, "produce-1", identity, original.resolver
+        )

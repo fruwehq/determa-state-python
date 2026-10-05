@@ -190,6 +190,13 @@ def _pinned_result_target(
     machine = definition["machine"]
     identity = [machine["namespace"], machine["machine_id"], machine["machine_version"]]
     if origin["kind"] == "root":
+        root_record = checkpoint["root_record"]
+        aggregate = root_record.get("aggregate_state")
+        actual_root_runtime_id = (
+            aggregate["root_runtime_id"] if aggregate else root_record["root_runtime_id"]
+        )
+        if origin["root_instance_id"] != root or runtime_id != actual_root_runtime_id:
+            raise EffectError("invalid_effect_journal")
         expected_id = hash_value(
             [
                 "determa-root-runtime-identity-1",
@@ -308,6 +315,13 @@ def validate_journal(
         for item in checkpoint["pending_outbox_intents"] + checkpoint["terminal_outbox_records"]
     ] + [item["effect_id"] for item in checkpoint["outbox_effect_tombstones"]]
     for record in records:
+        # Validate every pinned incarnation before dispatch or native seeding,
+        # including nonterminal work. A self-consistent alternate trusted origin
+        # cannot replace the checkpoint's immutable root runtime identity.
+        try:
+            pinned_target = _pinned_result_target(checkpoint, record, resolver)
+        except (ArtifactError, KeyError, TypeError, ValueError) as exc:
+            raise EffectError("invalid_effect_journal") from exc
         intent = intents.get(record["effect_id"])
         tombstone = compact.get(record["effect_id"])
         if location_ids.count(record["effect_id"]) != 1 or record["intent_digest"] != (
@@ -373,7 +387,7 @@ def validate_journal(
                         record,
                         outcome["kind"],
                         outcome["payload"],
-                        _pinned_result_target(checkpoint, record, resolver),
+                        pinned_target,
                     )
                     receipt = record["admission_receipt"]
                     if (
