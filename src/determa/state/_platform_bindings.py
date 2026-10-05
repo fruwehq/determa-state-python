@@ -32,6 +32,10 @@ for _name in (
     "sysconfig",
     "threading",
     "typing",
+    # On Python 3.11 this installed compatibility dependency replaces typing's
+    # parameter collector. Initialize it before anchoring the runtime, rather
+    # than trusting a replacement first observed during provider verification.
+    "typing_extensions",
     "urllib.parse",
     "weakref",
 ):
@@ -71,6 +75,12 @@ class _PlatformBindings:
                 self._capture(item)
             for item in (value.__kwdefaults__ or {}).values():
                 self._capture(item)
+            pending = [value.__code__]
+            while pending:
+                code = pending.pop()
+                for name in code.co_names:
+                    self._capture(value.__globals__.get(name))
+                pending.extend(item for item in code.co_consts if type(item) is types.CodeType)
         elif isinstance(value, type):
             if value in self.classes:
                 return
