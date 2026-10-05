@@ -716,6 +716,48 @@ def _native_effect_journal(ledger: Mapping[str, Any], root: str) -> dict[str, An
     return latest
 
 
+def _native_effect_documents(ledger: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Only independently retained native-role bytes certify private call history."""
+    roots = ledger.get("native_effect_roots", [])
+    if (
+        not isinstance(roots, list)
+        or any(type(root) is not str for root in roots)
+        or len(set(roots)) != len(roots)
+    ):
+        raise EffectError("unauthorized_scope")
+    history = ledger.get("native_effect_document_bytes", [] if not roots else None)
+    if not isinstance(history, list):
+        raise EffectError("unauthorized_scope")
+    latest = {}
+    for source in history:
+        if type(source) is not str:
+            raise EffectError("unauthorized_scope")
+        try:
+            value = json.loads(source)
+            if not isinstance(value, dict) or canonical_bytes(value).decode() != source:
+                raise ValueError("invalid native participant bytes")
+            if value["journal"]["scope_identity"] != ledger["scope_identity"]:
+                raise ValueError("wrong native scope")
+            if not isinstance(value["invocation_starts"], dict):
+                raise ValueError("missing private start inventory")
+            root = value["checkpoint"]["root_instance_id"]
+            if type(root) is not str or value["journal"]["root_instance_id"] != root:
+                raise ValueError("wrong native root")
+            latest[root] = value
+        except (ValueError, TypeError, KeyError) as error:
+            raise EffectError("unauthorized_scope") from error
+    if set(latest) != set(roots):
+        raise EffectError("unauthorized_scope")
+    return latest
+
+
+def _native_effect_document(ledger: Mapping[str, Any], root: str) -> dict[str, Any]:
+    latest = _native_effect_documents(ledger).get(root)
+    if latest is None:
+        raise EffectError("unauthorized_scope")
+    return latest
+
+
 def _validate_authority_pair(ledger: Mapping[str, Any], document: Mapping[str, Any]) -> None:
     """Check the old native pair before any journal transition can be staged."""
     from .authority import _native_checkpoint_history
@@ -771,6 +813,8 @@ def _validate_authority_pair(ledger: Mapping[str, Any], document: Mapping[str, A
         elif live is not None:
             raise EffectError("stale_attempt_fence")
     if journal != _native_effect_journal(ledger, journal["root_instance_id"]):
+        raise EffectError("unauthorized_scope")
+    if document != _native_effect_document(ledger, journal["root_instance_id"]):
         raise EffectError("unauthorized_scope")
 
 
@@ -985,6 +1029,7 @@ class SQLiteCommittedEffectHost:
             "result_responses": {},
             "cancel_requests": {},
             "producer_requests": {},
+            "invocation_starts": {},
         }
         if claim is not None:
             document["claims"][claim["work_identity"]] = copy.deepcopy(dict(claim))
@@ -1016,6 +1061,18 @@ class SQLiteCommittedEffectHost:
                     "native_effect_roots", []
                 ) and journal != _native_effect_journal(ledger, checkpoint["root_instance_id"]):
                     raise EffectError("unauthorized_scope")
+                if checkpoint["root_instance_id"] in ledger.get("native_effect_roots", []):
+                    retained = _native_effect_document(ledger, checkpoint["root_instance_id"])
+                    # Portable equality never restores private call permission.
+                    # Existing starts require explicit native recovery, not seed.
+                    if retained["invocation_starts"] or retained["checkpoint"] != checkpoint:
+                        raise EffectError("unauthorized_scope")
+                    if (
+                        claim is not None
+                        and retained["claims"].get(claim["work_identity"]) != claim
+                    ):
+                        raise EffectError("stale_attempt_fence")
+                    document = copy.deepcopy(retained)
                 # Restoring an already claimed invocation cannot mint authority.
                 # Its exact claim must already have been issued by this ledger.
                 if claim is not None and (
@@ -1068,6 +1125,10 @@ class SQLiteCommittedEffectHost:
                         raise EffectError("stale_attempt_fence")
                 self._mirror_authority(ledger, document)
                 connection.execute(
+                    "UPDATE determa_committed_effects SET document=? WHERE root_instance_id=?",
+                    (canonical_bytes(document), checkpoint["root_instance_id"]),
+                )
+                connection.execute(
                     "UPDATE determa_scope_authority SET ledger = ? WHERE scope_identity = ?",
                     (
                         json.dumps(ledger, sort_keys=True, separators=(",", ":")),
@@ -1081,8 +1142,12 @@ class SQLiteCommittedEffectHost:
         ledger: dict[str, Any], document: dict[str, Any], *, advance_generation: bool = True
     ) -> None:
         """Mirror effect fences and exact committed bytes in the colocated authority ledger."""
+        _native_effect_documents(ledger)
         native_roots = ledger.setdefault("native_effect_roots", [])
         root = document["checkpoint"]["root_instance_id"]
+        fresh = root not in native_roots
+        if not fresh:
+            _native_effect_document(ledger, root)
         if root not in native_roots:
             native_roots.append(root)
         records = document["journal"]["effect_records"]
@@ -1142,6 +1207,9 @@ class SQLiteCommittedEffectHost:
         # guarded_commit payload that happens to resemble a journal.
         ledger.setdefault("native_effect_journal_bytes", []).append(
             canonical_bytes(document["journal"]).decode()
+        )
+        ledger.setdefault("native_effect_document_bytes", []).append(
+            canonical_bytes(document).decode()
         )
         if advance_generation:
             ledger["scope_generation"] = str(int(ledger["scope_generation"]) + 1)
@@ -1212,6 +1280,12 @@ class SQLiteCommittedEffectHost:
                 ):
                     raise EffectError("stale_scope_authority")
                 _validate_authority_pair(ledger, document)
+                from .authority import _native_checkpoints
+
+                try:
+                    _native_checkpoints(connection, ledger)
+                except (ValueError, TypeError, KeyError, sqlite3.Error) as error:
+                    raise EffectError("unauthorized_scope") from error
                 if worker_guard is not None:
                     effect_id, principal, fence, trusted_now = worker_guard
                     journal_record = _record(document["journal"], effect_id)
@@ -1630,27 +1704,20 @@ class SQLiteCommittedEffectHost:
                     record["attempt_fence"],
                 ]
             )
-            journal = document["journal"]
-            if identifier in document["responses"] or any(
-                reference["operation_id"] == identifier
-                for reference in journal["operation_response_references"]
-            ):
+            starts = document["invocation_starts"]
+            if identifier in starts:
                 raise EffectError("native_invocation_already_started")
-            response = {
-                "kind": "effect_invocation_start",
-                "body": {"claim": copy.deepcopy(document["claims"][effect_id])},
+            intent = next(
+                item["intent"]
+                for item in document["checkpoint"]["pending_outbox_intents"]
+                + document["checkpoint"]["terminal_outbox_records"]
+                if item["intent"]["effect_id"] == effect_id
+            )
+            starts[identifier] = {
+                "claim": copy.deepcopy(document["claims"][effect_id]),
+                "intent": copy.deepcopy(intent),
+                "effect_record": copy.deepcopy(record),
             }
-            document["responses"][identifier] = response
-            journal["operation_response_references"].append(
-                {
-                    "operation_id": identifier,
-                    "response_digest": hash_value(["determa-host-operation-response-1", response]),
-                }
-            )
-            journal["operation_response_references"].sort(
-                key=lambda reference: reference["operation_id"]
-            )
-            _bump(journal)
             return identifier
 
         # Only this successful new native commit reaches the call phase. A saved
@@ -1665,24 +1732,10 @@ class SQLiteCommittedEffectHost:
 
         def call(document: dict[str, Any]) -> Mapping[str, Any]:
             record = _record(document["journal"], effect_id)
-            response = document["responses"].get(start_id)
-            reference = next(
-                (
-                    item
-                    for item in document["journal"]["operation_response_references"]
-                    if item["operation_id"] == start_id
-                ),
-                None,
-            )
-            if (
-                response
-                != {
-                    "kind": "effect_invocation_start",
-                    "body": {"claim": document["claims"].get(effect_id)},
-                }
-                or reference is None
-                or reference["response_digest"]
-                != hash_value(["determa-host-operation-response-1", response])
+            retained_start = document["invocation_starts"].get(start_id)
+            if not isinstance(retained_start, dict) or (
+                retained_start.get("claim") != document["claims"].get(effect_id)
+                or retained_start.get("effect_record") != record
             ):
                 raise EffectError("invalid_effect_journal")
             if record["invocation_state"] != "leased":
@@ -1712,6 +1765,8 @@ class SQLiteCommittedEffectHost:
                 )
                 if item["intent"]["effect_id"] == effect_id
             )
+            if retained_start.get("intent") != intent:
+                raise EffectError("invalid_effect_journal")
             metadata = {
                 "scope_identity": scope,
                 "effect_id": effect_id,

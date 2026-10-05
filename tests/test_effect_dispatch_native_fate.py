@@ -50,10 +50,7 @@ def _dispatch_worker(directory, cut, control):
                         0
                     ]
                 )
-            if any(
-                response.get("kind") == "effect_invocation_start"
-                for response in document["responses"].values()
-            ):
+            if document["invocation_starts"]:
                 control.send(information)
                 time.sleep(60)
         return "healthy"
@@ -176,16 +173,10 @@ def test_sigkill_native_dispatch_never_repeats_uncertain_provider_call(tmp_path,
         )
     assert host.snapshot(information["root"]) == before
     assert calls == []
-    assert (
-        len(
-            [
-                reply
-                for reply in before["responses"].values()
-                if reply.get("kind") == "effect_invocation_start"
-            ]
-        )
-        == 1
-    )
+    assert len(before["invocation_starts"]) == 1
+    start = next(iter(before["invocation_starts"].values()))
+    assert start["claim"] == information["claim"]
+    assert start["effect_record"]["effect_id"] == information["effect_id"]
     assert record["invocation_state"] == (
         "result_admitted"
         if cut == "admission"

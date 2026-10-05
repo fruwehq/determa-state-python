@@ -313,18 +313,27 @@ def _native_checkpoints(
                 "ORDER BY root_instance_id"
             )
         )
+    from .effects import _native_effect_documents, validate_journal
+
+    native_documents = _native_effect_documents(ledger)
+    if native_documents and "determa_committed_effects" not in tables:
+        raise ValueError("native effect participant table missing")
     if "determa_committed_effects" in tables:
-        from .effects import validate_journal
         from .wire import canonical_bytes
 
-        for root, payload in connection.execute(
+        native_rows = connection.execute(
             "SELECT root_instance_id, document FROM determa_committed_effects "
             "ORDER BY root_instance_id"
-        ):
+        ).fetchall()
+        if {root for root, _payload in native_rows} != set(native_documents):
+            raise ValueError("native effect participant inventory differs")
+        for root, payload in native_rows:
             native = _parse(bytes(payload).decode("utf-8", "strict"))
             validate_journal(native["checkpoint"], native["journal"])
             if native["journal"]["scope_identity"] != ledger["scope_identity"]:
                 raise ValueError("untracked native effect scope")
+            if native != native_documents[root]:
+                raise ValueError("native effect private history differs")
             for record in native["journal"]["effect_records"]:
                 if {
                     "work_identity": record["effect_id"],
@@ -1049,6 +1058,13 @@ class SQLiteLocalAuthority:
                 and invocation["authenticated_principal"] != ledger["owner_principal"]
             ):
                 return _compact(_result(request, ledger, "stale_scope_authority"))
+            # A new mutation cannot certify a scope around a missing private
+            # native participant. Historical receipt replay above grants no rights.
+            if ledger.get("native_effect_roots") or ledger.get("native_effect_document_bytes"):
+                try:
+                    _native_checkpoints(connection, ledger)
+                except (ValueError, TypeError, KeyError, sqlite3.Error):
+                    return _compact(_result(request, ledger, "scope_fence_unproven"))
             new_claim = None
             if operation == "fence_worker":
                 arguments = request["arguments"]

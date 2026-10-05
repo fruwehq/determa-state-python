@@ -976,10 +976,9 @@ def test_dispatch_crossing_lease_expiry_preserves_unresolved_work_for_recovery(t
     after = host.snapshot(root)
     assert after["checkpoint"] == before["checkpoint"]
     assert after["journal"]["effect_records"] == before["journal"]["effect_records"]
-    assert (
-        int(after["journal"]["journal_revision"]) == int(before["journal"]["journal_revision"]) + 1
-    )
-    assert len(after["responses"]) == len(before["responses"]) + 1
+    assert after["journal"] == before["journal"]
+    assert after["responses"] == before["responses"]
+    assert len(after["invocation_starts"]) == 1
     current_time[0] = "0"
     with pytest.raises(EffectError, match="native_invocation_already_started"):
         host.dispatch(root, request["effect_id"], credential="test-credential", **context)
@@ -1847,10 +1846,7 @@ def test_dispatch_clock_is_rechecked_after_provider_verification_before_io(tmp_p
             document = json.loads(
                 connection.execute("SELECT document FROM determa_committed_effects").fetchone()[0]
             )
-        if any(
-            response.get("kind") == "effect_invocation_start"
-            for response in document["responses"].values()
-        ):
+        if document["invocation_starts"]:
             current_time[0] = expiry
         return "healthy"
 
@@ -1863,7 +1859,7 @@ def test_dispatch_clock_is_rechecked_after_provider_verification_before_io(tmp_p
     after = host.snapshot(root)
     assert after["checkpoint"] == before["checkpoint"]
     assert after["journal"]["effect_records"] == before["journal"]["effect_records"]
-    assert len(after["responses"]) == 1
+    assert len(after["invocation_starts"]) == 1
     assert calls == []
 
 
@@ -2012,4 +2008,55 @@ def test_native_authority_seed_cannot_erase_a_committed_dispatch_start(tmp_path)
     with pytest.raises(EffectError, match="unauthorized_scope"):
         host.seed(before["checkpoint"], before["journal"], claim)
     assert authority.inspect(scope) == ledger
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("damage", ["erase_start", "older_document", "missing_native_history"])
+def test_private_dispatch_start_loss_cannot_be_blessed_by_dispatch_or_authority(tmp_path, damage):
+    import sqlite3
+
+    authority, host, scope, root, record = authority_effect_fixture(tmp_path)
+    command, invocation = authority_claim_request(authority, scope, root, record)
+    claim = json.loads(authority.perform(command, invocation))["claim"]
+    host.route.update(
+        {key: record[key] for key in ("handler_reference", "destination_binding_digest")}
+    )
+    host.trusted_clock = lambda: "0"
+    calls = []
+    host = installed_test_handler(host, lambda *args: calls.append(args) or {"accepted": True})
+    context = {
+        "principal": claim["worker_principal"],
+        "scope": scope,
+        "epoch": "0",
+        "trusted_now": "0",
+    }
+    before = host.snapshot(root)
+    host.dispatch(root, record["effect_id"], credential="test-credential", **context)
+    after = host.snapshot(root)
+    assert after["checkpoint"] == before["checkpoint"]
+    assert after["journal"] == before["journal"]
+    assert after["responses"] == before["responses"]
+    assert len(after["invocation_starts"]) == 1
+    fresh_command, fresh_invocation = authority_claim_request(
+        authority, scope, root, record, operation="after-private-start", expected="1"
+    )
+    with sqlite3.connect(host.path) as connection:
+        if damage == "missing_native_history":
+            ledger = json.loads(
+                connection.execute("SELECT ledger FROM determa_scope_authority").fetchone()[0]
+            )
+            del ledger["native_effect_document_bytes"]
+            connection.execute("UPDATE determa_scope_authority SET ledger=?", (json.dumps(ledger),))
+        else:
+            corrupted = copy.deepcopy(after if damage == "erase_start" else before)
+            corrupted["invocation_starts"] = {}
+            connection.execute(
+                "UPDATE determa_committed_effects SET document=?", (json.dumps(corrupted).encode(),)
+            )
+    with pytest.raises(EffectError, match="unauthorized_scope"):
+        host.dispatch(root, record["effect_id"], credential="test-credential", **context)
+    # The authority's generic mutation validation must not certify the corrupt
+    # private inventory by mirroring it into a new trusted native history entry.
+    assert json.loads(authority.perform(command, invocation))["claim"] == claim
+    assert json.loads(authority.perform(fresh_command, fresh_invocation))["status"] == "rejected"
     assert len(calls) == 1
