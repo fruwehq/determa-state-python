@@ -33,6 +33,29 @@ _TABLE = (
     "CREATE TABLE determa_timer_helpers "
     "(scope_identity TEXT PRIMARY KEY NOT NULL, document BLOB NOT NULL)"
 )
+_ORIGIN_TABLE = (
+    "CREATE TABLE determa_timer_origin "
+    "(singleton INTEGER PRIMARY KEY NOT NULL CHECK(singleton=1), configuration BLOB NOT NULL)"
+)
+_COMMIT_TABLE = (
+    "CREATE TABLE determa_timer_commits "
+    "(scope_identity TEXT NOT NULL, sequence INTEGER NOT NULL, operation_id TEXT NOT NULL, "
+    "journal BLOB NOT NULL, PRIMARY KEY(scope_identity, sequence), "
+    "UNIQUE(scope_identity, operation_id))"
+)
+_NATIVE_TABLES = {
+    "determa_timer_helpers": _TABLE,
+    "determa_timer_origin": _ORIGIN_TABLE,
+    "determa_timer_commits": _COMMIT_TABLE,
+}
+_NATIVE_TRIGGERS = {
+    f"{table}_forbid_{operation.lower()}": (
+        f"CREATE TRIGGER {table}_forbid_{operation.lower()} BEFORE {operation} ON {table} "
+        "BEGIN SELECT RAISE(ABORT, 'timer_native_evidence_immutable'); END"
+    )
+    for table in ("determa_timer_origin", "determa_timer_commits")
+    for operation in ("UPDATE", "DELETE")
+}
 _IDENTITIES = (
     "operation",
     "operation_id",
@@ -200,23 +223,78 @@ class SQLiteTimerHelper:
 
     def setup_schema(self) -> None:
         with closing(self._connect()) as connection:
-            connection.execute(_TABLE.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1))
-        self.validate_schema()
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                existing = connection.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'determa_timer_%'"
+                ).fetchone()[0]
+                if existing:
+                    # Never reconstruct origin or retained evidence around prior records.
+                    self._schema(connection)
+                else:
+                    for statement in (*_NATIVE_TABLES.values(), *_NATIVE_TRIGGERS.values()):
+                        connection.execute(statement)
+                    connection.execute(
+                        "INSERT INTO determa_timer_origin VALUES (1,?)",
+                        (canonical_bytes(self._configuration()),),
+                    )
+                    self._schema(connection)
+                connection.commit()
+            finally:
+                connection.rollback()
+
+    def _configuration(self) -> dict[str, Any]:
+        return {
+            "native_timer_configuration_version": 1,
+            "storage_path": self.path,
+            "scope_identity": self.scope_identity,
+            "root_instance_id": self.root_instance_id,
+            "root_runtime_id": self.root_runtime_id,
+            "validated_bundle_fingerprint": self.bundle.fingerprint,
+            "principals": sorted(self.principals),
+            "worker_principals": sorted(self.worker_principals),
+            "claim_lease_nanoseconds": str(self.claim_lease_nanoseconds),
+            "admission_strategy": "coordinated_sqlite"
+            if self.coordinated_host is not None
+            else "records_only",
+        }
 
     def _schema(self, connection: sqlite3.Connection | SQLiteApplicationTransaction) -> None:
         rows = _execute(
             connection,
-            "SELECT type,sql FROM sqlite_master "
-            "WHERE tbl_name='determa_timer_helpers' ORDER BY type",
+            "SELECT name,type,sql FROM sqlite_master WHERE tbl_name IN "
+            "('determa_timer_helpers','determa_timer_origin','determa_timer_commits') "
+            "OR name LIKE 'determa_timer_%' ORDER BY name",
         ).fetchall()
-        if rows != [("index", None), ("table", _TABLE)] or _execute(
-            connection, "PRAGMA integrity_check"
-        ).fetchone() != ("ok",):
+        actual = {name: (kind, sql) for name, kind, sql in rows if sql is not None}
+        expected = {
+            **{name: ("table", sql) for name, sql in _NATIVE_TABLES.items()},
+            **{name: ("trigger", sql) for name, sql in _NATIVE_TRIGGERS.items()},
+        }
+        if (
+            actual != expected
+            or len(rows) != 10
+            or _execute(connection, "PRAGMA integrity_check").fetchone() != ("ok",)
+        ):
             raise TimerError("timer_capability_mismatch")
+        origin = _execute(connection, "SELECT configuration FROM determa_timer_origin").fetchall()
+        if origin != [(canonical_bytes(self._configuration()),)]:
+            raise TimerError("timer_capability_mismatch")
+        for table in ("determa_timer_helpers", "determa_timer_commits"):
+            if _execute(
+                connection,
+                f"SELECT COUNT(*) FROM {table} WHERE scope_identity!=?",
+                (self.scope_identity,),
+            ).fetchone() != (0,):
+                raise TimerError("timer_capability_mismatch")
 
     def validate_schema(self) -> None:
         with closing(self._connect()) as connection:
-            self._schema(connection)
+            connection.execute("BEGIN")
+            try:
+                self._schema(connection)
+            finally:
+                connection.rollback()
 
     def _load(
         self, connection: sqlite3.Connection | SQLiteApplicationTransaction
@@ -227,7 +305,7 @@ class SQLiteTimerHelper:
             (self.scope_identity,),
         ).fetchone()
         if row is None:
-            return seal_timer_records(
+            artifact = seal_timer_records(
                 {
                     "timer_artifact_format": "determa.timer_records",
                     "timer_artifact_schema_version": 1,
@@ -235,13 +313,14 @@ class SQLiteTimerHelper:
                     "operation_receipts": [],
                 }
             )
-        try:
-            parsed, raw = strict_json(bytes(row[0]))
-            if not isinstance(parsed, dict) or raw != canonical_bytes(parsed):
-                raise TimerError("timer_capability_mismatch")
-            artifact: dict[str, Any] = parsed
-        except (ArtifactError, TypeError, ValueError) as error:
-            raise TimerError("timer_capability_mismatch") from error
+        else:
+            try:
+                parsed, raw = strict_json(bytes(row[0]))
+                if not isinstance(parsed, dict) or raw != canonical_bytes(parsed):
+                    raise TimerError("timer_capability_mismatch")
+                artifact = parsed
+            except (ArtifactError, TypeError, ValueError) as error:
+                raise TimerError("timer_capability_mismatch") from error
         if (
             not _validator("timer-record-v1.schema.json").is_valid(artifact)
             or seal_timer_records(artifact) != artifact
@@ -249,12 +328,105 @@ class SQLiteTimerHelper:
             raise TimerError("timer_capability_mismatch")
         if any(record["scope_identity"] != self.scope_identity for record in artifact["records"]):
             raise TimerError("timer_capability_mismatch")
+        self._history(connection, artifact)
         return artifact
+
+    def _history(
+        self,
+        connection: sqlite3.Connection | SQLiteApplicationTransaction,
+        artifact: dict[str, Any],
+    ) -> None:
+        rows = _execute(
+            connection,
+            "SELECT sequence,operation_id,journal FROM determa_timer_commits "
+            "WHERE scope_identity=? ORDER BY sequence",
+            (self.scope_identity,),
+        ).fetchall()
+        if len(rows) != len(artifact["operation_receipts"]):
+            raise TimerError("timer_capability_mismatch")
+        if not rows and artifact["records"]:
+            raise TimerError("timer_capability_mismatch")
+        last_digest = None
+        for sequence, (native_sequence, operation_id, raw) in enumerate(rows, start=1):
+            try:
+                journal, original = strict_json(bytes(raw))
+                if (
+                    native_sequence != sequence
+                    or not isinstance(journal, dict)
+                    or original != canonical_bytes(journal)
+                    or set(journal) != {"request", "result", "timer_artifact_digest"}
+                ):
+                    raise TimerError("timer_capability_mismatch")
+                request = journal["request"]
+                result = journal["result"]
+                receipt = artifact["operation_receipts"][sequence - 1]
+                if (
+                    not _validator("timer-helper-operation-v1.schema.json", "request").is_valid(
+                        request
+                    )
+                    or request["request_digest"] != timer_request_digest(request)
+                    or request["operation_id"] != operation_id
+                    or request["scope_identity"] != self.scope_identity
+                    or request["root_instance_id"] != self.root_instance_id
+                    or request["root_runtime_id"] != self.root_runtime_id
+                    or result["status"] != "accepted"
+                    or any(result[key] != request[key] for key in _IDENTITIES)
+                    or result["result_digest"]
+                    != hash_value(
+                        [
+                            "determa-timer-result-1",
+                            request["request_digest"],
+                            {key: value for key, value in result.items() if key != "result_digest"},
+                        ]
+                    )
+                    or receipt
+                    != {
+                        "operation_id": operation_id,
+                        "request_digest": request["request_digest"],
+                        "result": result,
+                    }
+                ):
+                    raise TimerError("timer_capability_mismatch")
+                last_digest = journal["timer_artifact_digest"]
+            except (ArtifactError, TypeError, ValueError, KeyError) as error:
+                raise TimerError("timer_capability_mismatch") from error
+        if last_digest is not None and last_digest != artifact["timer_artifact_digest"]:
+            raise TimerError("timer_capability_mismatch")
+
+    def _record_commit(
+        self,
+        connection: sqlite3.Connection | SQLiteApplicationTransaction,
+        request: Mapping[str, Any],
+        result: dict[str, Any],
+        artifact: dict[str, Any],
+    ) -> None:
+        self._persist(connection, artifact)
+        sealed = seal_timer_records(artifact)
+        _execute(
+            connection,
+            "INSERT INTO determa_timer_commits VALUES (?,?,?,?)",
+            (
+                self.scope_identity,
+                len(artifact["operation_receipts"]),
+                request["operation_id"],
+                canonical_bytes(
+                    {
+                        "request": request,
+                        "result": result,
+                        "timer_artifact_digest": sealed["timer_artifact_digest"],
+                    }
+                ),
+            ),
+        )
 
     def snapshot(self) -> dict[str, Any]:
         with closing(self._connect()) as connection:
-            self._schema(connection)
-            return self._load(connection)
+            connection.execute("BEGIN")
+            try:
+                self._schema(connection)
+                return self._load(connection)
+            finally:
+                connection.rollback()
 
     def _persist(
         self,
@@ -437,7 +609,7 @@ class SQLiteTimerHelper:
                         "result": result,
                     }
                 )
-                self._persist(sql, artifact)
+                self._record_commit(sql, request, result, artifact)
 
                 def check_lease() -> None:
                     try:
@@ -501,8 +673,8 @@ class SQLiteTimerHelper:
         record = None
         connection = self._connect()
         try:
-            self._schema(connection)
             connection.execute("BEGIN IMMEDIATE")
+            self._schema(connection)
             artifact = self._load(connection)
             record = next(
                 (
@@ -635,7 +807,7 @@ class SQLiteTimerHelper:
                     "result": result,
                 }
             )
-            self._persist(connection, artifact)
+            self._record_commit(connection, request, result, artifact)
             connection.commit()
             return result
         except TimerError as error:

@@ -7,9 +7,87 @@ from pathlib import Path
 import pytest
 
 from determa.state import load_bundle
-from determa.state.timers import SQLiteTimerHelper, timer_request_digest
+from determa.state.timers import (
+    SQLiteTimerHelper,
+    TimerError,
+    seal_timer_records,
+    timer_request_digest,
+)
 
 _ROOT_RUNTIME = "sha256:9b0e3238e782cb7d912febc1acc4e4c03a121d201764d0bc9658b969feac4dc8"
+
+
+@pytest.mark.parametrize("damage", ["record", "receipt", "unretained_record"])
+def test_resealed_portable_records_do_not_replace_retained_native_evidence(tmp_path, damage):
+    import sqlite3
+
+    from determa.state.wire import canonical_bytes
+
+    installed = helper(tmp_path / "native-evidence.sqlite", lambda: "100")
+    installed.setup_schema()
+    assert installed.execute(request(), principal="operator")["status"] == "accepted"
+    artifact = installed.snapshot()
+    if damage == "record":
+        artifact["records"][0]["deadline_at"] = "999"
+    elif damage == "receipt":
+        artifact["operation_receipts"][0]["result"]["record_revision"] = "999"
+    else:
+        artifact["operation_receipts"] = []
+    with sqlite3.connect(installed.path) as connection:
+        connection.execute(
+            "UPDATE determa_timer_helpers SET document=?",
+            (canonical_bytes(seal_timer_records(artifact)),),
+        )
+    result = installed.execute(request("read_timer", "read-A", {}), principal="operator")
+    assert result["error_code"] == "timer_capability_mismatch"
+
+
+def test_native_origin_is_storage_bound_and_setup_cannot_repair_missing_evidence(tmp_path):
+    import sqlite3
+
+    original = helper(tmp_path / "original.sqlite", lambda: "100")
+    original.setup_schema()
+    original.execute(request(), principal="operator")
+    before = original.snapshot()
+    copied_path = tmp_path / "copied.sqlite"
+    with sqlite3.connect(original.path) as source, sqlite3.connect(copied_path) as copied:
+        source.backup(copied)
+    inert = helper(copied_path, lambda: "100")
+    with pytest.raises(TimerError, match="timer_capability_mismatch"):
+        inert.snapshot()
+    with sqlite3.connect(copied_path) as connection:
+        connection.execute("DROP TABLE determa_timer_origin")
+        recorded = connection.execute("SELECT document FROM determa_timer_helpers").fetchall()
+    with pytest.raises(TimerError, match="timer_capability_mismatch"):
+        inert.setup_schema()
+    with sqlite3.connect(copied_path) as connection:
+        assert connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='determa_timer_origin'"
+        ).fetchone() == (0,)
+        assert (
+            connection.execute("SELECT document FROM determa_timer_helpers").fetchall() == recorded
+        )
+    assert original.snapshot() == before
+
+
+def test_native_operation_history_is_immutable_and_configuration_changes_fail_closed(tmp_path):
+    import sqlite3
+
+    installed = helper(tmp_path / "configuration.sqlite", lambda: "100")
+    installed.setup_schema()
+    installed.execute(request(), principal="operator")
+    with sqlite3.connect(installed.path) as connection:
+        for statement in (
+            "DELETE FROM determa_timer_commits",
+            "UPDATE determa_timer_commits SET operation_id='changed'",
+            "DELETE FROM determa_timer_origin",
+            "UPDATE determa_timer_origin SET configuration=X'00'",
+        ):
+            with pytest.raises(sqlite3.IntegrityError, match="timer_native_evidence_immutable"):
+                connection.execute(statement)
+    installed.claim_lease_nanoseconds += 1
+    result = installed.execute(request("read_timer", "read-A", {}), principal="operator")
+    assert result["error_code"] == "timer_capability_mismatch"
 
 
 def bundle():
