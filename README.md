@@ -310,6 +310,46 @@ determa-state validate examples/format-1.yaml
 
 It prints the normalized bundle fingerprint on success.
 
+## Optional local scope authority
+
+`SQLiteLocalAuthority` is an opt-in reference authority for one persistent SQLite
+database. It allocates a permanent scope marker, serializes guarded commits and
+freezes under the same SQLite write transaction, retains exact operation receipts,
+and records a frozen inventory of its trusted local scope data. Call
+`setup_schema()` explicitly before allocating a scope. The host supplies the
+authenticated invocation context and proposed native mutation bytes; applications
+must not treat a scope identity or a portable archive as authority credentials.
+
+For checkpoint hosting, use the bundled public extension registry to configure
+the authority and execution store as one instance, then pass the returned store
+to `ExecutionHost`. Its root transactions check
+the current scope owner, epoch and active state, and commit the actual checkpoint,
+authority generation and receipt through one SQLite transaction. Set up both
+schemas explicitly and allocate the root before creating its checkpoint:
+
+```python
+authority = ds.SQLiteLocalAuthority("scope.db")
+authority.setup_schema()
+authority.allocate("scope-42", "owner-1", roots=("root-7",))
+registry = ds.bundled_extension_registry()
+configured, authority, store = ds.configure_bundled_sqlite_authority(
+    registry, authority.path, "scope-42", "owner-1", "0"
+)
+store.setup_schema()
+report = authority.profile_report("scope-42", "owner-1", store, registry, configured)
+host = ds.ExecutionHost(store, resolver)
+```
+
+The configured report is checked against the loaded provider source, current
+health and the same store instance used by the host. Recheck it before relying on
+the guarded profile. A frozen scope retains fencing and inventory claims while
+checkpoint writes remain refused.
+
+The reference boundary does not issue worker claims or retirement grants and
+reports `worker_fencing: false` and `safe_relocation: false`. A copied database,
+new endpoint, or timeout cannot activate another owner. The pure in-memory API
+needs no scope authority.
+
 ## Develop
 
 ```sh

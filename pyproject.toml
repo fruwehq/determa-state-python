@@ -73,6 +73,8 @@ packages = ["src/determa"]
 "src/determa/state/data/extension-capability-report-v1.schema.json" = "determa/state/data/extension-capability-report-v1.schema.json"
 "src/determa/state/data/extension-capability-requirement-v1.schema.json" = "determa/state/data/extension-capability-requirement-v1.schema.json"
 "src/determa/state/data/inspection-v1.schema.json" = "determa/state/data/inspection-v1.schema.json"
+"src/determa/state/data/host-authority-operation-v1.schema.json" = "determa/state/data/host-authority-operation-v1.schema.json"
+"src/determa/state/data/host-authority-profile-report-v1.schema.json" = "determa/state/data/host-authority-profile-report-v1.schema.json"
 
 [tool.ruff]
 line-length = 100
