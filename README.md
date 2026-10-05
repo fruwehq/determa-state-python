@@ -25,6 +25,16 @@ and terminal replay. The optional public extension registry validates exact prov
 references, loaded source closure, configured health, and currently proved claims
 before evaluating a requested profile.
 
+`ApplicationProjectionFacade` binds explicitly selected application rows to one
+root. Supply an `ApplicationRowMapping` that reads and writes those rows through
+the configured execution store's native shared transaction. The mapping provides
+typed input, projects the proposed complete checkpoint into selected rows and
+supplemental storage, and reconstructs it for a precommit round-trip check. `run`
+returns the exact create, admit, or step result after commit; a retained delivery
+returns its receipt before current row input is mapped. The optional aggregate-only
+step path uses the mapping's `reconstruct_aggregate` and `project_aggregate`
+methods when no checkpoint exists.
+
 ## Install
 
 To try the `0.3.0` release candidate before publication, install it from a checkout:
@@ -271,6 +281,16 @@ the four bundled stores through the same public `register` operation and accepts
 source verifier for additional providers. Its only positive claim here is memory's
 `ephemeral`, which permits process loss. Category-specific guarantees need their
 operational profile proof before the host can advertise them.
+
+Bundled verification assumes a trusted Python interpreter, standard-library and
+package installation, and trusted package initialization. It captures runtime
+executable bindings during initialization and checks them before using decorators
+or rebuilding reference classes. Hosts must exclude concurrent executable
+rebinding between verification and invocation. These checks are not isolation
+from arbitrary code controlling the interpreter; native runtime implementation,
+the interpreter's import machinery, and the verifier itself remain part of the
+host's trust boundary. Ordinary mutable data may change; executable entries in
+reachable callback tables, defaults, and closures retain their captured bindings.
 
 `RuntimeProviderRegistry` installs exact native guard and action providers through
 that same common registration boundary. `SourceClosure` binds the loaded Python

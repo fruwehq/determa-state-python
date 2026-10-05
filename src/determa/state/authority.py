@@ -15,7 +15,6 @@ import re
 import sqlite3
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -59,7 +58,6 @@ _ALLOCATION_TRIGGER_SQL = (
 )
 
 
-@cache
 def _request_validator() -> Any:
     from jsonschema import Draft202012Validator
 
@@ -224,7 +222,12 @@ def _inventory(
     # current native rows. Allocation-time hints cannot establish completeness.
     retained = []
     for source in ledger["checkpoint_bytes"]:
-        document = _parse(source)
+        try:
+            document = _parse(source)
+        except ValueError:
+            # Guarded host mutations may be opaque bytes. Actual native
+            # checkpoint rows are always parsed and validated separately.
+            continue
         if (
             isinstance(document, dict)
             and document.get("execution_checkpoint_format") == "determa.execution_checkpoint"

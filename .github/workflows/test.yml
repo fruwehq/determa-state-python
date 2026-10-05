@@ -179,4 +179,4 @@ jobs:
       - name: PostgreSQL adapter tests
         env:
           DETERMA_POSTGRESQL_DSN: postgresql://postgres:postgres@localhost:5432/determa_test
-        run: pytest tests/test_postgresql_store.py -q
+        run: pytest tests/test_postgresql_store.py tests/test_application_projection_postgresql.py -q

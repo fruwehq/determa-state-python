@@ -39,7 +39,10 @@ def _request(operation: str, operation_id: str, generation: str, arguments: dict
     return json.dumps(request, sort_keys=True, separators=(",", ":"))
 
 
-def test_lost_response_replays_committed_receipt_and_freeze_fences_writer(tmp_path) -> None:
+@pytest.mark.parametrize("mutation", ['{"checkpoint":"one"}', "native mutation bytes"])
+def test_lost_response_replays_committed_receipt_and_freeze_fences_writer(
+    tmp_path, mutation
+) -> None:
     path = tmp_path / "authority.sqlite"
     authority = SQLiteLocalAuthority(path)
     authority.setup_schema()
@@ -83,7 +86,6 @@ def test_lost_response_replays_committed_receipt_and_freeze_fences_writer(tmp_pa
         "authorized_scopes": ["scope-1"],
         "operation_rights": ["guarded_commit", "freeze_scope"],
     }
-    mutation = '{"checkpoint":"one"}'
     commit = _request(
         "guarded_commit",
         "commit-1",

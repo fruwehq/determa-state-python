@@ -27,6 +27,7 @@ dependencies = [
   "jsonschema>=4",
   "cel-python>=0.1",
   "rfc8785>=0.1.4",
+  "typing-extensions>=4.16",
 ]
 
 [project.urls]
