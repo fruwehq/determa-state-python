@@ -311,6 +311,12 @@ def _verified_fixture_handler(module: Any) -> bool:
         frozen=True,
     )
     expected.__module__ = module.__name__
+    if sys.version_info >= (3, 13):
+        # CPython adds these non-executable class-body metadata fields. A class
+        # built by make_dataclass has no compiled body; reproduce only the exact
+        # values proved by this allowlisted declaration, not arbitrary metadata.
+        expected.__firstlineno__ = declaration.decorator_list[0].lineno
+        expected.__static_attributes__ = ()
     actual = module.NativeReply
     if (
         type(actual) is not type

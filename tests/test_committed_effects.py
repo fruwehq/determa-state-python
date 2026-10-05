@@ -826,6 +826,18 @@ def test_handler_fixture_verifier_rejects_changed_generated_or_executable_code(m
     assert not _verified_fixture_handler(module)
 
 
+@pytest.mark.parametrize(
+    ("member", "value"), [("__firstlineno__", 999), ("__static_attributes__", ("unexpected",))]
+)
+def test_handler_fixture_verifier_checks_compiler_metadata_exactly(monkeypatch, member, value):
+    from conformance.effects_adapter import _loaded_handler, _verified_fixture_handler
+
+    module = _loaded_handler()
+    assert _verified_fixture_handler(module)
+    monkeypatch.setattr(module.NativeReply, member, value, raising=False)
+    assert not _verified_fixture_handler(module)
+
+
 @pytest.mark.parametrize("method", ["invoke", "verify"])
 def test_verified_native_handle_cannot_shadow_its_trusted_methods(tmp_path, method):
     host, root, request, context = host_fixture(tmp_path)
