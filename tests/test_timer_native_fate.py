@@ -85,6 +85,24 @@ def test_replaced_fate_proof_cannot_bypass_its_own_guard(tmp_path, monkeypatch, 
     assert host.read_checkpoint("server-1").document == before_root
 
 
+@pytest.mark.parametrize("retention", ["bounded", "permanent"])
+def test_replaced_fate_function_code_is_checked_before_dispatch(tmp_path, monkeypatch, retention):
+    helper, host, complete, _, now, _ = configured(tmp_path, replay_retention=retention)
+    before_helper, before_root = helper.snapshot(), host.read_checkpoint("server-1").document
+    now[0] = "130"
+    monkeypatch.setattr(
+        SQLiteTimerHelper._prove_local_uncommitted_fire,
+        "__code__",
+        (lambda *_: None).__code__,
+    )
+    assert (
+        helper.execute(reclaim(complete), principal="worker-A")["error_code"]
+        == "delivery_ambiguous"
+    )
+    assert helper.snapshot() == before_helper
+    assert host.read_checkpoint("server-1").document == before_root
+
+
 @pytest.mark.parametrize("changed_content", [False, True])
 def test_independently_admitted_matching_id_never_becomes_helper_fate_proof(
     tmp_path, changed_content

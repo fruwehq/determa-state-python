@@ -898,6 +898,10 @@ class SQLiteTimerHelper:
                         return _result(request, record, "timer_fire_in_progress")
                     # Dispatch through the retained implementation: an instance or
                     # class replacement must not bypass the checks inside the proof.
+                    # Function objects are mutable too: attest the retained code
+                    # before entering it, rather than letting it attest itself.
+                    if _FATE_PROOF.__code__ is not _FATE_PROOF_CODE:
+                        raise TimerError("delivery_ambiguous")
                     _FATE_PROOF(self, connection, artifact, record)
                 if now < _time(record["deadline_at"]):
                     return _result(request, record, "timer_not_due")
@@ -934,6 +938,7 @@ class SQLiteTimerHelper:
 # Trusted local factory methods remain bound while an instance proves native fate.
 # This guard supplements native origin/history; it is not external registration proof.
 _FATE_PROOF = SQLiteTimerHelper._prove_local_uncommitted_fire
+_FATE_PROOF_CODE = _FATE_PROOF.__code__
 _FATE_METHODS = tuple(
     (name, getattr(SQLiteTimerHelper, name), getattr(SQLiteTimerHelper, name).__code__)
     for name in (
