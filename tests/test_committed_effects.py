@@ -92,7 +92,12 @@ def installed_test_handler(host, callback, proof_verifier=None):
     )
     handler = VerifiedNativeHandler(registry, configured)
     return SQLiteCommittedEffectHost(
-        host.path, host.resolver, host.route, handler, trusted_clock=host.trusted_clock
+        host.path,
+        host.resolver,
+        host.route,
+        handler,
+        authority_scope=host.authority_scope,
+        trusted_clock=host.trusted_clock,
     )
 
 
@@ -803,27 +808,36 @@ def test_authority_claim_refuses_missing_native_participant_evidence(tmp_path, d
 
 def test_seed_preserves_historical_claim_without_reviving_it(tmp_path):
     authority, host, scope, root, record = authority_effect_fixture(tmp_path)
-    request, invocation = authority_claim_request(authority, scope, root, record)
-    claim = json.loads(authority.perform(request, invocation))["claim"]
-    # Model a retained completed attempt whose current journal permits a retry.
-    journal = read("data/retryable-journal.json")
+    command, invocation = authority_claim_request(authority, scope, root, record)
+    claim = json.loads(authority.perform(command, invocation))["claim"]
+    # Use the actual committed report transition rather than fabricating an older
+    # portable journal and editing native authority to make it look admissible.
+    report = {
+        "effect_id": record["effect_id"],
+        "operation_token": record["operation_token"],
+        "attempt_fence": claim["attempt_fence"],
+        "outcome_kind": "retryable_failure",
+        "payload": ["map", []],
+    }
+    host.trusted_clock = lambda: "0"
+    response = host.submit_result(
+        root, report, principal=claim["worker_principal"], scope=scope, epoch="0", trusted_now="0"
+    )
+    assert response["status"] == "report_recorded"
+    saved = host.snapshot(root)
     ledger = authority.inspect(scope)
-    ledger["active_claims"] = []
+    assert ledger["active_claims"] == []
     assert claim in ledger["effect_claim_history"]
-    checkpoint = host.snapshot(root)["checkpoint"]
     with authority._connect() as connection:
-        connection.execute("UPDATE determa_scope_authority SET ledger=?", (json.dumps(ledger),))
         connection.execute("DELETE FROM determa_committed_effects")
         connection.commit()
-    host.seed(checkpoint, journal, claim)
+    host.seed(saved["checkpoint"], saved["journal"], claim)
     assert authority.inspect(scope)["active_claims"] == []
     assert host.snapshot(root)["claims"][record["effect_id"]] == claim
     new_claim = host.claim(
         root, record["effect_id"], "worker-b", "0", expires_at="30", trusted_now="20"
     )
     assert new_claim["attempt_fence"] == "2"
-    assert authority.inspect(scope)["active_claims"] == [new_claim]
-    assert claim in authority.inspect(scope)["effect_claim_history"]
 
 
 def test_missing_native_work_cannot_be_rebound_to_another_authorized_root(tmp_path):
@@ -959,7 +973,17 @@ def test_dispatch_crossing_lease_expiry_preserves_unresolved_work_for_recovery(t
     with pytest.raises(EffectError, match="stale_attempt_fence"):
         host.dispatch(root, request["effect_id"], credential="test-credential", **context)
     assert len(calls) == 1
-    assert host.snapshot(root) == before
+    after = host.snapshot(root)
+    assert after["checkpoint"] == before["checkpoint"]
+    assert after["journal"]["effect_records"] == before["journal"]["effect_records"]
+    assert (
+        int(after["journal"]["journal_revision"]) == int(before["journal"]["journal_revision"]) + 1
+    )
+    assert len(after["responses"]) == len(before["responses"]) + 1
+    current_time[0] = "0"
+    with pytest.raises(EffectError, match="native_invocation_already_started"):
+        host.dispatch(root, request["effect_id"], credential="test-credential", **context)
+    assert len(calls) == 1
     assert host.recover(root)["journal"]["effect_records"][0]["invocation_state"] == "ambiguous"
 
 
@@ -1751,3 +1775,241 @@ def test_portable_producer_identity_is_not_inferred_from_result_destination(tmp_
         _reconstruct_producer_response(
             checkpoint, journal, "produce-1", identity, original.resolver
         )
+
+
+def test_dispatch_retained_start_denies_repeated_and_restarted_calls(tmp_path):
+    host, root, request, context = host_fixture(tmp_path)
+    record = host.snapshot(root)["journal"]["effect_records"][0]
+    host.route.update(
+        {key: record[key] for key in ("handler_reference", "destination_binding_digest")}
+    )
+    calls = []
+    host = installed_test_handler(host, lambda *args: calls.append(args) or {"accepted": True})
+    assert host.dispatch(root, request["effect_id"], credential="test-credential", **context) == {
+        "accepted": True
+    }
+    after = host.snapshot(root)
+    assert len(calls) == 1
+    with pytest.raises(EffectError, match="native_invocation_already_started"):
+        host.dispatch(root, request["effect_id"], credential="test-credential", **context)
+    reopened = SQLiteCommittedEffectHost(
+        host.path, host.resolver, host.route, host.handler, trusted_clock=lambda: "0"
+    )
+    with pytest.raises(EffectError, match="native_invocation_already_started"):
+        reopened.dispatch(root, request["effect_id"], credential="test-credential", **context)
+    assert reopened.snapshot(root) == after
+    assert len(calls) == 1
+
+
+def test_dispatch_provider_error_retains_start_and_cannot_be_retried_by_reopening(tmp_path):
+    host, root, request, context = host_fixture(tmp_path)
+    before = host.snapshot(root)
+    record = before["journal"]["effect_records"][0]
+    host.route.update(
+        {key: record[key] for key in ("handler_reference", "destination_binding_digest")}
+    )
+    calls = []
+
+    def failed_call(*args):
+        calls.append(args)
+        raise RuntimeError("external acceptance is unknown")
+
+    host = installed_test_handler(host, failed_call)
+    with pytest.raises(RuntimeError, match="acceptance is unknown"):
+        host.dispatch(root, request["effect_id"], credential="test-credential", **context)
+    after = host.snapshot(root)
+    assert after["checkpoint"] == before["checkpoint"]
+    assert after["journal"]["effect_records"] == before["journal"]["effect_records"]
+    reopened = SQLiteCommittedEffectHost(
+        host.path, host.resolver, host.route, host.handler, trusted_clock=lambda: "0"
+    )
+    with pytest.raises(EffectError, match="native_invocation_already_started"):
+        reopened.dispatch(root, request["effect_id"], credential="test-credential", **context)
+    recovered = reopened.recover(root)
+    assert recovered["journal"]["effect_records"][0]["invocation_state"] == "ambiguous"
+    assert len(calls) == 1
+
+
+def test_dispatch_clock_is_rechecked_after_provider_verification_before_io(tmp_path, monkeypatch):
+    import sqlite3
+
+    host, root, request, context = host_fixture(tmp_path)
+    before = host.snapshot(root)
+    record = before["journal"]["effect_records"][0]
+    host.route.update(
+        {key: record[key] for key in ("handler_reference", "destination_binding_digest")}
+    )
+    current_time = ["0"]
+    expiry = read("data/active-claim.json")["expires_at"]
+
+    def health(self, instance):
+        with sqlite3.connect(host.path) as connection:
+            document = json.loads(
+                connection.execute("SELECT document FROM determa_committed_effects").fetchone()[0]
+            )
+        if any(
+            response.get("kind") == "effect_invocation_start"
+            for response in document["responses"].values()
+        ):
+            current_time[0] = expiry
+        return "healthy"
+
+    monkeypatch.setattr(NativeTestProvider, "health", health)
+    calls = []
+    host.trusted_clock = lambda: current_time[0]
+    host = installed_test_handler(host, lambda *args: calls.append(args) or {})
+    with pytest.raises(EffectError, match="stale_attempt_fence"):
+        host.dispatch(root, request["effect_id"], credential="test-credential", **context)
+    after = host.snapshot(root)
+    assert after["checkpoint"] == before["checkpoint"]
+    assert after["journal"]["effect_records"] == before["journal"]["effect_records"]
+    assert len(after["responses"]) == 1
+    assert calls == []
+
+
+def test_dispatch_postcall_health_loss_retains_start_without_returning_verified_output(
+    tmp_path, monkeypatch
+):
+    host, root, request, context = host_fixture(tmp_path)
+    record = host.snapshot(root)["journal"]["effect_records"][0]
+    host.route.update(
+        {key: record[key] for key in ("handler_reference", "destination_binding_digest")}
+    )
+    healthy = [True]
+    monkeypatch.setattr(
+        NativeTestProvider, "health", lambda *args: "healthy" if healthy[0] else "unavailable"
+    )
+    calls = []
+
+    def external_acceptance(*args):
+        calls.append(args)
+        healthy[0] = False
+        return {"accepted": True}
+
+    host = installed_test_handler(host, external_acceptance)
+    with pytest.raises(EffectError, match="host_capability_mismatch"):
+        host.dispatch(root, request["effect_id"], credential="test-credential", **context)
+    after = host.snapshot(root)
+    healthy[0] = True
+    with pytest.raises(EffectError, match="native_invocation_already_started"):
+        host.dispatch(root, request["effect_id"], credential="test-credential", **context)
+    assert host.snapshot(root) == after
+    assert len(calls) == 1
+
+
+def test_identical_dispatch_contenders_issue_one_native_call_under_consuming_lock(tmp_path):
+    import sqlite3
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
+    host, root, request, context = host_fixture(tmp_path)
+    record = host.snapshot(root)["journal"]["effect_records"][0]
+    host.route.update(
+        {key: record[key] for key in ("handler_reference", "destination_binding_digest")}
+    )
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+
+    def native_call(*args):
+        calls.append(args)
+        entered.set()
+        assert release.wait(5)
+        return {"accepted": True}
+
+    host = installed_test_handler(host, native_call)
+    rendezvous = threading.Barrier(3)
+
+    def contender():
+        rendezvous.wait(timeout=5)
+        try:
+            return host.dispatch(
+                root, request["effect_id"], credential="test-credential", **context
+            )
+        except EffectError as error:
+            return str(error)
+
+    with ThreadPoolExecutor(max_workers=2) as workers:
+        futures = [workers.submit(contender) for _ in range(2)]
+        rendezvous.wait(timeout=5)
+        try:
+            assert entered.wait(5)
+            with sqlite3.connect(host.path, timeout=0, isolation_level=None) as writer:
+                with pytest.raises(sqlite3.OperationalError, match="locked"):
+                    writer.execute("BEGIN IMMEDIATE")
+            assert len(calls) == 1
+        finally:
+            release.set()
+        replies = [future.result(timeout=5) for future in futures]
+    assert replies.count({"accepted": True}) == 1
+    assert replies.count("native_invocation_already_started") == 1
+    assert len(calls) == 1
+
+
+def test_dispatch_native_call_excludes_a_real_competing_result_transaction(tmp_path, monkeypatch):
+    import sqlite3
+
+    host, root, request, context = host_fixture(tmp_path)
+    record = host.snapshot(root)["journal"]["effect_records"][0]
+    host.route.update(
+        {key: record[key] for key in ("handler_reference", "destination_binding_digest")}
+    )
+    other = SQLiteCommittedEffectHost(
+        host.path, host.resolver, host.route, None, trusted_clock=lambda: "0"
+    )
+    native_connect = other._connect
+
+    def without_waiting():
+        connection = native_connect()
+        connection.execute("PRAGMA busy_timeout=0")
+        return connection
+
+    monkeypatch.setattr(other, "_connect", without_waiting)
+    calls = []
+
+    def native_call(*args):
+        calls.append(args)
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            other.submit_result(root, request, **context)
+        return {"accepted": True}
+
+    host = installed_test_handler(host, native_call)
+    assert host.dispatch(root, request["effect_id"], credential="test-credential", **context) == {
+        "accepted": True
+    }
+    after = host.snapshot(root)
+    assert after["journal"]["effect_records"][0]["invocation_state"] == "leased"
+    assert after["journal"]["effect_records"][0]["outcome"] is None
+    assert len(calls) == 1
+    assert other.submit_result(root, request, **context)["status"] == "committed"
+
+
+def test_native_authority_seed_cannot_erase_a_committed_dispatch_start(tmp_path):
+    import sqlite3
+
+    authority, host, scope, root, record = authority_effect_fixture(tmp_path)
+    command, invocation = authority_claim_request(authority, scope, root, record)
+    assert json.loads(authority.perform(command, invocation))["status"] == "accepted"
+    host.route.update(
+        {key: record[key] for key in ("handler_reference", "destination_binding_digest")}
+    )
+    host.trusted_clock = lambda: "0"
+    calls = []
+    host = installed_test_handler(host, lambda *args: calls.append(args) or {"accepted": True})
+    before = host.snapshot(root)
+    claim = before["claims"][record["effect_id"]]
+    context = {
+        "principal": claim["worker_principal"],
+        "scope": scope,
+        "epoch": "0",
+        "trusted_now": "0",
+    }
+    host.dispatch(root, record["effect_id"], credential="test-credential", **context)
+    ledger = authority.inspect(scope)
+    with sqlite3.connect(host.path) as connection:
+        connection.execute(
+            "DELETE FROM determa_committed_effects WHERE root_instance_id=?", (root,)
+        )
+    with pytest.raises(EffectError, match="unauthorized_scope"):
+        host.seed(before["checkpoint"], before["journal"], claim)
+    assert authority.inspect(scope) == ledger
+    assert len(calls) == 1

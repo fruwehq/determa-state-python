@@ -686,6 +686,36 @@ def _reconstruct_producer_response(
     return response
 
 
+def _native_effect_journal(ledger: Mapping[str, Any], root: str) -> dict[str, Any]:
+    """Resolve only host-participant history, never generic proposed mutation bytes."""
+    from .authority import _parse
+
+    history = ledger.get("native_effect_journal_bytes")
+    if type(history) is not list or any(type(source) is not str for source in history):
+        raise EffectError("unauthorized_scope")
+    latest = None
+    for source in history:
+        try:
+            journal = _parse(source)
+            if type(journal) is not dict:
+                raise EffectError("unauthorized_scope")
+            if (
+                canonical_bytes(journal).decode() != source
+                or journal.get("host_effect_journal_format") != "determa.host_effect_journal"
+                or journal.get("host_effect_journal_schema_version") != 1
+                or journal.get("scope_identity") != ledger["scope_identity"]
+                or journal.get("host_effect_journal_digest") != journal_digest(journal)
+            ):
+                raise EffectError("unauthorized_scope")
+        except (ValueError, TypeError, KeyError) as error:
+            raise EffectError("unauthorized_scope") from error
+        if journal["root_instance_id"] == root:
+            latest = journal
+    if latest is None:
+        raise EffectError("unauthorized_scope")
+    return latest
+
+
 def _validate_authority_pair(ledger: Mapping[str, Any], document: Mapping[str, Any]) -> None:
     """Check the old native pair before any journal transition can be staged."""
     from .authority import _native_checkpoint_history
@@ -740,6 +770,8 @@ def _validate_authority_pair(ledger: Mapping[str, Any], document: Mapping[str, A
                 raise EffectError("stale_attempt_fence")
         elif live is not None:
             raise EffectError("stale_attempt_fence")
+    if journal != _native_effect_journal(ledger, journal["root_instance_id"]):
+        raise EffectError("unauthorized_scope")
 
 
 def _issue_effect_claim(
@@ -858,10 +890,27 @@ class VerifiedNativeHandler:
         metadata: Mapping[str, Any],
         attempt: Mapping[str, Any],
     ) -> Mapping[str, Any]:
+        return VerifiedNativeHandler._invoke_with_guard(
+            self, reference, payload, metadata, attempt, lambda: None
+        )
+
+    def _invoke_with_guard(
+        self,
+        reference: Mapping[str, Any],
+        payload: Any,
+        metadata: Mapping[str, Any],
+        attempt: Mapping[str, Any],
+        guard: Callable[[], None],
+    ) -> Mapping[str, Any]:
         method, instance = VerifiedNativeHandler.verify(
             self, reference, metadata["destination_binding_digest"]
         )
-        return cast(Mapping[str, Any], method(instance, payload, metadata, attempt))
+        # Provider verification may execute native callbacks. Live host rights and
+        # trusted time must be checked after those callbacks, immediately before I/O.
+        guard()
+        result = method(instance, payload, metadata, attempt)
+        VerifiedNativeHandler.verify(self, reference, metadata["destination_binding_digest"])
+        return cast(Mapping[str, Any], result)
 
 
 class SQLiteCommittedEffectHost:
@@ -962,6 +1011,10 @@ class SQLiteCommittedEffectHost:
                     checkpoint["root_instance_id"] not in ledger["roots"]
                     or journal["scope_identity"] != self.authority_scope
                 ):
+                    raise EffectError("unauthorized_scope")
+                if checkpoint["root_instance_id"] in ledger.get(
+                    "native_effect_roots", []
+                ) and journal != _native_effect_journal(ledger, checkpoint["root_instance_id"]):
                     raise EffectError("unauthorized_scope")
                 # Restoring an already claimed invocation cannot mint authority.
                 # Its exact claim must already have been issued by this ledger.
@@ -1085,6 +1138,11 @@ class SQLiteCommittedEffectHost:
             history.append(source)
         ledger["checkpoint_bytes"].append(source)
         ledger["mutation_bytes"].append(canonical_bytes(document["journal"]).decode())
+        # This private native role history cannot be fabricated by a generic
+        # guarded_commit payload that happens to resemble a journal.
+        ledger.setdefault("native_effect_journal_bytes", []).append(
+            canonical_bytes(document["journal"]).decode()
+        )
         if advance_generation:
             ledger["scope_generation"] = str(int(ledger["scope_generation"]) + 1)
 
@@ -1539,8 +1597,94 @@ class SQLiteCommittedEffectHost:
         if clock is None:
             raise EffectError("stale_attempt_fence")
 
+        def start(document: dict[str, Any]) -> str:
+            record = _record(document["journal"], effect_id)
+            if record["invocation_state"] != "leased":
+                raise EffectError("effect_not_outstanding")
+            self._authorize(
+                document,
+                effect_id,
+                record["operation_token"],
+                record["attempt_fence"],
+                principal,
+                scope,
+                epoch,
+                clock(),
+            )
+            if (
+                not authorized
+                or credential is None
+                or record["handler_reference"] != self.route["handler_reference"]
+                or record["destination_binding_digest"] != self.route["destination_binding_digest"]
+            ):
+                raise EffectError("unauthorized_scope")
+            self._verified_handler(
+                record["handler_reference"], record["destination_binding_digest"]
+            )
+            identifier = hash_value(
+                [
+                    "determa-native-invocation-start-1",
+                    scope,
+                    root,
+                    effect_id,
+                    record["attempt_fence"],
+                ]
+            )
+            journal = document["journal"]
+            if identifier in document["responses"] or any(
+                reference["operation_id"] == identifier
+                for reference in journal["operation_response_references"]
+            ):
+                raise EffectError("native_invocation_already_started")
+            response = {
+                "kind": "effect_invocation_start",
+                "body": {"claim": copy.deepcopy(document["claims"][effect_id])},
+            }
+            document["responses"][identifier] = response
+            journal["operation_response_references"].append(
+                {
+                    "operation_id": identifier,
+                    "response_digest": hash_value(["determa-host-operation-response-1", response]),
+                }
+            )
+            journal["operation_response_references"].sort(
+                key=lambda reference: reference["operation_id"]
+            )
+            _bump(journal)
+            return identifier
+
+        # Only this successful new native commit reaches the call phase. A saved
+        # marker is historical evidence, never permission for another invocation.
+        start_id = self._transact(
+            root,
+            start,
+            expected_epoch=epoch,
+            authority_mutation=self._mirror_authority,
+            worker_guard=(effect_id, principal, None, trusted_now),
+        )
+
         def call(document: dict[str, Any]) -> Mapping[str, Any]:
             record = _record(document["journal"], effect_id)
+            response = document["responses"].get(start_id)
+            reference = next(
+                (
+                    item
+                    for item in document["journal"]["operation_response_references"]
+                    if item["operation_id"] == start_id
+                ),
+                None,
+            )
+            if (
+                response
+                != {
+                    "kind": "effect_invocation_start",
+                    "body": {"claim": document["claims"].get(effect_id)},
+                }
+                or reference is None
+                or reference["response_digest"]
+                != hash_value(["determa-host-operation-response-1", response])
+            ):
+                raise EffectError("invalid_effect_journal")
             if record["invocation_state"] != "leased":
                 raise EffectError("effect_not_outstanding")
             self._authorize(
@@ -1580,12 +1724,26 @@ class SQLiteCommittedEffectHost:
             handler = self._verified_handler(
                 record["handler_reference"], record["destination_binding_digest"]
             )
-            result = VerifiedNativeHandler.invoke(
+
+            def live_call_guard() -> None:
+                self._authorize(
+                    document,
+                    effect_id,
+                    record["operation_token"],
+                    record["attempt_fence"],
+                    principal,
+                    scope,
+                    epoch,
+                    clock(),
+                )
+
+            result = VerifiedNativeHandler._invoke_with_guard(
                 handler,
                 record["handler_reference"],
                 copy.deepcopy(intent["payload"]),
                 metadata,
                 {"attempt_fence": record["attempt_fence"]},
+                live_call_guard,
             )
             # External acceptance cannot extend an expired worker's mutation
             # rights. A refusal leaves its leased journal for reconciliation.
