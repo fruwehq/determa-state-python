@@ -334,3 +334,68 @@ def test_schema_comparison_preserves_literal_case_and_operator_tokens():
     assert _sql_tokens("RAISE(ABORT,'PUBLIC_HOST_IMMUTABLE')") != _sql_tokens(
         "RAISE(ABORT,'public_host_immutable')"
     )
+
+
+@pytest.mark.parametrize("mixed", [False, True])
+def test_pruned_acceptance_replay_refuses_without_committing_fresh_members(tmp_path, mixed):
+    import sqlite3
+
+    from determa.state.wire import canonical_bytes
+
+    host, bundle = open_host(tmp_path)
+    checkpoint = ds.create_checkpoint_v1(bundle, "counter", "root", "root:create")
+    root = checkpoint["root_record"]["aggregate_state"]["runtimes"][0]
+
+    def delivery(event_id):
+        envelope = ds.portable_envelope(
+            "increment", event_id, root["target_identity"], {"amount": 4}
+        )
+        return {
+            "delivery_mode": "input",
+            "envelope": envelope,
+            "envelope_digest": ds.delivery_request_digest("root", "input", envelope),
+        }
+
+    original = delivery("retained-event")
+    checkpoint = ds.admit_checkpoint_v1(
+        checkpoint,
+        [original],
+        host.resolver,
+        expected_revision=checkpoint["revision"],
+        expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+    )
+    checkpoint = ds.step_checkpoint_v1(
+        checkpoint,
+        root["runtime_id"],
+        host.resolver,
+        expected_revision=checkpoint["revision"],
+        expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+    )
+    checkpoint = ds.prune_checkpoint_v1(
+        checkpoint,
+        str(int(checkpoint["next_operation_receipt_sequence"]) - 1),
+        host.resolver,
+        target_mode="bounded",
+        policy_identifier="test-retention",
+        expected_revision=checkpoint["revision"],
+        expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+    )
+    encoded = canonical_bytes(checkpoint)
+    with sqlite3.connect(host.path) as db:
+        db.execute("INSERT INTO determa_public_host_checkpoints VALUES (?,?)", ("root", encoded))
+    request = base("admit", "new-public-operation")
+    request["precondition"] = {
+        "revision": checkpoint["revision"],
+        "checkpoint_digest": checkpoint["execution_checkpoint_digest"],
+    }
+    request["arguments"] = {
+        "ordered_deliveries": [original, delivery("fresh-event")] if mixed else [original]
+    }
+    response = host.handle(request, principal="alice")
+    assert response["error"]["code"] == "replay_evidence_expired"
+    validate_public_message(response, response=True)
+    with sqlite3.connect(host.path) as db:
+        assert db.execute("SELECT checkpoint FROM determa_public_host_checkpoints").fetchone()[
+            0
+        ] == (encoded)
+        assert db.execute("SELECT COUNT(*) FROM determa_public_host_responses").fetchone()[0] == 0

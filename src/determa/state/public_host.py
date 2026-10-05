@@ -446,15 +446,20 @@ class SQLitePublicExecutionHost:
             updated = result.get("checkpoint", result)
             if "execution_checkpoint_digest" not in updated:
                 updated = checkpoint
-            receipts = [
-                next(
-                    r
-                    for r in updated["operation_receipts"]
-                    if r["operation_kind"] == "acceptance"
-                    and r["event_id"] == d["envelope"]["event_id"]
+            receipts = []
+            for delivery in deliveries:
+                receipt = next(
+                    (
+                        r
+                        for r in updated["operation_receipts"]
+                        if r["operation_kind"] == "acceptance"
+                        and r["event_id"] == delivery["envelope"]["event_id"]
+                    ),
+                    None,
                 )
-                for d in deliveries
-            ]
+                if receipt is None:
+                    raise PublicHostError("replay_evidence_expired")
+                receipts.append(receipt)
             root = next(
                 r
                 for r in updated["root_record"]["aggregate_state"]["runtimes"]
