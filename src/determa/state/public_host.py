@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import copy
 import json
-import re
 import sqlite3
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
@@ -20,7 +19,12 @@ from .checkpoint_v1 import (
 from .definition import Bundle, load_bundle
 from .errors import ArtifactError
 from .inspection import inspect_candidate
-from .public_client import PublicHostError, public_request_digest, validate_public_message
+from .public_client import (
+    PublicHostError,
+    _sql_tokens,
+    public_request_digest,
+    validate_public_message,
+)
 from .wire import DefinitionResolver, canonical_bytes, decoded_typed_value, hash_value
 
 _OPERATIONS = ["capabilities", "create", "admit", "process", "read", "inspect", "receipt"]
@@ -46,14 +50,6 @@ _TRIGGERS = {
     }.items()
     for action in actions
 }
-
-
-def _sql_tokens(source: str) -> list[str]:
-    tokens = re.findall(
-        r"'(?:(?:'')|[^'])*'|\"(?:(?:\"\")|[^\"])*\"|[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[^\s]",
-        source,
-    )
-    return [token if token.startswith(("'", '"')) else token.lower() for token in tokens]
 
 
 class SQLitePublicExecutionHost:

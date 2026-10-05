@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import json
+import re
 import sqlite3
 import uuid
 from collections.abc import Callable, Iterator, Mapping
@@ -23,6 +24,30 @@ from .wire import canonical_bytes, hash_value
 _DATA = Path(__file__).with_name("data")
 _PROTOCOL = "determa.execution_host"
 _READS = {"capabilities", "read", "inspect", "receipt"}
+_CLIENT_TABLE = (
+    "CREATE TABLE determa_public_client_requests ("
+    "operation_id TEXT PRIMARY KEY, binding_name TEXT NOT NULL, "
+    "endpoint TEXT NOT NULL, request BLOB NOT NULL, request_digest TEXT NOT NULL, response BLOB)"
+)
+_CLIENT_TRIGGERS = {
+    "determa_public_client_forbid_delete": "CREATE TRIGGER determa_public_client_forbid_delete "
+    "BEFORE DELETE ON determa_public_client_requests "
+    "BEGIN SELECT RAISE(ABORT,'public_client_immutable'); END",
+    "determa_public_client_guard_update": "CREATE TRIGGER determa_public_client_guard_update "
+    "BEFORE UPDATE ON determa_public_client_requests WHEN "
+    "OLD.operation_id IS NOT NEW.operation_id OR OLD.binding_name IS NOT NEW.binding_name OR "
+    "OLD.endpoint IS NOT NEW.endpoint OR OLD.request IS NOT NEW.request OR "
+    "OLD.request_digest IS NOT NEW.request_digest OR OLD.response IS NOT NULL OR "
+    "NEW.response IS NULL BEGIN SELECT RAISE(ABORT,'public_client_immutable'); END",
+}
+
+
+def _sql_tokens(source: str) -> list[str]:
+    tokens = re.findall(
+        r"'(?:(?:'')|[^'])*'|\"(?:(?:\"\")|[^\"])*\"|[A-Za-z_][A-Za-z0-9_]*|[0-9]+|[^\s]",
+        source,
+    )
+    return [token if token.startswith(("'", '"')) else token.lower() for token in tokens]
 
 
 class PublicHostError(ArtifactError):
@@ -99,21 +124,53 @@ class PublicHostClient:
 
     def setup_schema(self) -> None:
         """Explicitly create a durable client request journal."""
-        with self._connect() as db:
+        with self._connect(setup=True) as db:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(_CLIENT_TABLE.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1))
+            for name, definition in _CLIENT_TRIGGERS.items():
+                if not db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='trigger' AND name=?", (name,)
+                ).fetchone():
+                    db.execute(definition)
+            self._check_schema(db)
+
+    @staticmethod
+    def _check_schema(db: sqlite3.Connection) -> None:
+        row = db.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' "
+            "AND name='determa_public_client_requests'"
+        ).fetchone()
+        triggers = dict(
             db.execute(
-                "CREATE TABLE IF NOT EXISTS determa_public_client_requests ("
-                "operation_id TEXT PRIMARY KEY, binding_name TEXT NOT NULL, "
-                "endpoint TEXT NOT NULL, request BLOB NOT NULL, "
-                "request_digest TEXT NOT NULL, response BLOB)"
+                "SELECT name,sql FROM sqlite_master WHERE type='trigger' "
+                "AND tbl_name='determa_public_client_requests'"
             )
+        )
+        if (
+            row is None
+            or _sql_tokens(row[0]) != _sql_tokens(_CLIENT_TABLE)
+            or set(triggers) != set(_CLIENT_TRIGGERS)
+            or any(
+                _sql_tokens(triggers[name]) != _sql_tokens(definition)
+                for name, definition in _CLIENT_TRIGGERS.items()
+            )
+        ):
+            raise PublicHostError("host_capability_mismatch")
 
     @contextmanager
-    def _connect(self) -> Iterator[sqlite3.Connection]:
+    def _connect(self, *, setup: bool = False) -> Iterator[sqlite3.Connection]:
         db = sqlite3.connect(self.path)
         try:
             db.execute("PRAGMA journal_mode=WAL")
             db.execute("PRAGMA synchronous=FULL")
+            if (
+                db.execute("PRAGMA journal_mode").fetchone()[0] != "wal"
+                or db.execute("PRAGMA synchronous").fetchone()[0] != 2
+            ):
+                raise PublicHostError("host_capability_mismatch")
             with db:
+                if not setup:
+                    self._check_schema(db)
                 yield db
         finally:
             db.close()

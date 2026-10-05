@@ -146,3 +146,44 @@ def test_unknown_operation_is_not_rollback_or_automatic_replacement(tmp_path):
         client.retry("missing")
     with pytest.raises(PublicHostError, match="outcome_unknown"):
         client.receipt("missing")
+
+
+def test_native_client_journal_preserves_request_and_first_response(tmp_path):
+    import sqlite3
+
+    client = PublicHostClient(
+        tmp_path / "client.db",
+        {"one": EndpointBinding("endpoint", "scope")},
+        lambda _endpoint, candidate: (
+            capabilities(candidate)
+            if candidate["operation"] == "capabilities"
+            else rejected(candidate)
+        ),
+    )
+    client.setup_schema()
+    response = client.submit("one", request())
+    with sqlite3.connect(client.path) as db:
+        for mutation in (
+            "DELETE FROM determa_public_client_requests",
+            "UPDATE determa_public_client_requests SET endpoint='replacement'",
+            "UPDATE determa_public_client_requests SET request=X'00'",
+            "UPDATE determa_public_client_requests SET response=NULL",
+        ):
+            with pytest.raises(sqlite3.IntegrityError, match="public_client_immutable"):
+                db.execute(mutation)
+    assert client.retry("create-1") == response
+
+
+def test_client_with_missing_retention_guard_refuses_before_transport(tmp_path):
+    import sqlite3
+
+    client = PublicHostClient(
+        tmp_path / "client.db",
+        {"one": EndpointBinding("endpoint", "scope")},
+        lambda *_args: pytest.fail("changed native storage must refuse before transport"),
+    )
+    client.setup_schema()
+    with sqlite3.connect(client.path) as db:
+        db.execute("DROP TRIGGER determa_public_client_guard_update")
+    with pytest.raises(PublicHostError, match="host_capability_mismatch"):
+        client.submit("one", request())
