@@ -110,6 +110,8 @@ def _baseline_ledger() -> dict[str, Any]:
 
 def _seed(ledger: dict[str, Any]) -> SQLiteLocalAuthority:
     global _INITIAL_BINDING
+    # These trusted protocol fixtures contain opaque mutations, not native rows.
+    ledger = {**ledger, "native_checkpoint_bytes": []}
     # A fresh test database for each independent vector. Production never
     # removes an allocated scope marker from a live authority domain.
     for suffix in ("", "-wal", "-shm"):
@@ -129,6 +131,14 @@ def _seed(ledger: dict[str, Any]) -> SQLiteLocalAuthority:
             )
             connection.commit()
     return authority
+
+
+def _observed_ledger(authority: SQLiteLocalAuthority) -> dict[str, Any] | None:
+    ledger = authority.inspect("scope-42")
+    if ledger is None:
+        return None
+    # Project the actual ledger onto the closed conformance observation shape.
+    return {key: value for key, value in ledger.items() if key != "native_checkpoint_bytes"}
 
 
 def _call(authority: SQLiteLocalAuthority, call: dict[str, Any], **kwargs: Any) -> str | None:
@@ -273,10 +283,10 @@ def _native_trace(payload: dict[str, Any]) -> dict[str, Any]:
         elif kind == "observe_native_fate":
             events.append(_event("native_fate", session=session, fate=fates[session]))
         elif kind == "observe_storage":
-            events.append(_event("storage", ledger=authority.inspect("scope-42")))
+            events.append(_event("storage", ledger=_observed_ledger(authority)))
         elif kind == "restart_authority":
             authority = SQLiteLocalAuthority(_PATH)
-            events.append(_event("restarted", ledger=authority.inspect("scope-42")))
+            events.append(_event("restarted", ledger=_observed_ledger(authority)))
         elif kind == "disconnect_session":
             events.append(_event("response", session=session))
         elif kind == "resolve_fate_from_storage":
@@ -302,7 +312,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         observed = {
             "binding": _binding(),
             "response_bytes": response,
-            "ledger_after": authority.inspect("scope-42"),
+            "ledger_after": _observed_ledger(authority),
         }
         if "observed_effects_before" in payload["setup"]:
             observed["observed_effects_after"] = payload["setup"]["observed_effects_before"]
@@ -329,7 +339,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         return {
             "binding": _binding(),
             "allocated": reused,
-            "ledger_after": authority.inspect("scope-42"),
+            "ledger_after": _observed_ledger(authority),
         }
     if kind == "base_core_refusal":
         return {

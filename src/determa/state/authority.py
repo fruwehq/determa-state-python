@@ -279,7 +279,7 @@ def _inventory(
             ("terminal_outbox_records", "terminal_intent"),
         ):
             members.extend(
-                {"kind": kind, "identity": _compact([root, "effect", item["effect_id"]])}
+                {"kind": kind, "identity": _compact([root, "effect", item["intent"]["effect_id"]])}
                 for item in document[field]
             )
     return [
@@ -938,6 +938,8 @@ class AuthoritySQLiteExecutionStore(SQLiteExecutionStore):
                 raise ExecutionStoreError("scope_fence_unproven") from error
             transaction = _SQLiteTransaction(connection, root_instance_id)
             previous = transaction.load()
+            if previous is not None and previous.decode("utf-8", "strict") not in native_history:
+                raise ExecutionStoreError("scope_fence_unproven")
             yield transaction
             current = transaction.load()
             if current != previous:
