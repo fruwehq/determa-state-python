@@ -416,7 +416,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         return {
             "binding": _binding(),
             "accepted": accepted,
-            "ledger_after": authority.inspect("scope-42"),
+            "ledger_after": _observed_ledger(authority),
             "host_mutation_count": 0,
             "external_dispatch_count": len(dispatched),
         }

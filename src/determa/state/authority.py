@@ -299,22 +299,42 @@ def _native_checkpoint_history(ledger: Mapping[str, Any]) -> list[str]:
 def _native_checkpoints(
     connection: sqlite3.Connection, ledger: Mapping[str, Any]
 ) -> list[dict[str, Any]]:
-    """Read the entire dedicated checkpoint table under the freeze transaction."""
-    if (
-        connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-            "AND name = 'determa_execution_checkpoints'"
-        ).fetchone()
-        is None
-    ):
-        return []
-    documents = []
-    for root, payload in connection.execute(
-        "SELECT root_instance_id, checkpoint FROM determa_execution_checkpoints "
-        "ORDER BY root_instance_id"
-    ):
+    """Read every native checkpoint/journal row under the freeze transaction."""
+    documents: dict[str, dict[str, Any]] = {}
+    history = _native_checkpoint_history(ledger)
+    tables = {
+        row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+    }
+    rows: list[tuple[str, bytes]] = []
+    if "determa_execution_checkpoints" in tables:
+        rows.extend(
+            connection.execute(
+                "SELECT root_instance_id, checkpoint FROM determa_execution_checkpoints "
+                "ORDER BY root_instance_id"
+            )
+        )
+    if "determa_committed_effects" in tables:
+        from .effects import validate_journal
+        from .wire import canonical_bytes
+
+        for root, payload in connection.execute(
+            "SELECT root_instance_id, document FROM determa_committed_effects "
+            "ORDER BY root_instance_id"
+        ):
+            native = _parse(bytes(payload).decode("utf-8", "strict"))
+            validate_journal(native["checkpoint"], native["journal"])
+            if native["journal"]["scope_identity"] != ledger["scope_identity"]:
+                raise ValueError("untracked native effect scope")
+            for record in native["journal"]["effect_records"]:
+                if {
+                    "work_identity": record["effect_id"],
+                    "attempt_fence": record["attempt_fence"],
+                } not in ledger["journal_entries"]:
+                    raise ValueError("untracked native journal")
+            rows.append((root, canonical_bytes(native["checkpoint"])))
+    for root, payload in rows:
         source = bytes(payload).decode("utf-8", "strict")
-        if root not in ledger["roots"] or source not in _native_checkpoint_history(ledger):
+        if root not in ledger["roots"] or source not in history:
             raise ValueError("untracked native checkpoint")
         document = _parse(source)
         if not validate_execution_checkpoint_member("executionCheckpoint", document):
@@ -323,8 +343,10 @@ def _native_checkpoints(
             "execution_checkpoint_digest"
         ] != execution_checkpoint_digest(document):
             raise ValueError("native checkpoint identity mismatch")
-        documents.append(document)
-    return documents
+        if root in documents and documents[root] != document:
+            raise ValueError("divergent native checkpoint owners")
+        documents[root] = document
+    return list(documents.values())
 
 
 def _compose_authority_profile(

@@ -22,9 +22,9 @@ from .checkpoint_v1 import (
     restore_execution_checkpoint_v1,
     step_checkpoint_v1,
 )
+from .errors import ArtifactError
 from .host import outbox_intent_digest
 from .wire import (
-    ArtifactError,
     ArtifactResolver,
     _schema_registry,
     canonical_bytes,
@@ -462,12 +462,21 @@ class SQLiteCommittedEffectHost:
                 )
             else:
                 entry["attempt_fence"] = record["attempt_fence"]
+        work = {record["effect_id"] for record in records}
         ledger["active_claims"] = [
+            claim for claim in ledger["active_claims"] if claim["work_identity"] not in work
+        ] + [
             copy.deepcopy(document["claims"][record["effect_id"]])
             for record in records
             if record["invocation_state"] == "leased" and record["effect_id"] in document["claims"]
         ]
-        ledger["checkpoint_bytes"].append(canonical_bytes(document["checkpoint"]).decode())
+        from .authority import _native_checkpoint_history
+
+        source = canonical_bytes(document["checkpoint"]).decode()
+        history = _native_checkpoint_history(ledger)
+        if source not in history:
+            history.append(source)
+        ledger["checkpoint_bytes"].append(source)
         ledger["mutation_bytes"].append(canonical_bytes(document["journal"]).decode())
         ledger["scope_generation"] = str(int(ledger["scope_generation"]) + 1)
 
@@ -512,6 +521,15 @@ class SQLiteCommittedEffectHost:
                 if authority is None:
                     raise EffectError("stale_scope_authority")
                 ledger = json.loads(authority[0])
+                from .authority import _native_checkpoint_history
+
+                if (
+                    root not in ledger["roots"]
+                    or document["journal"]["scope_identity"] != self.authority_scope
+                    or canonical_bytes(document["checkpoint"]).decode()
+                    not in _native_checkpoint_history(ledger)
+                ):
+                    raise EffectError("unauthorized_scope")
                 if ledger["state"] != "active" or (
                     expected_epoch is not None and ledger["authority_epoch"] != expected_epoch
                 ):
