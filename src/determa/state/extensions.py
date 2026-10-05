@@ -233,7 +233,7 @@ class ExtensionRegistry:
         configured = ConfiguredExtension(self._token, registered, clean, provider, instance)
         store = (
             instance.get("store")
-            if isinstance(provider, _BundledStoreProvider) and isinstance(instance, Mapping)
+            if isinstance(instance, Mapping) and _is_bundled_provider(provider)
             else None
         )
         self._bindings[id(configured)] = _InstanceBinding(
@@ -278,7 +278,7 @@ class ExtensionRegistry:
         )
         if instance_id != configured._configuration.get("instance_id"):
             raise ExtensionError(Code.INVALID_EXTENSION_CONFIGURATION)
-        if isinstance(configured._provider, _BundledStoreProvider):
+        if _is_bundled_provider(configured._provider):
             store = instance.get("store") if isinstance(instance, Mapping) else None
             if (
                 store is not binding.store
@@ -287,6 +287,28 @@ class ExtensionRegistry:
                 or _shadows_executable(store)
             ):
                 raise ExtensionError(Code.EXTENSION_IDENTITY_MISMATCH)
+            from .authority import (
+                AuthoritySQLiteExecutionStore,
+                SQLiteLocalAuthority,
+                _BundledAuthorityProvider,
+            )
+
+            if isinstance(configured._provider, _BundledAuthorityProvider):
+                authority = instance.get("authority") if isinstance(instance, Mapping) else None
+                if (
+                    not isinstance(authority, SQLiteLocalAuthority)
+                    or not isinstance(store, AuthoritySQLiteExecutionStore)
+                    or type(authority) is not SQLiteLocalAuthority
+                    or type(store) is not AuthoritySQLiteExecutionStore
+                    or _shadows_executable(authority)
+                    or authority.path != configured._configuration.get("path")
+                    or store.scope_identity != configured._configuration.get("scope_identity")
+                    or store.owner_principal != configured._configuration.get("owner_principal")
+                    or store.authority_epoch != configured._configuration.get("authority_epoch")
+                    or store.replay_retention != configured._configuration.get("replay_retention")
+                    or store.outbox_retention != configured._configuration.get("outbox_retention")
+                ):
+                    raise ExtensionError(Code.EXTENSION_IDENTITY_MISMATCH)
         return descriptor, configured._provider, instance, evaluator
 
     def capabilities(self, configured: ConfiguredExtension, *extra: Any) -> list[str]:
@@ -318,6 +340,14 @@ class ExtensionRegistry:
         """Evaluate current configured instance before any core or host mutation."""
         del lookup_uri  # URI is only a resolver hint; it cannot change exact identity.
         configured = self.validate_configuration(descriptor, configuration)
+        return self.report(configured, requirement)
+
+    def report(
+        self,
+        configured: ConfiguredExtension,
+        requirement: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Recheck source, identity, current health and proof for a configured instance."""
         claims = self.capabilities(configured)
         health = self.health(configured)
         checked, _, instance, evaluator = self._bound(configured)
@@ -486,6 +516,12 @@ class _BundledStoreProvider:
         return "healthy" if instance["store"].health().get("healthy") is True else "unavailable"
 
 
+def _is_bundled_provider(provider: Any) -> bool:
+    from .authority import _BundledAuthorityProvider
+
+    return isinstance(provider, (_BundledStoreProvider, _BundledAuthorityProvider))
+
+
 def _shadows_executable(instance: Any) -> bool:
     own = vars(instance)
     return any(
@@ -522,13 +558,21 @@ def _bundled_factory_matches_source(name: str, factory: Any) -> bool:
     import types
 
     package = Path(__file__).parent
-    module = importlib.import_module(f"determa.state.stores.{name}")
+    authority = name == "authority"
+    module = importlib.import_module(
+        "determa.state.authority" if authority else f"determa.state.stores.{name}"
+    )
     if not isinstance(factory, types.FunctionType):
         return False
-    if factory is not getattr(
-        module, f"{name}_execution_store_factory", None
-    ) or factory is not getattr(
-        importlib.import_module("determa.state.stores"), f"{name}_execution_store_factory", None
+    factory_name = (
+        "bundled_sqlite_authority_provider_factory"
+        if authority
+        else f"{name}_execution_store_factory"
+    )
+    if factory is not getattr(module, factory_name, None) or (
+        not authority
+        and factory
+        is not getattr(importlib.import_module("determa.state.stores"), factory_name, None)
     ):
         return False
 
@@ -654,11 +698,11 @@ def _bundled_factory_matches_source(name: str, factory: Any) -> bool:
             return True
         return verify_function(value, expected)
 
-    for origin in (
-        importlib.import_module(__name__),
-        module,
-        importlib.import_module("determa.state.stores.base"),
-    ):
+    origins = [importlib.import_module(__name__), module]
+    if authority:
+        origins.extend((importlib.import_module("determa.state.stores.sqlite"),))
+    origins.append(importlib.import_module("determa.state.stores.base"))
+    for origin in origins:
         top = source_code(origin)
         if top is None:
             return False
@@ -666,6 +710,30 @@ def _bundled_factory_matches_source(name: str, factory: Any) -> bool:
             if isinstance(child, types.CodeType) and not child.co_name.startswith("<"):
                 if not verify_definition(origin, child.co_name):
                     return False
+    if authority:
+        host = importlib.import_module("determa.state.host")
+        host_code = source_code(host)
+        if host_code is None:
+            return False
+        for child in host_code.co_consts:
+            if not isinstance(child, types.CodeType) or child.co_name.startswith("<"):
+                continue
+            loaded = vars(host).get(child.co_name)
+            if isinstance(loaded, type):
+                for method_code in child.co_consts:
+                    if not isinstance(
+                        method_code, types.CodeType
+                    ) or method_code.co_name.startswith("<"):
+                        continue
+                    method = vars(loaded).get(method_code.co_name)
+                    if isinstance(method, (staticmethod, classmethod)):
+                        method = method.__func__
+                    if isinstance(method, property):
+                        method = method.fget
+                    if getattr(method, "__code__", None) != method_code:
+                        return False
+            elif getattr(loaded, "__code__", None) != child:
+                return False
     return True
 
 
@@ -716,6 +784,14 @@ def bundled_extension_registry(
     installed by a host. Memory's `ephemeral` only states that loss is permitted.
     """
     from .__about__ import __version__
+    from .authority import (
+        AuthoritySQLiteExecutionStore,
+        SQLiteLocalAuthority,
+        _authority_closure,
+        _BundledAuthorityProvider,
+        bundled_authority_descriptor,
+        bundled_sqlite_authority_provider_factory,
+    )
     from .stores import (
         file_execution_store_factory,
         memory_execution_store_factory,
@@ -728,6 +804,27 @@ def bundled_extension_registry(
     def verify(provider: Any, descriptor: Mapping[str, Any]) -> bool:
         reference = descriptor["provider_reference"]
         identifier = reference["identifier"]
+        if identifier == "reference.sqlite-authority":
+            import hashlib
+
+            installed_authority = (
+                descriptor == bundled_authority_descriptor()
+                and reference["content_digest"]
+                == "sha256:" + hashlib.sha256(_authority_closure()).hexdigest()
+            )
+            if isinstance(provider, _BundledAuthorityProvider):
+                return (
+                    installed_authority
+                    and _bundled_factory_matches_source(
+                        "authority", bundled_sqlite_authority_provider_factory
+                    )
+                    and not _shadows_executable(provider)
+                )
+            return (
+                installed_authority
+                and provider is bundled_sqlite_authority_provider_factory
+                and _bundled_factory_matches_source("authority", provider)
+            )
         installed = (
             identifier
             in {
@@ -812,4 +909,36 @@ def bundled_extension_registry(
         registry.register(descriptor, make_provider)
         if evaluator is not None:
             registry._set_operational_evaluator(descriptor, evaluator)
+    authority_descriptor = bundled_authority_descriptor()
+    registry.register(authority_descriptor, bundled_sqlite_authority_provider_factory)
+
+    def authority_proof(instance: Any, health: str, claims: Sequence[str]) -> frozenset[str]:
+        authority = instance.get("authority") if isinstance(instance, dict) else None
+        store = instance.get("store") if isinstance(instance, dict) else None
+        if (
+            health != "healthy"
+            or type(authority) is not SQLiteLocalAuthority
+            or type(store) is not AuthoritySQLiteExecutionStore
+            or store.authority is not authority
+            or store.path != authority.path
+            or store.journal_mode != "WAL"
+            or store.synchronous != "FULL"
+        ):
+            return frozenset()
+        try:
+            authority.validate_schema()
+            store.validate_schema()
+            ledger = authority.inspect(store.scope_identity)
+        except (ValueError, KeyError):
+            return frozenset()
+        if (
+            ledger is None
+            or ledger["owner_principal"] != store.owner_principal
+            or ledger["authority_epoch"] != store.authority_epoch
+            or ledger["state"] not in ("active", "frozen")
+        ):
+            return frozenset()
+        return frozenset(claims) & frozenset(authority_descriptor["supported_capabilities"])
+
+    registry._set_operational_evaluator(authority_descriptor, authority_proof)
     return registry
