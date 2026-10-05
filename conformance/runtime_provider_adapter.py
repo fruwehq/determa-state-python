@@ -716,6 +716,11 @@ def execute(payload: dict[str, Any]) -> dict[str, Any]:
                     manifest["content"]["generated_validated_bundle_fingerprint"] = arguments[
                         "manifest_fingerprint_override"
                     ]
+                    from determa.state.wire import hash_value, typed_value
+
+                    manifest["artifact_digest"] = hash_value(
+                        [manifest["artifact_format"], "1", typed_value(manifest["content"])]
+                    )
             else:
                 manifest = None
             previous_profile = sys.getprofile()

@@ -53,13 +53,13 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: fruwehq/determa-state-conformance
-          ref: affe3fe3bcc4d13fa7c5374471568e94af36f0d1
+          ref: c6949440f5b9fd6e06ea5571f4e01681dd59ee04
           path: .pinned/determa-state-conformance
       - name: Check out pinned specification
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: fruwehq/determa-state-spec
-          ref: 86bb88dd21cb1f799eefe5020b6e49dabf6e7225
+          ref: 77c0a2e60cd0771a6d44ae170a079ddd51d7d9f0
           path: .pinned/determa-state-spec
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -88,13 +88,13 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: fruwehq/determa-state-conformance
-          ref: affe3fe3bcc4d13fa7c5374471568e94af36f0d1
+          ref: c6949440f5b9fd6e06ea5571f4e01681dd59ee04
           path: .pinned/determa-state-conformance
       - name: Check out pinned specification
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: fruwehq/determa-state-spec
-          ref: 86bb88dd21cb1f799eefe5020b6e49dabf6e7225
+          ref: 77c0a2e60cd0771a6d44ae170a079ddd51d7d9f0
           path: .pinned/determa-state-spec
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -126,13 +126,13 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: fruwehq/determa-state-conformance
-          ref: affe3fe3bcc4d13fa7c5374471568e94af36f0d1
+          ref: c6949440f5b9fd6e06ea5571f4e01681dd59ee04
           path: .pinned/determa-state-conformance
       - name: Check out pinned specification
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: fruwehq/determa-state-spec
-          ref: 86bb88dd21cb1f799eefe5020b6e49dabf6e7225
+          ref: 77c0a2e60cd0771a6d44ae170a079ddd51d7d9f0
           path: .pinned/determa-state-spec
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:

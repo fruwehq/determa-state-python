@@ -198,6 +198,9 @@ def test_exact_compilation_and_manifest_fingerprint() -> None:
     assert bundle.fingerprint == manifest["content"]["generated_validated_bundle_fingerprint"]
     assert bundle.source_compilation == {"source": source, "manifest": manifest}
     manifest["content"]["generated_validated_bundle_fingerprint"] = "sha256:" + "0" * 64
+    manifest["artifact_digest"] = hash_value(
+        [manifest["artifact_format"], "1", typed_value(manifest["content"])]
+    )
     with pytest.raises(RuntimeProviderError, match="language_compilation_failed"):
         compile_language_source(source, registry, manifest=manifest)
 
