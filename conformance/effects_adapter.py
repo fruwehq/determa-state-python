@@ -694,14 +694,16 @@ def _run_operation(payload: dict[str, Any], control: Path | None = None) -> dict
     elif operation == "terminalize_outbox":
         host.terminalize_outbox(_ROOT, arguments["effect_id"], {"status": arguments["status"]})
     elif operation == "submit_result":
-        response = host.submit_result(
+        submit = (
+            host._record_result if fault == "after_outcome_before_admission" else host.submit_result
+        )
+        response = submit(
             _ROOT,
             arguments,
             principal=context["principal"],
             scope=context["scope_identity"],
             epoch=context["scope_authority_epoch"],
             trusted_now=context["trusted_host_now"],
-            admit=fault != "after_outcome_before_admission",
         )
         caller_kind = "response"
         if fault == "after_outcome_before_admission":

@@ -1455,7 +1455,10 @@ def test_portable_producer_replay_requires_original_work_identity(tmp_path, dama
         "operation_token": token,
     }
     if damage is not None:
-        with pytest.raises(EffectError, match="operation_id_conflict"):
+        with pytest.raises(
+            EffectError,
+            match="replay_evidence_expired" if damage == "target" else "operation_id_conflict",
+        ):
             host.produce(root, "produce-1", target, **arguments)
     else:
         # Fixture journal response hash describes its pre-claim producer response.
@@ -1518,3 +1521,28 @@ def test_native_producer_replay_retains_exact_kind_and_request_identity(tmp_path
         else:
             assert host.produce(root, "shared-id", runtime, **arguments) == first
     assert host.snapshot(root) == before
+
+
+def test_portable_producer_identity_is_not_inferred_from_result_destination(tmp_path):
+    original, root, _, _ = host_fixture(tmp_path)
+    checkpoint = read("pending-checkpoint.json")
+    journal = read("data/unclaimed-journal.json")
+    record = journal["effect_records"][0]
+    source_runtime = checkpoint["root_record"]["aggregate_state"]["root_runtime_id"]
+    record["target"]["runtime_id"] = "another-result-runtime"
+    host = SQLiteCommittedEffectHost(
+        tmp_path / "different-target.sqlite", original.resolver, {}, None
+    )
+    host.setup_schema()
+    host.seed(checkpoint, seal_journal(journal))
+    arguments = {
+        "expected_revision": "stale",
+        "expected_digest": "stale",
+        "route_generation": "999",
+        "operation_token": record["operation_token"],
+    }
+    assert host.produce(root, "produce-1", source_runtime, **arguments) == read(
+        "data/producer-response.json"
+    )
+    with pytest.raises(EffectError, match="replay_evidence_expired"):
+        host.produce(root, "produce-1", record["target"]["runtime_id"], **arguments)

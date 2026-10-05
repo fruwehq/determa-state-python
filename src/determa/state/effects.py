@@ -496,6 +496,7 @@ def _reconstruct_producer_response(
     journal: Mapping[str, Any],
     operation_id: str,
     request_identity: Mapping[str, Any],
+    resolver: ArtifactResolver,
 ) -> dict[str, Any] | None:
     """Resolve a retained simple producer response from complete checkpoint evidence."""
     reference = next(
@@ -527,12 +528,7 @@ def _reconstruct_producer_response(
     ]
     if len(records) != len(emission_ids) or not records:
         raise EffectError("replay_evidence_expired")
-    if any(
-        record["target"]["root_instance_id"] != request_identity["root_instance_id"]
-        or record["target"]["runtime_id"] != request_identity["target_runtime_id"]
-        or record["operation_token"] != request_identity["operation_token"]
-        for record in records
-    ):
+    if any(record["operation_token"] != request_identity["operation_token"] for record in records):
         raise EffectError("operation_id_conflict")
     intents = {
         item["intent"]["effect_id"]: item["intent"] for item in checkpoint["pending_outbox_intents"]
@@ -550,6 +546,62 @@ def _reconstruct_producer_response(
     ]
     if len(emissions) != len(receipt["emission_references"]):
         raise EffectError("replay_evidence_expired")
+    # Result routing can name a different runtime from the emitting producer.
+    # Derive producer identity from actual effect IDs and trusted author send
+    # locations. Complex lifecycle emission histories without this evidence
+    # remain unavailable for portable reconstruction.
+    from .engine import _pointer_get
+    from .wire import _origin_machine
+
+    try:
+        aggregate = checkpoint["root_record"]["aggregate_state"]
+        source_runtime = next(
+            item
+            for item in aggregate["runtimes"]
+            if item["runtime_id"] == request_identity["target_runtime_id"]
+        )
+        bundle, machine = _origin_machine(
+            resolver, {"definition": source_runtime["current_definition"]}
+        )
+        namespace, machine_id, version = machine.definition_identity()
+        root_pointer = source_runtime["current_definition"]["machine"]["root_definition_pointer"]
+        pointers: list[str] = []
+
+        def visit(value: Any, pointer: str) -> None:
+            if isinstance(value, dict):
+                if "send" in value:
+                    pointers.append(pointer + "/send")
+                for name, child in value.items():
+                    visit(child, pointer + "/" + name.replace("~", "~0").replace("/", "~1"))
+            elif isinstance(value, list):
+                for index, child in enumerate(value):
+                    visit(child, pointer + "/" + str(index))
+
+        visit(_pointer_get(bundle.raw, root_pointer), root_pointer)
+        step_sequence = str(int(aggregate["next_logical_step_sequence"]) - 1)
+        for emission in receipt["emission_references"]:
+            if emission["kind"] != "external_outbox":
+                continue
+            if not any(
+                hash_value(
+                    [
+                        "determa-effect-identity-1",
+                        "1",
+                        [namespace, machine_id, str(version)],
+                        request_identity["root_instance_id"],
+                        request_identity["target_runtime_id"],
+                        receipt["event_id"],
+                        step_sequence,
+                        pointer,
+                        emission["emission_index"],
+                    ]
+                )
+                == emission["effect_id"]
+                for pointer in pointers
+            ):
+                raise EffectError("replay_evidence_expired")
+    except (ArtifactError, KeyError, TypeError, ValueError, StopIteration) as exc:
+        raise EffectError("replay_evidence_expired") from exc
     outcome = receipt["outcome"]
     response = {
         "kind": "processing",
@@ -1152,6 +1204,7 @@ class SQLiteCommittedEffectHost:
                 document["journal"],
                 operation_id,
                 request_identity,
+                self.resolver,
             )
             if reconstructed is not None:
                 return reconstructed
