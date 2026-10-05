@@ -747,3 +747,53 @@ def test_requested_profile_cannot_skip_composition() -> None:
             weak_profile_opt_in=True,
             host_guarantees={"deterministic": True},
         )
+
+
+def test_bundled_binding_supports_current_python_platform() -> None:
+    """Expose the first failed binding check when an interpreter changes layout."""
+    import sys
+
+    failures: list[tuple[str, int, str, str, str]] = []
+
+    def trace(frame: object, event: str, value: object) -> object:
+        # Only names and source locations are recorded, never runtime values.
+        from types import FrameType
+
+        assert isinstance(frame, FrameType)
+        if (
+            event == "return"
+            and value is False
+            and frame.f_code.co_name
+            in {
+                "walk",
+                "matches",
+                "binding_matches",
+                "installed_module_attribute",
+                "verify_definition",
+                "verify_function",
+                "same_executable",
+            }
+            and len(failures) < 20
+        ):
+            namespace = frame.f_locals
+            target = namespace.get("value", namespace.get("original"))
+            failures.append(
+                (
+                    frame.f_code.co_name,
+                    frame.f_lineno,
+                    str(namespace.get("attribute", namespace.get("member_name", ""))),
+                    type(target).__name__,
+                    str(getattr(target, "__name__", "")),
+                )
+            )
+        return trace
+
+    previous = sys.gettrace()
+    try:
+        sys.settrace(trace)
+        matches = extensions._bundled_factory_matches_source(
+            "memory", memory_module.memory_execution_store_factory
+        )
+    finally:
+        sys.settrace(previous)
+    assert matches, failures
