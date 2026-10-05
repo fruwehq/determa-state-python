@@ -319,6 +319,25 @@ def _run_operation(payload: dict[str, Any], control: Path | None = None) -> dict
         authority_scope=_AUTHORITY_SCOPE,
         core_observer=observe_core,
     )
+    # Install the vector's pre-existing authority facts as trusted test setup.
+    # The production seed path may restore these claims, but cannot issue them.
+    with authority._connect() as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        row = connection.execute(
+            "SELECT ledger FROM determa_scope_authority WHERE scope_identity = ?",
+            (_AUTHORITY_SCOPE,),
+        ).fetchone()
+        ledger = json.loads(row[0])
+        ledger["active_claims"] = [copy.deepcopy(payload["claim"])] if payload["claim"] else []
+        ledger["journal_entries"] = [
+            {"work_identity": record["effect_id"], "attempt_fence": record["attempt_fence"]}
+            for record in journal["effect_records"]
+        ]
+        connection.execute(
+            "UPDATE determa_scope_authority SET ledger = ? WHERE scope_identity = ?",
+            (json.dumps(ledger), _AUTHORITY_SCOPE),
+        )
+        connection.commit()
     host.seed(checkpoint, journal, payload["claim"])
     before = host.snapshot(_ROOT)
     operation = payload["operation"]

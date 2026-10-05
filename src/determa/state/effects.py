@@ -431,8 +431,35 @@ class SQLiteCommittedEffectHost:
                 if row is None:
                     raise EffectError("stale_scope_authority")
                 ledger = json.loads(row[0])
-                if checkpoint["root_instance_id"] not in ledger["roots"]:
+                if (
+                    ledger["state"] != "active"
+                    or self.route.get("authority_epoch") != ledger["authority_epoch"]
+                ):
+                    raise EffectError("stale_scope_authority")
+                if (
+                    checkpoint["root_instance_id"] not in ledger["roots"]
+                    or journal["scope_identity"] != self.authority_scope
+                ):
                     raise EffectError("unauthorized_scope")
+                # Restoring an already claimed invocation cannot mint authority.
+                # Its exact claim must already have been issued by this ledger.
+                if claim is not None and (
+                    dict(claim) not in ledger["active_claims"]
+                    or claim.get("scope_identity") != self.authority_scope
+                    or claim.get("root_instance_id") != checkpoint["root_instance_id"]
+                    or claim.get("scope_authority_epoch") != ledger["authority_epoch"]
+                ):
+                    raise EffectError("stale_attempt_fence")
+                for record in journal["effect_records"]:
+                    if (
+                        record["attempt_fence"] != "0"
+                        and {
+                            "work_identity": record["effect_id"],
+                            "attempt_fence": record["attempt_fence"],
+                        }
+                        not in ledger["journal_entries"]
+                    ):
+                        raise EffectError("stale_attempt_fence")
                 self._mirror_authority(ledger, document)
                 connection.execute(
                     "UPDATE determa_scope_authority SET ledger = ? WHERE scope_identity = ?",
@@ -544,7 +571,6 @@ class SQLiteCommittedEffectHost:
                         raise EffectError("unauthorized_scope")
                     replay = journal_record["invocation_state"] in {
                         "result_admitted",
-                        "outcome_recorded",
                         "closed",
                         "unclaimed",
                         "ambiguous",
@@ -963,7 +989,8 @@ class SQLiteCommittedEffectHost:
             scope,
             epoch,
             trusted_now,
-            allow_replay=retained is not None,
+            allow_replay=retained is not None
+            and (kind not in _OUTCOMES or preexisting["admission_receipt"] is not None),
         )
         key = effect_id + ":" + fence
         prior = document["result_requests"].get(key)

@@ -126,3 +126,69 @@ def test_payload_pointer_inserts_pinned_token_before_declared_input_admission(tm
         "map",
         [["provider_reference", ["string", request["operation_token"]]]],
     ]
+
+
+def test_expired_worker_cannot_admit_recorded_outcome_but_host_recovery_can(tmp_path):
+    host, root, request, context = host_fixture(tmp_path)
+    host.submit_result(root, request, admit=False, **context)
+    before = host.snapshot(root)
+    context["trusted_now"] = read("data/active-claim.json")["expires_at"]
+    assert host.submit_result(root, request, **context)["error_code"] == "stale_attempt_fence"
+    assert host.snapshot(root) == before
+    assert (
+        host.recover(root)["journal"]["effect_records"][0]["invocation_state"] == "result_admitted"
+    )
+
+
+@pytest.mark.parametrize("boundary", ["frozen", "wrong_epoch", "wrong_scope", "unissued_claim"])
+def test_authority_seed_cannot_bypass_scope_or_claim_guard(tmp_path, boundary):
+    from determa.state.authority import SQLiteLocalAuthority
+    from determa.state.wire import hash_value
+
+    bundle = load_bundle((CASE / "machine.yaml").read_text())
+    resolver = MemoryArtifactResolver(definitions={bundle.fingerprint: bundle})
+    checkpoint = read("pending-checkpoint.json")
+    journal = read("data/leased-journal.json")
+    claim = read("data/active-claim.json")
+    scope, root = journal["scope_identity"], checkpoint["root_instance_id"]
+    authority = SQLiteLocalAuthority(tmp_path / "authority.sqlite")
+    authority.setup_schema()
+    assert authority.allocate(scope, "owner", roots=(root,))
+    claim["scope_authority_epoch"] = "0"
+    epoch = "9" if boundary == "wrong_epoch" else "0"
+    host = SQLiteCommittedEffectHost(
+        authority.path, resolver, {"authority_epoch": epoch}, lambda *_: {}, authority_scope=scope
+    )
+    host.setup_schema()
+    if boundary == "frozen":
+        request = {
+            "interface": "determa.host_authority",
+            "interface_version": 1,
+            "operation": "freeze_scope",
+            "operation_id": "freeze",
+            "scope_identity": scope,
+            "expected_authority_epoch": "0",
+            "expected_scope_generation": "0",
+            "arguments": {},
+        }
+        request["request_digest"] = hash_value(["determa-host-authority-request-1", request])
+        response = authority.perform(
+            json.dumps(request),
+            {
+                "authenticated_principal": "owner",
+                "authorized_scopes": [scope],
+                "operation_rights": ["freeze_scope"],
+            },
+        )
+        assert json.loads(response)["state"] == "frozen"
+    if boundary == "wrong_scope":
+        journal["scope_identity"] = "other-scope"
+        journal = seal_journal(journal)
+    before = authority.inspect(scope)
+    with pytest.raises(EffectError):
+        host.seed(checkpoint, journal, claim)
+    assert authority.inspect(scope) == before
+    with host._connect() as connection:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM determa_committed_effects").fetchone()[0] == 0
+        )
