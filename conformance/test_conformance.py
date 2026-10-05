@@ -147,7 +147,7 @@ def test_suite_present() -> None:
     assert len(core_cases()) == 99
     assert len(version1_vectors()) == 162
     assert len(durable_host_vectors()) == 142
-    assert len(_manifest_artifacts()) == 476
+    assert len(_manifest_artifacts()) == 484
 
 
 @pytest.mark.parametrize("stored", [b"mutated", None])
