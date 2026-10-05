@@ -25,6 +25,16 @@ and terminal replay. The optional public extension registry validates exact prov
 references, loaded source closure, configured health, and currently proved claims
 before evaluating a requested profile.
 
+`ApplicationProjectionFacade` binds explicitly selected application rows to one
+root. Supply an `ApplicationRowMapping` that reads and writes those rows through
+the configured execution store's native shared transaction. The mapping provides
+typed input, projects the proposed complete checkpoint into selected rows and
+supplemental storage, and reconstructs it for a precommit round-trip check. `run`
+returns the exact create, admit, or step result after commit; a retained delivery
+returns its receipt before current row input is mapped. The optional aggregate-only
+step path uses the mapping's `reconstruct_aggregate` and `project_aggregate`
+methods when no checkpoint exists.
+
 ## Install
 
 To try the `0.3.0` release candidate before publication, install it from a checkout:
