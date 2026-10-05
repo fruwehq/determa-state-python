@@ -12,6 +12,7 @@ import json
 import re
 import sqlite3
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, TypeVar, cast
 
@@ -457,6 +458,7 @@ def _issue_effect_claim(
     return copy.deepcopy(claim)
 
 
+@dataclass(frozen=True, slots=True, init=False)
 class VerifiedNativeHandler:
     """An exact native-handler instance installed through the public registry.
 
@@ -464,14 +466,19 @@ class VerifiedNativeHandler:
     dependency closure. This handle never promotes provider claims into proof.
     """
 
+    _registry: ExtensionRegistry
+    _configured: ConfiguredExtension
+    _reference: dict[str, Any]
+    _configuration: dict[str, Any]
+
     def __init__(self, registry: ExtensionRegistry, configured: ConfiguredExtension) -> None:
-        self._registry = registry
-        self._configured = configured
+        object.__setattr__(self, "_registry", registry)
+        object.__setattr__(self, "_configured", configured)
         descriptor, _provider, _instance, _evaluator = registry._bound(configured)
         if descriptor["category"] != "native_handler":
             raise EffectError("host_capability_mismatch")
-        self._reference = copy.deepcopy(descriptor["provider_reference"])
-        self._configuration = copy.deepcopy(configured._configuration)
+        object.__setattr__(self, "_reference", copy.deepcopy(descriptor["provider_reference"]))
+        object.__setattr__(self, "_configuration", copy.deepcopy(configured._configuration))
         destination = self._configuration.get("destination_binding_digest")
         if type(destination) is not str or not re.fullmatch(r"sha256:[0-9a-f]{64}", destination):
             raise EffectError("host_capability_mismatch")
@@ -503,7 +510,9 @@ class VerifiedNativeHandler:
         metadata: Mapping[str, Any],
         attempt: Mapping[str, Any],
     ) -> Mapping[str, Any]:
-        method, instance = self.verify(reference, metadata["destination_binding_digest"])
+        method, instance = VerifiedNativeHandler.verify(
+            self, reference, metadata["destination_binding_digest"]
+        )
         return cast(Mapping[str, Any], method(instance, payload, metadata, attempt))
 
 
@@ -544,7 +553,7 @@ class SQLiteCommittedEffectHost:
             or self.handler is not self._installed_handler
         ):
             raise EffectError("host_capability_mismatch")
-        self.handler.verify(reference, destination)
+        VerifiedNativeHandler.verify(self.handler, reference, destination)
         return self.handler
 
     def _connect(self) -> sqlite3.Connection:
@@ -1124,7 +1133,8 @@ class SQLiteCommittedEffectHost:
             handler = self._verified_handler(
                 record["handler_reference"], record["destination_binding_digest"]
             )
-            result = handler.invoke(
+            result = VerifiedNativeHandler.invoke(
+                handler,
                 record["handler_reference"],
                 copy.deepcopy(intent["payload"]),
                 metadata,

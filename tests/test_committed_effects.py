@@ -673,3 +673,23 @@ def test_handler_fixture_verifier_rejects_changed_generated_or_executable_code(m
     else:
         monkeypatch.setattr(module.NativeReply, member, lambda *args: None)
     assert not _verified_fixture_handler(module)
+
+
+@pytest.mark.parametrize("method", ["invoke", "verify"])
+def test_verified_native_handle_cannot_shadow_its_trusted_methods(tmp_path, method):
+    host, root, request, context = host_fixture(tmp_path)
+    record = host.snapshot(root)["journal"]["effect_records"][0]
+    host.route.update(
+        {key: record[key] for key in ("handler_reference", "destination_binding_digest")}
+    )
+    calls = []
+    host = installed_test_handler(host, lambda *args: calls.append(args) or {"accepted": True})
+    host.trusted_clock = lambda: "0"
+    with pytest.raises((AttributeError, TypeError)):
+        setattr(host.handler, method, lambda *args: {"unverified": True})
+    with pytest.raises(AttributeError):
+        object.__setattr__(host.handler, method, lambda *args: {"unverified": True})
+    assert host.dispatch(root, request["effect_id"], credential="test-credential", **context) == {
+        "accepted": True
+    }
+    assert len(calls) == 1
