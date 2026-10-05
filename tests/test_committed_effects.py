@@ -481,6 +481,31 @@ def test_generic_registration_preserves_binding_and_expiry_does_not_prove_retry_
     assert authority.inspect("scope") == before
 
 
+def test_native_worker_guard_refuses_unbound_claim_even_with_valid_native_root(tmp_path):
+    authority, host, scope, root, record = authority_effect_fixture(tmp_path)
+    request, invocation = authority_claim_request(authority, scope, root, record)
+    claim = json.loads(authority.perform(request, invocation))["claim"]
+    assert authority.check_worker_claim(claim, "worker-a", "0", phase="dispatch")
+    unbound = {**claim, "work_identity": "unbound-work", "operation_token": "unbound-token"}
+    with authority._connect() as connection:
+        ledger = authority.inspect(scope)
+        ledger["journal_entries"].append(
+            {"work_identity": unbound["work_identity"], "attempt_fence": unbound["attempt_fence"]}
+        )
+        ledger["active_claims"].append(unbound)
+        connection.execute(
+            "UPDATE determa_scope_authority SET ledger = ? WHERE scope_identity = ?",
+            (json.dumps(ledger), scope),
+        )
+    before = host.snapshot(root)
+    calls = []
+    assert not authority.check_worker_claim(
+        unbound, "worker-a", "0", phase="dispatch", on_dispatch=lambda: calls.append("called")
+    )
+    assert calls == []
+    assert host.snapshot(root) == before
+
+
 def test_authority_claim_atomically_updates_native_journal_and_replays_once(tmp_path):
     authority, host, scope, root, record = authority_effect_fixture(tmp_path)
     request, invocation = authority_claim_request(authority, scope, root, record)

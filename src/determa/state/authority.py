@@ -894,13 +894,37 @@ class SQLiteLocalAuthority:
                 from .effects import EffectError, _validate_authority_pair
 
                 try:
+                    bindings = [
+                        item
+                        for item in ledger.get("native_effect_work", [])
+                        if item["work_identity"] == stored["work_identity"]
+                    ]
+                    if len(bindings) != 1 or any(
+                        bindings[0][key] != stored[key]
+                        for key in ("root_instance_id", "work_kind", "operation_token")
+                    ):
+                        return False
                     native = connection.execute(
                         "SELECT document FROM determa_committed_effects WHERE root_instance_id = ?",
                         (stored["root_instance_id"],),
                     ).fetchone()
                     if native is None:
                         return False
-                    _validate_authority_pair(ledger, _parse(bytes(native[0]).decode()))
+                    document = _parse(bytes(native[0]).decode())
+                    records = [
+                        item
+                        for item in document["journal"]["effect_records"]
+                        if item["effect_id"] == stored["work_identity"]
+                    ]
+                    if (
+                        len(records) != 1
+                        or records[0]["operation_token"] != stored["operation_token"]
+                        or records[0]["attempt_fence"] != stored["attempt_fence"]
+                        or records[0]["invocation_state"] != "leased"
+                        or document["claims"].get(stored["work_identity"]) != stored
+                    ):
+                        return False
+                    _validate_authority_pair(ledger, document)
                 except (EffectError, sqlite3.Error, ValueError):
                     return False
             if phase == "dispatch" and on_dispatch is not None:
