@@ -1526,6 +1526,7 @@ class SharedExecutionTransaction:
         self.root_instance_id = root_instance_id
         self._active = True
         self._response: dict[str, Any] | None = None
+        self._operation: str | None = None
 
     def _stage(
         self,
@@ -1537,11 +1538,16 @@ class SharedExecutionTransaction:
         if self._response is not None:
             raise ExecutionHostError("shared_transaction_operation_conflict")
         self._response = invoke()
+        self._operation = operation
         return StagedExecutionResult(operation)
 
     def _finish(self) -> dict[str, Any]:
         if self._response is None:
             raise ExecutionHostError("shared_transaction_operation_required")
+        # Queue-bearing admission returns committed acceptance evidence rather
+        # than the result discriminator used by create/migration operations.
+        if self._operation == "admit_v1" and set(self._response) == {"evidence"}:
+            return self._response
         if self._response["result"] not in {
             "committed",
             "pending",
@@ -1553,6 +1559,12 @@ class SharedExecutionTransaction:
 
     def _deactivate(self) -> None:
         self._active = False
+
+    def read_checkpoint(self) -> RestoredExecutionCheckpoint | None:
+        """Read and resolver-validate the bound root inside this transaction."""
+        if not self._active:
+            raise ExecutionHostError("shared_transaction_closed")
+        return self._host.read_checkpoint(self.root_instance_id)
 
     def create_v1(
         self,

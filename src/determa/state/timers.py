@@ -1,8 +1,8 @@
 """Explicit foreground SQLite timer records, separate from portable checkpoints.
 
-This implementation checkpoint supports durable schedule/cancel/read and initial claims.
-Fire, coordinated admission, verified provider installation and archive integration
-remain unfinished; no completed timer profile is advertised yet.
+This implementation checkpoint supports durable schedule/cancel/read, initial claims
+and coordinated SQLite admission. Proved-fate reclaim, verified provider installation,
+archive and recovery integration remain unfinished; no completed profile is advertised.
 """
 
 from __future__ import annotations
@@ -19,6 +19,13 @@ from typing import Any
 from .definition import Bundle
 from .engine import _normalize_payload
 from .errors import ArtifactError
+from .host import (
+    ExecutionHost,
+    ExecutionHostError,
+    SharedExecutionTransaction,
+    delivery_request_digest,
+)
+from .stores.sqlite import SQLiteApplicationTransaction, SQLiteExecutionStore
 from .wire import _schema_registry, canonical_bytes, decoded_typed_value, hash_value, strict_json
 
 _TIME = re.compile(r"(?:0|-?[1-9][0-9]*)\Z")
@@ -40,6 +47,13 @@ class TimerError(ValueError):
     def __init__(self, code: str) -> None:
         self.code = code
         super().__init__(code)
+
+
+class _TimerReturn(Exception):
+    """Return a replay/refusal only after rolling back the shared host callback."""
+
+    def __init__(self, result: dict[str, Any]) -> None:
+        self.result = result
 
 
 def timer_request_digest(request: Mapping[str, Any]) -> str:
@@ -133,6 +147,7 @@ class SQLiteTimerHelper:
         trusted_clock: Callable[[], str],
         worker_principals: frozenset[str] = frozenset(),
         claim_lease_nanoseconds: str = "20",
+        coordinated_host: ExecutionHost | None = None,
     ) -> None:
         if (
             str(path) == ":memory:"
@@ -150,6 +165,13 @@ class SQLiteTimerHelper:
         self.root_runtime_id = root_runtime_id
         self.principals = frozenset(principals)
         self.trusted_clock = trusted_clock
+        self.coordinated_host = coordinated_host
+        if coordinated_host is not None and (
+            type(coordinated_host.store) is not SQLiteExecutionStore
+            or Path(coordinated_host.store.path).resolve() != Path(self.path)
+            or not coordinated_host.store.shared_application_transactions
+        ):
+            raise ValueError("coordinated admission requires the same host-owned SQLite database")
         self.worker_principals = frozenset(worker_principals)
         self.claim_lease_nanoseconds = _time(claim_lease_nanoseconds, duration=True)
         if self.claim_lease_nanoseconds == 0 or not self.worker_principals <= self.principals:
@@ -171,20 +193,23 @@ class SQLiteTimerHelper:
             connection.execute(_TABLE.replace("CREATE TABLE", "CREATE TABLE IF NOT EXISTS", 1))
         self.validate_schema()
 
-    def _schema(self, connection: sqlite3.Connection) -> None:
+    def _schema(self, connection: sqlite3.Connection | SQLiteApplicationTransaction) -> None:
         rows = connection.execute(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='determa_timer_helpers'"
+            "SELECT type,sql FROM sqlite_master "
+            "WHERE tbl_name='determa_timer_helpers' ORDER BY type"
         ).fetchall()
-        if rows != [(_TABLE,)] or connection.execute("PRAGMA integrity_check").fetchone() != (
-            "ok",
-        ):
+        if rows != [("index", None), ("table", _TABLE)] or connection.execute(
+            "PRAGMA integrity_check"
+        ).fetchone() != ("ok",):
             raise TimerError("timer_capability_mismatch")
 
     def validate_schema(self) -> None:
         with closing(self._connect()) as connection:
             self._schema(connection)
 
-    def _load(self, connection: sqlite3.Connection) -> dict[str, Any]:
+    def _load(
+        self, connection: sqlite3.Connection | SQLiteApplicationTransaction
+    ) -> dict[str, Any]:
         row = connection.execute(
             "SELECT document FROM determa_timer_helpers WHERE scope_identity=?",
             (self.scope_identity,),
@@ -219,7 +244,11 @@ class SQLiteTimerHelper:
             self._schema(connection)
             return self._load(connection)
 
-    def _persist(self, connection: sqlite3.Connection, artifact: dict[str, Any]) -> None:
+    def _persist(
+        self,
+        connection: sqlite3.Connection | SQLiteApplicationTransaction,
+        artifact: dict[str, Any],
+    ) -> None:
         artifact["records"].sort(
             key=lambda record: (
                 record["scope_identity"],
@@ -257,6 +286,151 @@ class SQLiteTimerHelper:
         except Exception as error:
             raise TimerError("timer_clock_unavailable") from error
 
+    def _complete(self, request: Mapping[str, Any], principal: str) -> dict[str, Any]:
+        host = self.coordinated_host
+        assert host is not None
+        if (
+            type(host.store) is not SQLiteExecutionStore
+            or Path(host.store.path).resolve() != Path(self.path)
+            or not host.store.shared_application_transactions
+        ):
+            return _result(request, None, "timer_capability_mismatch")
+        committed: list[dict[str, Any]] = []
+
+        def callback(
+            sql: SQLiteApplicationTransaction, execution: SharedExecutionTransaction
+        ) -> None:
+            record = None
+            try:
+                self._schema(sql)
+                artifact = self._load(sql)
+                record = next(
+                    (
+                        item
+                        for item in artifact["records"]
+                        if item["timer_id"] == request["timer_id"]
+                        and item["root_instance_id"] == self.root_instance_id
+                        and item["root_runtime_id"] == self.root_runtime_id
+                    ),
+                    None,
+                )
+                previous = next(
+                    (
+                        item
+                        for item in artifact["operation_receipts"]
+                        if item["operation_id"] == request["operation_id"]
+                    ),
+                    None,
+                )
+                if previous is not None:
+                    raise _TimerReturn(
+                        copy.deepcopy(previous["result"])
+                        if previous["request_digest"] == request["request_digest"]
+                        else _result(request, record, "timer_operation_conflict")
+                    )
+                if record is None:
+                    raise TimerError("timer_not_found")
+                arguments = request["arguments"]
+                if record["attempt_fence"] != arguments["attempt_fence"]:
+                    raise TimerError("timer_stale_fence")
+                if record["revision"] != arguments["expected_revision"]:
+                    raise TimerError("timer_revision_conflict")
+                if record["state"] != "claimed":
+                    raise TimerError(
+                        "timer_already_fired"
+                        if record["state"] == "fired"
+                        else "timer_cancelled"
+                        if record["state"] == "cancelled"
+                        else "timer_stale_fence"
+                    )
+                if record["worker_principal"] != principal:
+                    raise TimerError("timer_worker_mismatch")
+                if record["event_id"] != arguments["event_id"]:
+                    raise TimerError("timer_event_conflict")
+                if self._now() >= _time(record["expires_at"]):
+                    raise TimerError("timer_stale_fence")
+                restored = execution.read_checkpoint()
+                if restored is None:
+                    raise TimerError("timer_admission_rejected")
+                before = restored.document
+                aggregate = before["root_record"].get("aggregate_state")
+                if (
+                    not aggregate
+                    or aggregate["root_runtime_id"] != self.root_runtime_id
+                    or (aggregate["validated_bundle_fingerprint"] != self.bundle.fingerprint)
+                ):
+                    raise TimerError("unauthorized_timer_scope")
+                envelope = {
+                    "event": record["event_name"],
+                    "event_id": record["event_id"],
+                    "cause_id": record["event_id"],
+                    "source": {"host": True},
+                    "target": {
+                        "root": {
+                            "root_instance_id": self.root_instance_id,
+                            "root_runtime_id": self.root_runtime_id,
+                        }
+                    },
+                    "payload": record["payload"],
+                }
+                if record["correlation_id"] is not None:
+                    envelope["correlation_id"] = record["correlation_id"]
+                envelope_digest = delivery_request_digest(self.root_instance_id, "input", envelope)
+                execution.admit_v1(
+                    [
+                        {
+                            "delivery_mode": "input",
+                            "envelope": envelope,
+                            "envelope_digest": envelope_digest,
+                        }
+                    ],
+                    expected_revision=before["revision"],
+                    expected_checkpoint_digest=before["execution_checkpoint_digest"],
+                )
+                candidate = execution.read_checkpoint()
+                assert candidate is not None
+                receipt = next(
+                    (
+                        item
+                        for item in candidate.document["operation_receipts"]
+                        if item["operation_kind"] == "acceptance"
+                        and item["event_id"] == record["event_id"]
+                    ),
+                    None,
+                )
+                if receipt is None or receipt["request_digest"] != envelope_digest:
+                    raise TimerError("timer_admission_rejected")
+                receipt_digest = hash_value(["determa-timer-admission-receipt-1", receipt])
+                if receipt_digest != arguments["admission_receipt_digest"]:
+                    raise TimerError("timer_event_conflict")
+                record.update(
+                    state="fired",
+                    revision=str(int(record["revision"]) + 1),
+                    worker_principal=None,
+                    expires_at=None,
+                    admission_receipt_digest=receipt_digest,
+                )
+                result = _result(request, record)
+                artifact["operation_receipts"].append(
+                    {
+                        "operation_id": request["operation_id"],
+                        "request_digest": request["request_digest"],
+                        "result": result,
+                    }
+                )
+                self._persist(sql, artifact)
+                committed.append(result)
+            except TimerError as error:
+                raise _TimerReturn(_result(request, record, error.code)) from error
+            except ExecutionHostError as error:
+                raise _TimerReturn(_result(request, record, "timer_admission_rejected")) from error
+
+        try:
+            host.run_shared_transaction(self.root_instance_id, callback)
+        except _TimerReturn as returned:
+            return returned.result
+        return committed[0]
+
     def execute(self, request: Mapping[str, Any], *, principal: str) -> dict[str, Any]:
         if not isinstance(request, Mapping) or request.get("interface") != "determa.timer_helper":
             return _result(None, None, "unsupported_timer_protocol")
@@ -292,6 +466,8 @@ class SQLiteTimerHelper:
             or request["arguments"]["worker_principal"] != principal
         ):
             return _result(request, None, "unauthorized_timer_scope")
+        if request["operation"] == "complete_fire" and self.coordinated_host is not None:
+            return self._complete(request, principal)
         record = None
         connection = self._connect()
         try:
