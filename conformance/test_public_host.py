@@ -78,3 +78,40 @@ def test_local_host_exact_public_core_goldens(tmp_path):
             assert host.handle(case["request"], principal="alice") == case["response"], case["name"]
             observed.add(case["name"])
     assert observed == names
+
+
+@pytest.mark.parametrize(
+    ("name", "fixture", "initial"),
+    [
+        ("admit_declared_event", "execution-checkpoint-transfer-v1.json", "before_admission"),
+        ("process_unhandled_event", "execution-checkpoint-transfer-v1.json", "after_admission"),
+        ("process_deferred_event", "queue-placement-checkpoints-v1.json", "after_second_admission"),
+        ("process_recall_event", "queue-placement-checkpoints-v1.json", "after_received_admission"),
+    ],
+)
+def test_local_host_exact_delivery_goldens(tmp_path, name, fixture, initial):
+    import sqlite3
+
+    from determa.state import restore_execution_checkpoint_v1
+
+    spec = Path(os.environ["DETERMA_SPEC_DIR"])
+    bundle = load_bundle((spec / "examples/portable-event-deferral.yaml").read_text())
+    resolver = MemoryArtifactResolver(definitions={bundle.fingerprint: bundle})
+    checkpoint = json.loads((spec / "examples/delivery" / fixture).read_text())[initial]
+    restore_execution_checkpoint_v1(checkpoint, resolver)
+    host = SQLitePublicExecutionHost(
+        tmp_path / "host.db",
+        scope_alias="scope",
+        scope_binding_identity="binding-local-1",
+        authorized_principals=frozenset({"alice"}),
+        resolver=resolver,
+    )
+    host.setup_schema()
+    with sqlite3.connect(host.path) as db:
+        db.execute(
+            "INSERT INTO determa_public_host_checkpoints VALUES (?,?)",
+            (checkpoint["root_instance_id"], canonical_bytes(checkpoint)),
+        )
+    case = next(case for case in goldens("positive-v1.json")["cases"] if case["name"] == name)
+    assert host.handle(case["request"], principal="alice") == case["response"]
+    assert host.handle(case["request"], principal="alice") == case["response"]

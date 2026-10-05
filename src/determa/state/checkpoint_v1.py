@@ -960,7 +960,10 @@ def step_checkpoint_v1(
     candidate["root_record"]["aggregate_state"] = result["state"]
     if result["disposition"] == "deferred":
         _synchronize_mailbox_references(candidate)
-        return seal_execution_checkpoint(candidate)
+        sealed = seal_execution_checkpoint(candidate)
+        if _include_host_response:
+            return {"checkpoint": sealed, "core_result": copy.deepcopy(result), "receipt": None}
+        return sealed
     receipt_sequence = candidate["next_operation_receipt_sequence"]
     lifecycle_sequences = [
         str(int(receipt_sequence) + index + 1)
