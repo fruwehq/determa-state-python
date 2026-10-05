@@ -522,6 +522,64 @@ def test_bundled_contextmanager_rejects_forged_wrapped_target(
     assert called == 0
 
 
+def test_bundled_rejects_transitive_stdlib_callback_before_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = bundled_extension_registry(include_postgresql=False)
+    record = next(
+        item
+        for item in registry.descriptors
+        if item["provider_reference"]["identifier"] == "determa.store.memory"
+    )
+    original = memory_module.threading._CRLock  # type: ignore[attr-defined]
+    called = 0
+
+    def substituted(*args: object, **kwargs: object) -> object:
+        nonlocal called
+        called += 1
+        return original(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(memory_module.threading, "_CRLock", substituted)
+        with pytest.raises(ExtensionError, match="extension_identity_mismatch"):
+            registry.negotiate(
+                record, {"instance_id": "primary", "uri": "memory:", "store_configuration": {}}
+            )
+    assert called == 0
+
+
+def test_bundled_rejects_rebound_decorator_before_reference_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import contextlib
+    import sys
+
+    registry = bundled_extension_registry(include_postgresql=False)
+    record = next(
+        item
+        for item in registry.descriptors
+        if item["provider_reference"]["identifier"] == "determa.store.memory"
+    )
+    original = contextlib.contextmanager
+    called = 0
+
+    def substituted(*args: object, **kwargs: object) -> object:
+        nonlocal called
+        called += 1
+        return original(*args, **kwargs)  # type: ignore[arg-type]
+
+    with monkeypatch.context() as patch:
+        patch.setattr(contextlib, "contextmanager", substituted)
+        for name, module in tuple(sys.modules.items()):
+            if name.startswith("determa.state.") and vars(module).get("contextmanager") is original:
+                patch.setattr(module, "contextmanager", substituted)
+        with pytest.raises(ExtensionError, match="extension_identity_mismatch"):
+            registry.negotiate(
+                record, {"instance_id": "primary", "uri": "memory:", "store_configuration": {}}
+            )
+    assert called == 0
+
+
 def test_bundled_rejects_changed_descriptor_but_allows_mutable_data(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

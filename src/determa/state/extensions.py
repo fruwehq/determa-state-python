@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from ._platform_bindings import PLATFORM_BINDINGS
 from .codes import ExtensionNegotiationFailureCode as Code
 from .errors import DetermaError
 
@@ -525,6 +526,7 @@ def _bundled_factory_matches_source(name: str, factory: Any) -> bool:
     """Bind the loaded package callbacks used by a bundled store to hashed source."""
     import ast
     import importlib
+    import sys
     import types
 
     package = Path(__file__).parent
@@ -552,6 +554,8 @@ def _bundled_factory_matches_source(name: str, factory: Any) -> bool:
             # External validator implementations are a separate installed
             # dependency; this check binds executable stdlib imports.
             return root_name != "determa"
+        if not PLATFORM_BINDINGS.matches(module, attribute):
+            return False
         value = vars(module).get(attribute)
         defining_name = getattr(value, "__module__", None)
         if not isinstance(defining_name, str) or not isinstance(
@@ -730,6 +734,12 @@ def _bundled_factory_matches_source(name: str, factory: Any) -> bool:
                         if alias.name == "*" or vars(origin).get(
                             alias.asname or alias.name
                         ) is not getattr(imported, alias.name, None):
+                            return None
+                        if (
+                            callable(getattr(imported, alias.name, None))
+                            and imported.__name__.split(".", 1)[0] in sys.stdlib_module_names
+                            and not PLATFORM_BINDINGS.matches(imported, alias.name)
+                        ):
                             return None
             compiled[origin.__name__] = compile(source, str(source_path), "exec")
             syntax[origin.__name__] = tree
