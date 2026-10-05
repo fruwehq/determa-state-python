@@ -96,3 +96,31 @@ def test_sqlite_default_store_refuses_shared_transaction(tmp_path):
     host = ExecutionHost(store, _resolver())
     with pytest.raises(Exception, match="adapter_capability_mismatch"):
         host.run_shared_transaction("root", lambda sql, execution: None)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "DROP TRIGGER determa_execution_checkpoints_forbid_delete",
+        "DELETE FROM determa_execution_checkpoints WHERE root_instance_id='victim'",
+        "DROP TABLE determa_execution_checkpoints",
+        "UPDATE determa_execution_checkpoints SET revision='999' WHERE root_instance_id='victim'",
+        "CREATE TRIGGER app_delete AFTER INSERT ON applications "
+        "BEGIN DELETE FROM determa_execution_checkpoints; END",
+    ],
+)
+def test_application_sql_cannot_change_protected_engine_storage(tmp_path, statement):
+    store, host = configured(tmp_path)
+    host.create_v1(load_bundle(MACHINE), "counter", "victim", "create-victim", {})
+    before = host.read_checkpoint("victim").document
+
+    def callback(sql, execution):
+        execution.create_v1(load_bundle(MACHINE), "counter", "create-other", {})
+        sql.execute(statement)
+        sql.execute("INSERT INTO applications VALUES ('trigger-attack')")
+
+    with pytest.raises(sqlite3.DatabaseError, match="(not authorized|prohibited)"):
+        host.run_shared_transaction("other-root", callback)
+    assert host.read_checkpoint("victim").document == before
+    assert host.read_checkpoint("other-root") is None
+    assert store.health()["healthy"]

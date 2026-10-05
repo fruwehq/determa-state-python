@@ -143,7 +143,7 @@ def test_actual_admission_and_timer_fire_commit_together_and_replay_after_restar
     assert restarted.execute(complete, principal="worker-A") == result
     assert restarted.snapshot() == committed
     assert restarted_host.read_checkpoint("server-1").document == expected
-    assert calls == ["100", "110", "120"]
+    assert calls == ["100", "110", "120", "120"]
 
 
 @pytest.mark.parametrize(
@@ -197,4 +197,31 @@ def test_commit_before_response_failure_is_reconciled_from_retained_fire(tmp_pat
     assert host.read_checkpoint("server-1").document == expected
     # Retained replay aborts the read-only callback before the response fault hook.
     assert helper.execute(complete, principal="worker-A")["status"] == "accepted"
-    assert calls == ["100", "110", "120"]
+    assert calls == ["100", "110", "120", "120"]
+
+
+@pytest.mark.parametrize("fate", ["expired", "offline"])
+def test_lease_is_rechecked_after_staging_and_before_native_commit(tmp_path, fate):
+    helper, host, complete, expected, now, calls = configured(tmp_path)
+    before_helper = helper.snapshot()
+    before_checkpoint = host.read_checkpoint("server-1").document
+    reads = []
+
+    def advancing_clock():
+        reads.append(now[0])
+        if len(reads) == 1:
+            now[0] = "1000"
+            return "120"
+        if fate == "offline":
+            raise RuntimeError("clock offline")
+        return now[0]
+
+    helper.trusted_clock = advancing_clock
+    result = helper.execute(complete, principal="worker-A")
+    assert result["error_code"] == (
+        "timer_stale_fence" if fate == "expired" else "timer_clock_unavailable"
+    )
+    assert result["record_revision"] == "2" and result["attempt_fence"] == "1"
+    assert helper.snapshot() == before_helper
+    assert host.read_checkpoint("server-1").document == before_checkpoint
+    assert reads == ["120", "1000"]

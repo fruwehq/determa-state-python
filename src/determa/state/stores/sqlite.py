@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -46,16 +46,28 @@ def _schema_tokens(source: str) -> list[str]:
 
 
 class _SQLiteTransaction(ExecutionStoreTransaction):
-    def __init__(self, connection: sqlite3.Connection, root_instance_id: str) -> None:
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        root_instance_id: str,
+        *,
+        application_sql: bool = False,
+    ) -> None:
         self._connection = connection
         self._root_instance_id = root_instance_id
+        self._application_sql = application_sql
+
+    def _execute(self, statement: str, parameters: Any = ()) -> sqlite3.Cursor:
+        if self._application_sql:
+            return _execute_host_owned(self._connection, statement, parameters)
+        return self._connection.execute(statement, parameters)
 
     @property
     def root_instance_id(self) -> str:
         return self._root_instance_id
 
     def load(self) -> bytes | None:
-        row = self._connection.execute(
+        row = self._execute(
             f"SELECT checkpoint FROM {_TABLE} WHERE root_instance_id = ?",
             (self._root_instance_id,),
         ).fetchone()
@@ -66,7 +78,7 @@ class _SQLiteTransaction(ExecutionStoreTransaction):
         if root_instance_id != self._root_instance_id:
             raise ExecutionStoreError("transaction_root_mismatch")
         try:
-            self._connection.execute(
+            self._execute(
                 f"""
                 INSERT INTO {_TABLE}
                     (root_instance_id, revision, checkpoint_digest, checkpoint)
@@ -87,7 +99,7 @@ class _SQLiteTransaction(ExecutionStoreTransaction):
         root_instance_id, revision, digest = checkpoint_metadata(checkpoint)
         if root_instance_id != self._root_instance_id:
             raise ExecutionStoreError("transaction_root_mismatch")
-        cursor = self._connection.execute(
+        cursor = self._execute(
             f"""
             UPDATE {_TABLE}
             SET revision = ?, checkpoint_digest = ?, checkpoint = ?
@@ -135,6 +147,7 @@ class SQLiteApplicationTransaction:
     def __init__(self, connection: sqlite3.Connection) -> None:
         self._connection = connection
         self._active = True
+        self._commit_checks: list[Callable[[], None]] = []
 
     def execute(self, statement: str, parameters: Any = ()) -> SQLiteApplicationCursor:
         if not self._active:
@@ -143,6 +156,27 @@ class SQLiteApplicationTransaction:
 
     def _close(self) -> None:
         self._active = False
+
+    def _execute_host_owned(self, statement: str, parameters: Any = ()) -> SQLiteApplicationCursor:
+        if not self._active:
+            raise ExecutionStoreError("shared_transaction_closed")
+        return SQLiteApplicationCursor(_execute_host_owned(self._connection, statement, parameters))
+
+    def _before_commit(self, check: Callable[[], None]) -> None:
+        if not self._active:
+            raise ExecutionStoreError("shared_transaction_closed")
+        self._commit_checks.append(check)
+
+
+def _execute_host_owned(
+    connection: sqlite3.Connection, statement: str, parameters: Any
+) -> sqlite3.Cursor:
+    """Trusted adapter/helper path; application SQL never receives this operation."""
+    connection.set_authorizer(None)
+    try:
+        return connection.execute(statement, parameters)
+    finally:
+        connection.set_authorizer(_application_authorizer)
 
 
 def _application_authorizer(
@@ -153,6 +187,8 @@ def _application_authorizer(
     trigger: str | None,
 ) -> int:
     del database, trigger
+    if any(name and name.lower().startswith("determa_") for name in (first, second)):
+        return sqlite3.SQLITE_DENY
     if operation == sqlite3.SQLITE_PRAGMA and first == "integrity_check" and second is None:
         return sqlite3.SQLITE_OK
     return (
@@ -497,11 +533,17 @@ class SQLiteExecutionStore(ExecutionStore):
             self._validate_schema(connection)
             connection.execute("BEGIN IMMEDIATE")
             connection.set_authorizer(_application_authorizer)
-            yield application, _SQLiteTransaction(connection, root_instance_id)
+            yield (
+                application,
+                _SQLiteTransaction(connection, root_instance_id, application_sql=True),
+            )
             application._close()
             connection.set_authorizer(None)
             if not connection.in_transaction:
                 raise ExecutionStoreError(AdapterCode.ADAPTER_CAPABILITY_MISMATCH)
+            self._validate_schema(connection)
+            for check in application._commit_checks:
+                check()
             connection.commit()
         except BaseException:
             application._close()

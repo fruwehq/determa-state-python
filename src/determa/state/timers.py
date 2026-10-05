@@ -95,6 +95,16 @@ def _time(value: Any, *, duration: bool = False) -> int:
     return parsed
 
 
+def _execute(
+    connection: sqlite3.Connection | SQLiteApplicationTransaction,
+    statement: str,
+    parameters: Any = (),
+) -> Any:
+    if isinstance(connection, SQLiteApplicationTransaction):
+        return connection._execute_host_owned(statement, parameters)
+    return connection.execute(statement, parameters)
+
+
 def _result(
     request: Mapping[str, Any] | None, record: dict[str, Any] | None, code: str | None = None
 ) -> dict[str, Any]:
@@ -194,12 +204,13 @@ class SQLiteTimerHelper:
         self.validate_schema()
 
     def _schema(self, connection: sqlite3.Connection | SQLiteApplicationTransaction) -> None:
-        rows = connection.execute(
+        rows = _execute(
+            connection,
             "SELECT type,sql FROM sqlite_master "
-            "WHERE tbl_name='determa_timer_helpers' ORDER BY type"
+            "WHERE tbl_name='determa_timer_helpers' ORDER BY type",
         ).fetchall()
-        if rows != [("index", None), ("table", _TABLE)] or connection.execute(
-            "PRAGMA integrity_check"
+        if rows != [("index", None), ("table", _TABLE)] or _execute(
+            connection, "PRAGMA integrity_check"
         ).fetchone() != ("ok",):
             raise TimerError("timer_capability_mismatch")
 
@@ -210,7 +221,8 @@ class SQLiteTimerHelper:
     def _load(
         self, connection: sqlite3.Connection | SQLiteApplicationTransaction
     ) -> dict[str, Any]:
-        row = connection.execute(
+        row = _execute(
+            connection,
             "SELECT document FROM determa_timer_helpers WHERE scope_identity=?",
             (self.scope_identity,),
         ).fetchone()
@@ -260,7 +272,8 @@ class SQLiteTimerHelper:
         artifact = seal_timer_records(artifact)
         if not _validator("timer-record-v1.schema.json").is_valid(artifact):
             raise TimerError("timer_capability_mismatch")
-        connection.execute(
+        _execute(
+            connection,
             "INSERT INTO determa_timer_helpers VALUES (?,?) "
             "ON CONFLICT(scope_identity) DO UPDATE SET document=excluded.document",
             (self.scope_identity, canonical_bytes(artifact)),
@@ -301,6 +314,7 @@ class SQLiteTimerHelper:
             sql: SQLiteApplicationTransaction, execution: SharedExecutionTransaction
         ) -> None:
             record = None
+            claimed_record = None
             try:
                 self._schema(sql)
                 artifact = self._load(sql)
@@ -330,6 +344,7 @@ class SQLiteTimerHelper:
                     )
                 if record is None:
                     raise TimerError("timer_not_found")
+                claimed_record = copy.deepcopy(record)
                 arguments = request["arguments"]
                 if record["attempt_fence"] != arguments["attempt_fence"]:
                     raise TimerError("timer_stale_fence")
@@ -347,7 +362,8 @@ class SQLiteTimerHelper:
                     raise TimerError("timer_worker_mismatch")
                 if record["event_id"] != arguments["event_id"]:
                     raise TimerError("timer_event_conflict")
-                if self._now() >= _time(record["expires_at"]):
+                claim_expiry = _time(record["expires_at"])
+                if self._now() >= claim_expiry:
                     raise TimerError("timer_stale_fence")
                 restored = execution.read_checkpoint()
                 if restored is None:
@@ -419,11 +435,22 @@ class SQLiteTimerHelper:
                     }
                 )
                 self._persist(sql, artifact)
+
+                def check_lease() -> None:
+                    try:
+                        if self._now() >= claim_expiry:
+                            raise TimerError("timer_stale_fence")
+                    except TimerError as error:
+                        raise _TimerReturn(_result(request, claimed_record, error.code)) from error
+
+                sql._before_commit(check_lease)
                 committed.append(result)
             except TimerError as error:
-                raise _TimerReturn(_result(request, record, error.code)) from error
+                raise _TimerReturn(_result(request, claimed_record, error.code)) from error
             except ExecutionHostError as error:
-                raise _TimerReturn(_result(request, record, "timer_admission_rejected")) from error
+                raise _TimerReturn(
+                    _result(request, claimed_record, "timer_admission_rejected")
+                ) from error
 
         try:
             host.run_shared_transaction(self.root_instance_id, callback)
