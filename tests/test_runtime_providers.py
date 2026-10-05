@@ -196,9 +196,66 @@ def test_exact_compilation_and_manifest_fingerprint() -> None:
     manifest = json.loads((_PROFILE / "source-manifest.json").read_text())
     bundle = compile_language_source(source, registry, manifest=manifest)
     assert bundle.fingerprint == manifest["content"]["generated_validated_bundle_fingerprint"]
+    assert bundle.source_compilation == {"source": source, "manifest": manifest}
     manifest["content"]["generated_validated_bundle_fingerprint"] = "sha256:" + "0" * 64
+    manifest["artifact_digest"] = hash_value(
+        [manifest["artifact_format"], "1", typed_value(manifest["content"])]
+    )
     with pytest.raises(RuntimeProviderError, match="language_compilation_failed"):
         compile_language_source(source, registry, manifest=manifest)
+
+
+@pytest.mark.parametrize("slot", ["metadata", "value"])
+def test_compiler_rejects_inert_slot_before_resolution(slot: str) -> None:
+    _, source = _installed_compiler(_PROFILE)
+    region = source["content"]["regions"][0]
+    template = source["content"]["template"]
+    if slot == "metadata":
+        template["meta"] = {"guard": "true"}
+        region["locator"] = "/meta/guard"
+    else:
+        template["machines"][0]["root"]["variables"] = {
+            "data": {"type": "map", "init": {"action": []}}
+        }
+        region.update(kind="actions", locator="/machines/0/root/variables/data/init/action")
+    source["artifact_digest"] = hash_value(
+        [source["artifact_format"], "1", typed_value(source["content"])]
+    )
+    # No dependency/compiler is installed: grammar rejection must precede resolution.
+    with pytest.raises(RuntimeProviderError, match="language_compilation_failed"):
+        compile_language_source(source, RuntimeProviderRegistry())
+
+
+def test_weak_compiler_retains_source_evidence_without_manifest() -> None:
+    registry, source = _installed_compiler(_PROFILE)
+    key = tuple(
+        source["content"]["regions"][0]["provider_reference"][name]
+        for name in ("identifier", "version", "content_digest")
+    )
+    registry._compiler_proofs[key] = None
+    bundle = compile_language_source(source, registry)
+    assert bundle.source_compilation is not None
+    evidence = bundle.source_compilation
+    assert evidence["source"] == source
+    assert evidence["manifest"]["content"]["source_capabilities"] == {
+        "deterministic": False,
+        "pure": False,
+        "portable": False,
+        "semantically_introspectable": False,
+        "process_contained": False,
+        "external_io_capable": True,
+    }
+    assert (
+        evidence["manifest"]["content"]["generated_validated_bundle_fingerprint"]
+        == bundle.fingerprint
+    )
+    generated = load_bundle(bundle.raw)
+    created = create(generated, "order", "generated-root", "generated-create", {})
+    restored = restore_aggregate(
+        created["state"], MemoryArtifactResolver(definitions={generated.fingerprint: generated})
+    )
+    assert restored.bundle.source_compilation is None
+    assert restored.bundle.fingerprint == bundle.fingerprint
 
 
 def test_compiler_source_drift_refused_before_callback(tmp_path: Path) -> None:
@@ -209,6 +266,50 @@ def test_compiler_source_drift_refused_before_callback(tmp_path: Path) -> None:
     path.write_bytes(path.read_bytes() + b"\n# altered installed source\n")
     with pytest.raises(RuntimeProviderError, match="runtime_provider_unavailable"):
         compile_language_source(source, registry)
+
+
+def test_compiler_rebinding_between_regions_refused_before_substitute_runs(tmp_path: Path) -> None:
+    body = (_PROFILE / "provider/test_provider.py").read_text().split("def compile_region(")[0]
+    body += """
+calls = []
+def substitute(source):
+    calls.append('substitute')
+    return 'event.payload.approved'
+def compile_region(source):
+    calls.append('original')
+    compile_region.__code__ = substitute.__code__
+    return 'event.payload.approved'
+"""
+    bundle, registry = _modified_runtime_bundle(tmp_path, provider_source=body)
+    active = registry.resolve("guard", _fixture_guard_binding(bundle)).provider
+    module = sys.modules[type(active).__module__]
+    closure = SourceClosure(
+        tmp_path / "fixture",
+        ("provider/test_provider.py", "provider/test_provider.rs"),
+        "provider-closure.json",
+        _DOMAIN,
+        "provider/test_provider.py",
+    )
+    reference = {
+        "identifier": "test-mutating-compiler",
+        "version": "1.0.0",
+        "content_digest": closure.digest(),
+    }
+    registry.register_compiler(reference, module.compile_region, closure)
+    source = json.loads((_PROFILE / "source-package.json").read_text())
+    content = source["content"]
+    content["dependencies"] = []
+    second = json.loads(json.dumps(content["template"]["machines"][0]))
+    second["machine_id"] = "second"
+    content["template"]["machines"].append(second)
+    content["regions"][0]["provider_reference"] = reference
+    region = json.loads(json.dumps(content["regions"][0]))
+    region["locator"] = region["locator"].replace("/machines/0/", "/machines/1/")
+    content["regions"].append(region)
+    source["artifact_digest"] = hash_value([source["artifact_format"], "1", typed_value(content)])
+    with pytest.raises(RuntimeProviderError, match="runtime_provider_unavailable"):
+        compile_language_source(source, registry)
+    assert module.calls == ["original"]
 
 
 def test_compiler_manifest_drift_refused_at_use(tmp_path: Path) -> None:
@@ -409,13 +510,13 @@ def test_semantic_and_ordinary_guards_see_same_native_event(tmp_path: Path) -> N
         source_path.read_text()
         .replace(
             "self.ordinary_calls += 1\n        return True",
-            'self.ordinary_calls += 1\n        return "source" not in snapshot["event"] '
-            'and "cause_id" not in snapshot["event"]',
+            'self.ordinary_calls += 1\n        return snapshot["event"]["source"]["host"] is True '
+            'and snapshot["event"]["cause_id"] == snapshot["event"]["event_id"]',
         )
         .replace(
             "return True, 1, 2",
-            'return "source" not in snapshot["event"] '
-            'and "cause_id" not in snapshot["event"], 1, 2',
+            'return snapshot["event"]["source"]["host"] is True '
+            'and snapshot["event"]["cause_id"] == snapshot["event"]["event_id"], 1, 2',
         )
     )
     source_path.write_text(source)
@@ -829,7 +930,7 @@ def test_source_declared_slots_do_not_hide_weak_provider(tmp_path: Path) -> None
             "class Provider:",
             "class Provider:\n"
             "    __slots__ = ('guard_calls', 'action_calls', 'external_calls', "
-            "'irreversible_effects', 'external_effect_log')",
+            "'irreversible_effects', 'external_effect_log', 'guard_snapshot', 'action_snapshot')",
         )
     )
     bundle, registry = _modified_runtime_bundle(tmp_path, provider_source=source)

@@ -26,6 +26,7 @@ from determa.state import (
     RuntimeProviderError,
     RuntimeProviderRegistry,
     SourceClosure,
+    ValidationError,
     admit,
     compile_language_source,
     create,
@@ -62,7 +63,7 @@ def _empty() -> dict[str, Any]:
         "result": "rejected",
         "code": None,
         "value": None,
-        "calls": {"guard": 0, "actions": 0, "inspect_guard": 0, "external": 0},
+        "calls": {"guard": 0, "actions": 0, "inspect_guard": 0, "compile_region": 0, "external": 0},
         "external_effects": [],
         "irreversible_side_effects": 0,
         "determa_state_committed": False,
@@ -112,19 +113,11 @@ def _installed(
     )
     descriptors: list[dict[str, Any]] = []
 
-    def scan(value: Any) -> None:
-        if type(value) is dict:
-            if type(value.get("guard")) is dict and "provider" in value["guard"]:
-                descriptors.append({"kind": "guard", "binding": value["guard"]["provider"]})
-            if "provider_actions" in value:
-                descriptors.append({"kind": "actions", "binding": value["provider_actions"]})
-            for child in value.values():
-                scan(child)
-        elif type(value) is list:
-            for child in value:
-                scan(child)
+    from determa.state.runtime_providers import _runtime_bindings
 
-    scan(bundle_document)
+    descriptors = [
+        {"kind": kind, "binding": binding} for kind, binding in _runtime_bindings(bundle_document)
+    ]
     names = (
         {"example.native-common", "example.guard-compiler"}
         if compiler
@@ -156,7 +149,9 @@ def _installed(
             module.compile_region,
             closure,
             capability_proof=lambda selected: (
-                _PURE_CLAIMS if selected is module.compile_region else frozenset()
+                _PURE_CLAIMS
+                if selected is module.compile_region and not arguments.get("weak_compiler", False)
+                else frozenset()
             ),
         )
     else:
@@ -187,6 +182,13 @@ def _installed(
                         "invalid": bool(arguments.get("invalid_output", False)),
                         "fail": bool(arguments.get("action_fail", False)),
                         "external_io": bool(arguments.get("action_external_io", False)),
+                        **({"repeat_send": True} if arguments.get("repeat_send") else {}),
+                        **({"mixed_send": True} if arguments.get("mixed_send") else {}),
+                        **(
+                            {"environment_send": arguments["environment_send"]}
+                            if "environment_send" in arguments
+                            else {}
+                        ),
                     }
                 ),
             )
@@ -208,7 +210,11 @@ def _state(aggregate: dict[str, Any]) -> dict[str, Any]:
         item for item in aggregate["runtimes"] if item["runtime_id"] == aggregate["root_runtime_id"]
     )
     return {
-        "active_leaf": runtime["active_leaf_state_definition_pointers"][-1],
+        "active_leaf": (
+            runtime["active_leaf_state_definition_pointers"][-1]
+            if runtime["active_leaf_state_definition_pointers"]
+            else None
+        ),
         "status": runtime["status"],
         "variables": {
             item["variable_declaration_pointer"].split("/")[-1]: item["value"]
@@ -218,6 +224,24 @@ def _state(aggregate: dict[str, Any]) -> dict[str, Any]:
         "deferred_mailbox_length": len(runtime["deferred_mailbox"]),
         "output_count": int(aggregate["next_output_sequence"]),
     }
+
+
+def _component_states(aggregate: dict[str, Any]) -> dict[str, Any]:
+    result = {}
+    for runtime in aggregate["runtimes"]:
+        component = runtime["target_identity"].get("component")
+        if component is not None:
+            observed = _state({**aggregate, "root_runtime_id": runtime["runtime_id"]})
+            result[component["component_id"]] = {
+                key: observed[key]
+                for key in (
+                    "status",
+                    "variables",
+                    "ready_mailbox_length",
+                    "deferred_mailbox_length",
+                )
+            }
+    return result
 
 
 def _run_step(
@@ -251,7 +275,14 @@ def _run_step(
     observation["stages"].append("admit")
     observation["state_before"] = _state(aggregate)
     observation["stages"].append("evaluate_cel")
-    result = step(aggregate, setup["target_runtime_id"], resolver)
+    result = step(
+        aggregate,
+        setup["target_runtime_id"],
+        resolver,
+        _include_host_evidence=bool(
+            request["arguments"].get("repeat_send") or request["arguments"].get("mixed_send")
+        ),
+    )
     _provider_counts(registry, observation)
     if observation["calls"]["guard"]:
         observation["stages"].append("evaluate_guard")
@@ -263,8 +294,18 @@ def _run_step(
         observation["result"] = "faulted"
         observation["code"] = result["fault"]["code"]
         observation["state_after"] = observation["state_before"]
-        if request["arguments"].get("invalid_output"):
+        if "environment_send" in request["arguments"]:
+            observation["value"] = {
+                "source_locator": result["fault"]["source_locator"],
+                "component_states_before": _component_states(aggregate),
+                "component_states_after": _component_states(result["state"]),
+            }
+        if request["arguments"].get("invalid_output") or request["arguments"].get(
+            "destroyed_write"
+        ):
             observation["value"] = {"boundary_code": "runtime_provider_output_invalid"}
+            if request["arguments"].get("destroyed_write"):
+                observation["value"]["source_locator"] = result["fault"]["source_locator"]
         return
     observation["stages"].append("commit")
     observation["result"] = (
@@ -272,10 +313,111 @@ def _run_step(
     )
     observation["determa_state_committed"] = True
     observation["state_after"] = _state(result["state"])
-    observation["value"] = {
-        "accepted": observation["state_after"]["variables"]["accepted"],
-        "emissions": len(result["emissions"]),
-    }
+    observation["value"] = {"emissions": len(result["emissions"])}
+    if "environment_send" in request["arguments"]:
+        before_child = next(
+            item
+            for item in aggregate["runtimes"]
+            if item.get("target_identity", {}).get("component", {}).get("component_id") == "replica"
+        )
+        after_child = next(
+            item
+            for item in result["state"]["runtimes"]
+            if item.get("target_identity", {}).get("component", {}).get("component_id") == "replica"
+        )
+        internal = next(
+            item for item in result["emissions"] if item.get("kind") == "internal_mailbox"
+        )
+        emission = next(
+            item["envelope"]
+            for item in after_child["ready_mailbox"]
+            if item["envelope"]["event_id"] == internal["event_id"]
+        )
+        observation["value"].update(
+            forwarded_event={
+                "event": emission["event"],
+                "component_id": after_child["target_identity"]["component"]["component_id"],
+                "payload": emission["payload"],
+            },
+            component_variables_before=_state(
+                {**aggregate, "root_runtime_id": before_child["runtime_id"]}
+            )["variables"],
+            component_ready_before_delivery=len(after_child["ready_mailbox"]),
+        )
+        delivered = step(result["state"], after_child["runtime_id"], resolver)
+        observation["stages"].append("deliver_env")
+        refreshed = next(
+            item
+            for item in delivered["state"]["runtimes"]
+            if item["runtime_id"] == after_child["runtime_id"]
+        )
+        observation["value"].update(
+            component_variables_after=_state(
+                {**delivered["state"], "root_runtime_id": refreshed["runtime_id"]}
+            )["variables"],
+            component_ready_after_delivery=len(refreshed["ready_mailbox"]),
+        )
+    if "accepted" in observation["state_after"]["variables"]:
+        observation["value"]["accepted"] = observation["state_after"]["variables"]["accepted"]
+    if observation["state_after"]["status"] == "completed":
+        observation["value"].update(
+            status="completed", exit_correlation=result["emissions"][-1]["correlation_id"]
+        )
+    if request["arguments"].get("repeat_send") or request["arguments"].get("mixed_send"):
+        observation["value"]["emission_identities"] = [
+            (
+                {
+                    "event_id": item["event_id"],
+                    "emission_index": item["emission_index"],
+                    "acceptance_sequence": item["acceptance_sequence"],
+                    "queue_sequence": item["queue_sequence"],
+                }
+                if "kind" in item
+                else {
+                    "effect_id": item["effect_id"],
+                    "sequence": item["sequence"],
+                    "emission_index": item["_determa_v1_emission_index"],
+                }
+            )
+            for item in result["emissions"]
+        ]
+
+    if request["arguments"].get("capture_snapshot"):
+        for active in registry._active.values():
+            for key in ("guard_snapshot", "action_snapshot"):
+                captured = getattr(active.provider, key, None)
+                if captured is not None:
+                    observation["value"][key] = captured
+
+
+def _run_create(
+    bundle: Any,
+    registry: RuntimeProviderRegistry,
+    request: dict[str, Any],
+    observation: dict[str, Any],
+) -> None:
+    creation = request["setup"]["create_request"]
+    result = create(
+        bundle,
+        creation["machine_id"],
+        creation["root_instance_id"],
+        creation["creation_id"],
+        creation["bindings"],
+    )
+    observation["stages"].append("create")
+    _provider_counts(registry, observation)
+    if observation["calls"]["actions"]:
+        observation["stages"].extend(("evaluate_actions", "validate_output"))
+    observation["state_after"] = _state(result["state"])
+    observation["result"] = result["status"]
+    observation["code"] = result["fault"]["code"] if result["fault"] else None
+    if result["fault"]:
+        observation["value"] = {
+            "boundary_code": "runtime_provider_output_invalid",
+            "source_locator": result["fault"]["source_locator"],
+            "emissions": len(result["emissions"]),
+            "status": result["status"],
+        }
 
 
 class _ConflictStore(MemoryExecutionStore):
@@ -356,17 +498,17 @@ def _run_host_commit(
     entry = runtime["ready_mailbox"][0]
     store.conflict = request["arguments"]["cas_conflict"]
     store.replace_attempts = 0
+    process_arguments = {
+        "expected_revision": checkpoint["revision"],
+        "expected_checkpoint_digest": checkpoint["execution_checkpoint_digest"],
+        "event_id": entry["envelope"]["event_id"],
+        "envelope_digest": entry["envelope_digest"],
+        "acceptance_sequence": entry["acceptance_sequence"],
+        "queue_sequence": entry["queue_sequence"],
+    }
     try:
-        host.process_ready_v1(
-            root_id,
-            setup["target_runtime_id"],
-            expected_revision=checkpoint["revision"],
-            expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
-            event_id=entry["envelope"]["event_id"],
-            envelope_digest=entry["envelope_digest"],
-            acceptance_sequence=entry["acceptance_sequence"],
-            queue_sequence=entry["queue_sequence"],
-        )
+        first = host.process_ready_v1(root_id, setup["target_runtime_id"], **process_arguments)
+
     except ExecutionHostError as exc:
         _provider_counts(registry, observation)
         if observation["calls"]["guard"]:
@@ -381,7 +523,58 @@ def _run_host_commit(
         after = host.read_checkpoint(root_id)
         assert after is not None and after.source_bytes == admitted.source_bytes
         return
-    raise AssertionError("expected one real store compare-and-swap conflict")
+    if request["arguments"]["cas_conflict"]:
+        raise AssertionError("expected one real store compare-and-swap conflict")
+    _provider_counts(registry, observation)
+    if observation["calls"]["guard"]:
+        observation["stages"].append("evaluate_guard")
+    if observation["calls"]["actions"]:
+        observation["stages"].extend(("evaluate_actions", "validate_output"))
+    observation["stages"].extend(("compare_and_swap", "commit"))
+    committed = host.read_checkpoint(root_id)
+    assert committed is not None and store.replace_attempts == 1
+    observation["state_after"] = _state(committed.document["root_record"]["aggregate_state"])
+    receipt = first["receipt"]
+    references = receipt["emission_references"]
+    intents = committed.document["pending_outbox_intents"]
+    observation["value"] = {
+        "accepted": observation["state_after"]["variables"]["accepted"],
+        "emissions": len(first["core_result"]["emissions"]),
+        "emission_identities": [
+            {
+                "effect_id": item["effect_id"],
+                "emission_index": next(
+                    reference["emission_index"]
+                    for reference in references
+                    if reference.get("effect_id") == item["effect_id"]
+                ),
+                "sequence": item["sequence"],
+            }
+            for item in first["core_result"]["emissions"]
+        ],
+        "checkpoint_revision": committed.document["revision"],
+        "retained_effect_references": copy.deepcopy(references),
+        "pending_outbox_entries": copy.deepcopy(intents),
+    }
+    providers_before = [
+        copy.deepcopy(active.provider.__dict__) for active in registry._active.values()
+    ]
+    replay = host.process_ready_v1(root_id, setup["target_runtime_id"], **process_arguments)
+    after_replay = host.read_checkpoint(root_id)
+    assert after_replay is not None
+    observation["value"].update(
+        replay_receipt_equal=replay == receipt,
+        replay_checkpoint_unchanged=after_replay.source_bytes == committed.source_bytes,
+        replay_provider_calls_unchanged=providers_before
+        == [active.provider.__dict__ for active in registry._active.values()],
+    )
+    observation["stages"].append("replay")
+    observation["result"] = (
+        "handled_now"
+        if receipt["outcome"]["disposition"] == "handled"
+        else receipt["outcome"]["disposition"]
+    )
+    observation["determa_state_committed"] = True
 
 
 def _run_inspect(
@@ -484,9 +677,27 @@ def execute(payload: dict[str, Any]) -> dict[str, Any]:
                 source["artifact_digest"] = hash_value(
                     [source["artifact_format"], "1", typed_value(source["content"])]
                 )
-            from determa.state.compilation import _artifact
+            if "invalid_slot" in arguments:
+                content = source["content"]
+                region = content["regions"][0]
+                if arguments["invalid_slot"] == "metadata_guard":
+                    content["template"]["meta"] = {"guard": "true"}
+                    region["locator"] = "/meta/guard"
+                else:
+                    content["template"]["machines"][0]["root"]["variables"] = {
+                        "data": {"type": "map", "init": {"action": []}}
+                    }
+                    region.update(
+                        kind="actions", locator="/machines/0/root/variables/data/init/action"
+                    )
+                from determa.state.wire import hash_value, typed_value
 
-            _artifact(source, "language-source-v1.schema.json", "determa.language_source")
+                source["artifact_digest"] = hash_value(
+                    [source["artifact_format"], "1", typed_value(content)]
+                )
+            from determa.state.compilation import _source_preflight, _verify_compilation_manifest
+
+            _source_preflight(source)
             observation["stages"].append("resolve_compiler_closure")
             registry, _module, loaded = _installed(
                 root, payload, installed, arguments, compiler=True
@@ -505,17 +716,37 @@ def execute(payload: dict[str, Any]) -> dict[str, Any]:
                     manifest["content"]["generated_validated_bundle_fingerprint"] = arguments[
                         "manifest_fingerprint_override"
                     ]
+                    from determa.state.wire import hash_value, typed_value
+
+                    manifest["artifact_digest"] = hash_value(
+                        [manifest["artifact_format"], "1", typed_value(manifest["content"])]
+                    )
             else:
                 manifest = None
-            bundle = compile_language_source(
-                source,
-                registry,
-                maximum_compilation_steps=arguments.get("maximum_compilation_steps", 1000),
-            )
-            observation["stages"].append("strict_load")
-            if manifest is not None:
-                observation["stages"].append("verify_manifest")
-                bundle = compile_language_source(source, registry, manifest=manifest)
+            previous_profile = sys.getprofile()
+
+            def trace(frame, event, arg):
+                if event == "call":
+                    if frame.f_code is _module.compile_region.__code__:
+                        observation["calls"]["compile_region"] += 1
+                    elif (
+                        frame.f_code is load_bundle.__code__
+                        and frame.f_back.f_code is compile_language_source.__code__
+                    ):
+                        observation["stages"].append("strict_load")
+                    elif frame.f_code is _verify_compilation_manifest.__code__:
+                        observation["stages"].append("verify_manifest")
+
+            sys.setprofile(trace)
+            try:
+                bundle = compile_language_source(
+                    source,
+                    registry,
+                    manifest=manifest,
+                    maximum_compilation_steps=arguments.get("maximum_compilation_steps", 1000),
+                )
+            finally:
+                sys.setprofile(previous_profile)
             if "generated_bundle_file" in arguments:
                 supplied = load_bundle(
                     json.loads((root / arguments["generated_bundle_file"]).read_text())
@@ -528,9 +759,37 @@ def execute(payload: dict[str, Any]) -> dict[str, Any]:
                     "on_events"
                 ]["submit"]["guard"]
             }
-            observation["effective_capabilities"] = registry.compiler_capabilities(
-                source["content"]["regions"][0]["provider_reference"]
-            )
+            assert bundle.source_compilation is not None
+            evidence = bundle.source_compilation["manifest"]["content"]
+            observation["effective_capabilities"] = evidence["source_capabilities"]
+            if arguments.get("without_manifest") and arguments.get("weak_compiler"):
+                generated_registry = RuntimeProviderRegistry()
+                generated = load_bundle(bundle.raw, runtime_providers=generated_registry)
+                created = create(generated, "order", "compiled-restore-root", "compiled-create", {})
+                before_restore_calls = observation["calls"]["compile_region"]
+                sys.setprofile(trace)
+                try:
+                    restored = restore_aggregate(
+                        created["state"],
+                        MemoryArtifactResolver(definitions={generated.fingerprint: generated}),
+                    )
+                finally:
+                    sys.setprofile(previous_profile)
+                observation["value"].update(
+                    source_artifact_digest=evidence["source_artifact_digest"],
+                    compiler_providers=evidence["compiler_providers"],
+                    generated_validated_bundle_fingerprint=evidence[
+                        "generated_validated_bundle_fingerprint"
+                    ],
+                    generated_runtime_capabilities=generated_registry.effective_capabilities(
+                        generated.raw
+                    ),
+                    restored_runtime_capabilities=generated_registry.effective_capabilities(
+                        restored.bundle.raw
+                    ),
+                    restore_compiler_calls=observation["calls"]["compile_region"]
+                    - before_restore_calls,
+                )
         else:
             observation["stages"].append(
                 "resolve_runtime_closure" if operation == "restore" else "resolve_closure"
@@ -565,6 +824,8 @@ def execute(payload: dict[str, Any]) -> dict[str, Any]:
                 observation["result"] = "accepted"
             elif operation == "step":
                 _run_step(bundle, registry, request, observation)
+            elif operation == "create":
+                _run_create(bundle, registry, request, observation)
             elif operation == "host_commit":
                 _run_host_commit(bundle, registry, request, observation)
             elif operation == "inspect":
@@ -583,6 +844,12 @@ def execute(payload: dict[str, Any]) -> dict[str, Any]:
                     observation["effective_capabilities"] = _profile()
                 else:
                     _provider_counts(registry, observation)
+    except ValidationError as exc:
+        # Static validation precedes provider capability verification inside the loader.
+        if observation["stages"][-1:] == ["verify_capabilities"]:
+            observation["stages"].pop()
+        observation["stages"].append("load")
+        observation["code"] = exc.code
     except RuntimeProviderError as exc:
         observation["code"] = exc.code
     return {

@@ -4,11 +4,11 @@ Python implementation of [Determa State](https://github.com/fruwehq/determa-stat
 a language-agnostic statechart engine with a shared normative conformance suite.
 
 This implementation supports Determa State `format: 1` at specification
-commit `86bb88dd21cb1f799eefe5020b6e49dabf6e7225`. Correctness is determined by
+commit `77c0a2e60cd0771a6d44ae170a079ddd51d7d9f0`. Correctness is determined by
 99 format-1 core cases, 162 version-1 vectors, 142 durable-host vectors, 49 core
 inspection vectors, 47 extension negotiation vectors, 7 native guard-provider
-inspection vectors, 30 runtime-provider vectors, and 484 manifest artifacts at
-conformance commit `affe3fe3bcc4d13fa7c5374471568e94af36f0d1`. The native
+inspection vectors, 52 runtime-provider vectors, and 487 manifest artifacts at
+conformance commit `c6949440f5b9fd6e06ea5571f4e01681dd59ee04`. The native
 runtime-provider profile is optional and is exercised through its production adapter.
 
 The package metadata is `0.3.0`. Artifact and checkpoint schema version 1 is the
@@ -329,7 +329,11 @@ a failed compare-and-swap; the engine does not retry it automatically.
 `compile_language_source(source, registry, manifest=manifest)` verifies the exact
 source and compiler closure, compiles disjoint regions in order, strictly loads the
 generated format-1 bundle, and checks the manifest fingerprint and proved source
-capabilities. A generated CEL bundle restores without an installed compiler.
+capabilities. Only executable grammar slots can be compiled; metadata and variable
+values are inert. Every successful result retains sealed version-1 source and
+manifest artifacts in `bundle.source_compilation`, including when no manifest was
+supplied. That evidence discloses historical source guarantees independently of
+the generated runtime profile. A generated CEL bundle restores without an installed compiler.
 Semantic inspection calls only a separately proved, bounded `inspect_guard` method;
 structural inspection never invokes a native provider.
 

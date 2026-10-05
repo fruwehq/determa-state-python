@@ -163,6 +163,9 @@ class Bundle:
     required_capabilities: frozenset[str] = dataclass_field(
         default=frozenset(), compare=False, repr=False
     )
+    source_compilation: dict[str, Any] | None = dataclass_field(
+        default=None, compare=False, repr=False
+    )
 
     def verify_runtime_policy(self) -> None:
         """Recheck exact provider closure, current health, and host requirements."""
@@ -238,13 +241,6 @@ def load_bundle(
 
 
 def _has_runtime_provider(value: Any) -> bool:
-    if isinstance(value, dict):
-        return (
-            "provider_actions" in value
-            or isinstance(value.get("guard"), dict)
-            and "provider" in value["guard"]
-            or any(_has_runtime_provider(child) for child in value.values())
-        )
-    if isinstance(value, list):
-        return any(_has_runtime_provider(child) for child in value)
-    return False
+    from .runtime_providers import _runtime_bindings
+
+    return next(_runtime_bindings(value), None) is not None

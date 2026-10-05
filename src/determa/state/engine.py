@@ -392,6 +392,7 @@ def _dispatch(
     delivery: _Delivery = None,
     *,
     _capture_emission_provenance: bool = False,
+    _provider_envelope: dict[str, Any] | None = None,
 ) -> _Result:
     """Validate and process at most one envelope against an aggregate copy."""
     validated = _coerce_bundle(bundle)
@@ -458,6 +459,9 @@ def _dispatch(
         assert declaration is not None
         normalized_envelope["payload"] = _normalize_payload(declaration, envelope.get("payload"))
     execution.event = normalized_envelope
+    if _provider_envelope is not None:
+        execution.provider_event = copy.deepcopy(_provider_envelope)
+        execution.provider_event["payload"] = copy.deepcopy(normalized_envelope["payload"])
     execution.cause_id = str(envelope["event_id"])
     before = copy.deepcopy(state)
     try:
@@ -1498,6 +1502,7 @@ class _Execution:
     emissions: list[dict[str, Any]]
     cause_id: str
     event: dict[str, Any] | None
+    provider_event: dict[str, Any] | None
     capture_emission_provenance: bool
 
     def __init__(
@@ -1516,6 +1521,7 @@ class _Execution:
         self.emissions = []
         self.cause_id = ""
         self.event = None
+        self.provider_event = None
         self.capture_emission_provenance = capture_emission_provenance
         self._provider_writes: list[tuple[str, str]] = []
 
@@ -1686,6 +1692,7 @@ class _Execution:
             return
         if state.type == "composite" and descend:
             initial = state.raw["initial"]
+            write_start = len(self._provider_writes)
             target, history = self.resolve_compound_transition(
                 runtime,
                 machine,
@@ -1695,6 +1702,7 @@ class _Execution:
                 event_visible=False,
             )
             assert target is not None
+            self.validate_provider_writes(runtime, machine, state, target, False, write_start)
             self.enter_path(runtime, machine, state, target, history=history)
 
     def initialize_variables(
@@ -1788,7 +1796,8 @@ class _Execution:
     ) -> dict[str, Any]:
         from .runtime_providers import guard_snapshot
 
-        return guard_snapshot(activation, self.event, binding)
+        event = (self.provider_event or self.event) if "event" in activation else None
+        return guard_snapshot(activation, event, binding)
 
     def allocate_components(
         self, runtime: dict[str, Any], machine: MachineModel, state: StateNode
@@ -2143,6 +2152,7 @@ class _Execution:
         from .runtime_providers import RuntimeProviderError
         from .wire import decoded_typed_value
 
+        ordinals = {"internal": 0, "external": 0}
         for proposal in proposals:
             try:
                 if "assign" in proposal:
@@ -2165,6 +2175,7 @@ class _Execution:
                         pointer,
                         event_visible=self.event is not None,
                         literal_values=True,
+                        native_ordinals=ordinals,
                     )
             except (DetermaError, ValueError, KeyError, TypeError) as exc:
                 raise RuntimeProviderError("runtime_provider_output_invalid") from exc
@@ -2179,6 +2190,7 @@ class _Execution:
         *,
         event_visible: bool,
         literal_values: bool = False,
+        native_ordinals: dict[str, int] | None = None,
     ) -> None:
         activation = self.activation(runtime, machine, state, event_visible=event_visible)
         declaration = self.event_declaration(runtime, send["event"])
@@ -2188,12 +2200,22 @@ class _Execution:
         if literal_values:
             from .wire import decoded_typed_value
 
-            if send["event"] == "env" or declaration is None:
+            if declaration is None and send["event"] != "env":
                 raise StepFault(FaultCode.ACTION_FAULT, pointer)
             decoded = decoded_typed_value(send["payload"])
             if not isinstance(decoded, dict):
                 raise StepFault(FaultCode.ACTION_FAULT, pointer)
             payload_values = decoded
+            if send["event"] == "env" and (
+                "targets" in send
+                or "correlation_id" in send
+                or not isinstance(send.get("to"), dict)
+                or set(send["to"]) != {"component"}
+                or set(payload_values) != {"changed"}
+                or not isinstance(payload_values["changed"], dict)
+                or not payload_values["changed"]
+            ):
+                raise StepFault(FaultCode.ACTION_FAULT, pointer)
         elif send["event"] == "env":
             changed_expression = payload_expressions["changed"]
             payload_values["changed"] = self.evaluate(
@@ -2251,6 +2273,24 @@ class _Execution:
             self.resolve_send_target(runtime, target_spec, value, pointer, index, "targets" in send)
             for index, (target_spec, value) in enumerate(evaluated_targets)
         ]
+        if literal_values and send["event"] == "env":
+            component_target = resolved[0]
+            if not isinstance(component_target, dict):
+                raise StepFault(FaultCode.ACTION_FAULT, pointer)
+            child = self.state["runtimes"][_target_runtime_id(component_target)]
+            root = _pointer_get(self.bundle.raw, child["root_pointer"])
+            external = {
+                name: item
+                for name, item in (root.get("variables") or {}).items()
+                if item.get("external") is True
+            }
+            changed = normalized_payload["changed"]
+            if set(changed) - set(external):
+                raise StepFault(FaultCode.ACTION_FAULT, pointer)
+            normalized_payload["changed"] = {
+                name: _normalize_value(value, str(external[name]["type"]))
+                for name, value in changed.items()
+            }
         if (
             literal_values
             and declaration is not None
@@ -2262,6 +2302,10 @@ class _Execution:
         ):
             raise StepFault(FaultCode.ACTION_FAULT, pointer)
         for index, target in enumerate(resolved):
+            if native_ordinals is not None:
+                kind = "external" if target == "external" else "internal"
+                index = native_ordinals[kind]
+                native_ordinals[kind] += 1
             if target == "external":
                 sequence = int(self.state["next_output_sequence"])
                 self.state["next_output_sequence"] = sequence + 1
@@ -2570,6 +2614,7 @@ class _Execution:
                     self.enter_path(runtime, machine, state, destination, history=False)
                 return
         initial = state.raw["initial"]
+        write_start = len(self._provider_writes)
         target, target_history = self.resolve_compound_transition(
             runtime,
             machine,
@@ -2579,6 +2624,7 @@ class _Execution:
             event_visible=False,
         )
         assert target is not None
+        self.validate_provider_writes(runtime, machine, state, target, False, write_start)
         self.enter_path(runtime, machine, state, target, history=target_history)
 
     def exit_state(self, runtime: dict[str, Any], machine: MachineModel, state: StateNode) -> None:

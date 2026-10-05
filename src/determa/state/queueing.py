@@ -883,6 +883,7 @@ def step_aggregate_v1(
         restored.state,
         {selected["delivery_mode"]: native},
         _capture_emission_provenance=True,
+        _provider_envelope=selected["envelope"],
     )
     disposition = result["disposition"]
     if disposition == DispositionCode.REJECTED.value:
