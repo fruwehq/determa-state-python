@@ -7,6 +7,40 @@ on:
     branches: [main]
 
 jobs:
+  package:
+    name: Build and install distribution (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        python-version: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Build source and wheel distributions
+        run: |
+          python -m pip install build
+          python -m build
+      - name: Install wheel into a clean environment and exercise packaged API
+        run: |
+          python -m venv "$RUNNER_TEMP/package-install"
+          "$RUNNER_TEMP/package-install/bin/python" -m pip install dist/*.whl
+          cd "$RUNNER_TEMP"
+          "$RUNNER_TEMP/package-install/bin/python" -I - <<'PY'
+          import importlib.metadata
+          import pathlib
+          import sys
+          import determa.state
+          from determa.state import RuntimeProviderRegistry, SourceClosure, load_bundle
+          assert importlib.metadata.version("determa-state") == "0.3.0"
+          assert pathlib.Path(determa.state.__file__).is_relative_to(sys.prefix)
+          bundle = load_bundle("format: 1\nnamespace: package.smoke\nevents: {}\nmachines:\n  - machine_id: smoke\n    root: {type: simple}\n")
+          assert bundle.fingerprint.startswith("sha256:")
+          assert RuntimeProviderRegistry is not None and SourceClosure is not None
+          PY
+          "$RUNNER_TEMP/package-install/bin/determa-state" --version
+
   test:
     runs-on: ${{ matrix.os }}
     strategy:
@@ -15,6 +49,18 @@ jobs:
         os: [ubuntu-24.04]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out pinned conformance suite
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: fruwehq/determa-state-conformance
+          ref: ce6c94ee1929597689403080d1790e2f48f8a5fb
+          path: .pinned/determa-state-conformance
+      - name: Check out pinned specification
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: fruwehq/determa-state-spec
+          ref: 86bb88dd21cb1f799eefe5020b6e49dabf6e7225
+          path: .pinned/determa-state-spec
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.13"
@@ -28,6 +74,9 @@ jobs:
       - name: Mypy
         run: mypy src/determa
       - name: Unit tests
+        env:
+          DETERMA_CONFORMANCE_DIR: ${{ github.workspace }}/.pinned/determa-state-conformance
+          DETERMA_SPEC_DIR: ${{ github.workspace }}/.pinned/determa-state-spec
         run: pytest -q
 
   python-311-compatibility:
@@ -35,6 +84,18 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check out pinned conformance suite
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: fruwehq/determa-state-conformance
+          ref: ce6c94ee1929597689403080d1790e2f48f8a5fb
+          path: .pinned/determa-state-conformance
+      - name: Check out pinned specification
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: fruwehq/determa-state-spec
+          ref: 86bb88dd21cb1f799eefe5020b6e49dabf6e7225
+          path: .pinned/determa-state-spec
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.11"
@@ -48,6 +109,9 @@ jobs:
       - name: Mypy
         run: mypy src/determa
       - name: Unit tests
+        env:
+          DETERMA_CONFORMANCE_DIR: ${{ github.workspace }}/.pinned/determa-state-conformance
+          DETERMA_SPEC_DIR: ${{ github.workspace }}/.pinned/determa-state-spec
         run: pytest -q
 
   conformance:
@@ -62,13 +126,13 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: fruwehq/determa-state-conformance
-          ref: c0e101c86bd71068669df3cd2250d4fec24ff74d
+          ref: ce6c94ee1929597689403080d1790e2f48f8a5fb
           path: .pinned/determa-state-conformance
       - name: Check out pinned specification
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: fruwehq/determa-state-spec
-          ref: 6bd25e3fcdf068af861aa289903a8489bd8f0139
+          ref: 86bb88dd21cb1f799eefe5020b6e49dabf6e7225
           path: .pinned/determa-state-spec
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:

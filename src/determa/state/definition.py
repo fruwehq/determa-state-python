@@ -9,13 +9,17 @@ import math
 import struct
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from dataclasses import field as dataclass_field
+from typing import TYPE_CHECKING, Any
 
 from . import yaml12
 from .codes import MachineLoadFailureCode as LoadCode
 from .errors import ValidationError
 
 BundleSource = str | Mapping[str, Any]
+
+if TYPE_CHECKING:
+    from .runtime_providers import RuntimeProviderRegistry
 
 
 def _utf8_key(value: str) -> bytes:
@@ -153,6 +157,27 @@ class Bundle:
 
     raw: dict[str, Any]
     fingerprint: str
+    runtime_providers: RuntimeProviderRegistry | None = dataclass_field(
+        default=None, compare=False, repr=False
+    )
+    required_capabilities: frozenset[str] = dataclass_field(
+        default=frozenset(), compare=False, repr=False
+    )
+
+    def verify_runtime_policy(self) -> None:
+        """Recheck exact provider closure, current health, and host requirements."""
+        if self.runtime_providers is None:
+            return
+        if bundle_fingerprint(self.raw) != self.fingerprint:
+            from .runtime_providers import RuntimeProviderError
+
+            raise RuntimeProviderError("runtime_provider_unavailable")
+        self.runtime_providers.resolve_definition(self.raw)
+        report = self.runtime_providers.effective_capabilities(self.raw)
+        if any(report.get(name) is not True for name in self.required_capabilities):
+            from .runtime_providers import RuntimeProviderError
+
+            raise RuntimeProviderError("extension_capability_mismatch")
 
     @property
     def namespace(self) -> str:
@@ -166,7 +191,12 @@ class Bundle:
         return next((m for m in self.raw["machines"] if m["machine_id"] == machine_id), None)
 
 
-def load_bundle(source: BundleSource) -> Bundle:
+def load_bundle(
+    source: BundleSource,
+    *,
+    runtime_providers: RuntimeProviderRegistry | None = None,
+    required_capabilities: frozenset[str] = frozenset(),
+) -> Bundle:
     """Parse, structurally validate, semantically validate, and normalize one bundle."""
     if isinstance(source, str):
         document = yaml12.load(source)
@@ -185,4 +215,36 @@ def load_bundle(source: BundleSource) -> Bundle:
 
     validate(document)
     normalized = normalize_bundle(document)
-    return Bundle(raw=normalized, fingerprint=bundle_fingerprint(normalized))
+    if runtime_providers is None:
+        from .runtime_providers import RuntimeProviderError
+
+        if _has_runtime_provider(normalized):
+            raise RuntimeProviderError("runtime_provider_unavailable")
+    else:
+        runtime_providers.resolve_definition(normalized)
+        if any(
+            runtime_providers.effective_capabilities(normalized).get(name) is not True
+            for name in required_capabilities
+        ):
+            from .runtime_providers import RuntimeProviderError
+
+            raise RuntimeProviderError("extension_capability_mismatch")
+    return Bundle(
+        raw=normalized,
+        fingerprint=bundle_fingerprint(normalized),
+        runtime_providers=runtime_providers,
+        required_capabilities=required_capabilities,
+    )
+
+
+def _has_runtime_provider(value: Any) -> bool:
+    if isinstance(value, dict):
+        return (
+            "provider_actions" in value
+            or isinstance(value.get("guard"), dict)
+            and "provider" in value["guard"]
+            or any(_has_runtime_provider(child) for child in value.values())
+        )
+    if isinstance(value, list):
+        return any(_has_runtime_provider(child) for child in value)
+    return False

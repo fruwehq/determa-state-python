@@ -675,7 +675,7 @@ def _bundled_factory_matches_source(name: str, factory: Any) -> bool:
                     if callable(member) or hasattr(type(member), "__get__")
                 )
             if isinstance(reference, (types.GetSetDescriptorType, types.MemberDescriptorType)):
-                return current.__name__ == reference.__name__
+                return bool(current.__name__ == reference.__name__)
             if callable(reference) or hasattr(type(reference), "__get__"):
                 return current is reference
             return True
