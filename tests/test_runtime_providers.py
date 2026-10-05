@@ -829,7 +829,7 @@ def test_source_declared_slots_do_not_hide_weak_provider(tmp_path: Path) -> None
             "class Provider:",
             "class Provider:\n"
             "    __slots__ = ('guard_calls', 'action_calls', 'external_calls', "
-            "'irreversible_effects', 'external_effect_log')",
+            "'irreversible_effects', 'external_effect_log', 'guard_snapshot', 'action_snapshot')",
         )
     )
     bundle, registry = _modified_runtime_bundle(tmp_path, provider_source=source)
