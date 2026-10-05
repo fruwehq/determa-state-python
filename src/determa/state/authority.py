@@ -965,8 +965,22 @@ class SQLiteLocalAuthority:
                 }
                 # An installed effect journal is a participant in this claim,
                 # not an eventually updated mirror of the authority receipt.
-                native_owned = arguments["root_instance_id"] in ledger.get(
-                    "native_effect_roots", []
+                native_binding = next(
+                    (
+                        item
+                        for item in ledger.get("native_effect_work", [])
+                        if item["work_identity"] == arguments["work_identity"]
+                    ),
+                    None,
+                )
+                if native_binding is not None and any(
+                    native_binding[key] != arguments[key]
+                    for key in ("root_instance_id", "work_kind", "operation_token")
+                ):
+                    return _compact(_result(request, ledger, "invalid_host_request"))
+                native_owned = (
+                    arguments["root_instance_id"] in ledger.get("native_effect_roots", [])
+                    or native_binding is not None
                 )
                 native_update = None
                 if connection.execute(

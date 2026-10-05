@@ -375,6 +375,15 @@ def _validate_authority_pair(ledger: Mapping[str, Any], document: Mapping[str, A
     ):
         raise EffectError("unauthorized_scope")
     for record in journal["effect_records"]:
+        binding = {
+            "root_instance_id": journal["root_instance_id"],
+            "work_kind": "effect",
+            "work_identity": record["effect_id"],
+            "operation_token": record["operation_token"],
+            "participant": "native_effects",
+        }
+        if binding not in ledger.get("native_effect_work", []):
+            raise EffectError("unauthorized_scope")
         issued = next(
             (
                 entry
@@ -600,6 +609,21 @@ class SQLiteCommittedEffectHost:
             native_roots.append(root)
         records = document["journal"]["effect_records"]
         for record in records:
+            binding = {
+                "root_instance_id": root,
+                "work_kind": "effect",
+                "work_identity": record["effect_id"],
+                "operation_token": record["operation_token"],
+                "participant": "native_effects",
+            }
+            bindings = ledger.setdefault("native_effect_work", [])
+            existing = next(
+                (item for item in bindings if item["work_identity"] == record["effect_id"]), None
+            )
+            if existing is not None and existing != binding:
+                raise EffectError("stale_attempt_fence")
+            if existing is None:
+                bindings.append(binding)
             entry = next(
                 (
                     item

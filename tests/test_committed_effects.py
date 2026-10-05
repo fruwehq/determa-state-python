@@ -422,3 +422,16 @@ def test_seed_preserves_historical_claim_without_reviving_it(tmp_path):
     assert new_claim["attempt_fence"] == "2"
     assert authority.inspect(scope)["active_claims"] == [new_claim]
     assert claim in authority.inspect(scope)["effect_claim_history"]
+
+
+def test_missing_native_work_cannot_be_rebound_to_another_authorized_root(tmp_path):
+    authority, host, scope, root, record = authority_effect_fixture(tmp_path)
+    ledger = authority.inspect(scope)
+    ledger["roots"].append("other-authorized-root")
+    with authority._connect() as connection:
+        connection.execute("UPDATE determa_scope_authority SET ledger=?", (json.dumps(ledger),))
+        connection.execute("DELETE FROM determa_committed_effects")
+        connection.commit()
+    request, invocation = authority_claim_request(authority, scope, "other-authorized-root", record)
+    assert json.loads(authority.perform(request, invocation))["status"] == "rejected"
+    assert authority.inspect(scope) == ledger
