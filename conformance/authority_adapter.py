@@ -139,6 +139,34 @@ def _seed(ledger: dict[str, Any]) -> SQLiteLocalAuthority:
     global _INITIAL_BINDING
     # These trusted protocol fixtures contain opaque mutations, not native rows.
     ledger = {**ledger, "native_checkpoint_bytes": []}
+    if _WORKER_MODE:
+        # Explicit trusted fixture installation, independent of the incoming
+        # request and expected result. These §18 vectors use this fixed work
+        # identity rather than a §19 native checkpoint/effect journal.
+        ledger["authority_effect_bindings"] = [
+            {
+                "root_instance_id": "root-7",
+                "work_kind": "effect",
+                "work_identity": "effect-17",
+                "operation_token": "token-17",
+                "participant": "authority_journal",
+            }
+            for entry in ledger["journal_entries"]
+            if entry["work_identity"] == "effect-17"
+        ]
+        ledger["authority_effect_records"] = [
+            {
+                **entry,
+                "state": "leased"
+                if any(
+                    claim["work_identity"] == entry["work_identity"] and claim["state"] == "active"
+                    for claim in ledger["active_claims"]
+                )
+                else "unclaimed",
+            }
+            for entry in ledger["journal_entries"]
+            if entry["work_identity"] == "effect-17"
+        ]
     # A fresh test database for each independent vector. Production never
     # removes an allocated scope marker from a live authority domain.
     for suffix in ("", "-wal", "-shm"):
@@ -176,6 +204,8 @@ def _observed_ledger(authority: SQLiteLocalAuthority) -> dict[str, Any] | None:
             "effect_claim_history",
             "native_effect_roots",
             "native_effect_work",
+            "authority_effect_bindings",
+            "authority_effect_records",
         }
     }
 

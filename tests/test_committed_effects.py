@@ -407,6 +407,80 @@ def authority_claim_request(
     return json.dumps(request), invocation
 
 
+def generic_authority_fixture(tmp_path):
+    from determa.state.authority import SQLiteLocalAuthority
+
+    authority = SQLiteLocalAuthority(
+        tmp_path / "generic.sqlite", worker_fencing=True, worker_lease_nanoseconds=10
+    )
+    authority.setup_schema()
+    assert authority.allocate("scope", "owner", roots=("root", "other-root"))
+    authority.register_effect_work("scope", "owner", "0", "root", "effect", "token")
+    return authority, {"effect_id": "effect", "operation_token": "token"}
+
+
+def test_generic_claim_commits_bound_journal_and_receipt_atomically(tmp_path):
+    authority, record = generic_authority_fixture(tmp_path)
+    request, invocation = authority_claim_request(authority, "scope", "root", record)
+    before = authority.inspect("scope")
+    assert authority._perform(request, invocation, fault="precommit_abort") is None
+    assert authority.inspect("scope") == before
+    assert authority._perform(request, invocation, fault="drop_response_after_commit") is None
+    committed = authority.inspect("scope")
+    claim = committed["active_claims"][0]
+    assert committed["authority_effect_records"] == [
+        {"work_identity": "effect", "attempt_fence": "1", "state": "leased"}
+    ]
+    assert committed["effect_claim_history"] == [claim]
+    assert json.loads(authority.perform(request, invocation))["claim"] == claim
+    assert authority.inspect("scope") == committed
+    assert authority.check_worker_claim(claim, "worker-a", "0", phase="dispatch")
+    assert not authority.check_worker_claim(claim, "worker-a", "10", phase="dispatch")
+
+
+@pytest.mark.parametrize("change", ["root", "token", "binding", "record", "fence"])
+def test_generic_claim_cannot_rebind_work_or_fall_back_from_missing_participant(tmp_path, change):
+    authority, record = generic_authority_fixture(tmp_path)
+    overrides = {}
+    if change == "root":
+        overrides["root_instance_id"] = "other-root"
+    elif change == "token":
+        overrides["operation_token"] = "other-token"
+    else:
+        with authority._connect() as connection:
+            ledger = authority.inspect("scope")
+            if change == "binding":
+                ledger["authority_effect_bindings"] = []
+            elif change == "record":
+                ledger["authority_effect_records"] = []
+            else:
+                ledger["authority_effect_records"][0]["attempt_fence"] = "2"
+            connection.execute(
+                "UPDATE determa_scope_authority SET ledger = ? WHERE scope_identity = ?",
+                (json.dumps(ledger), "scope"),
+            )
+    request, invocation = authority_claim_request(authority, "scope", "root", record, **overrides)
+    before = authority.inspect("scope")
+    assert json.loads(authority.perform(request, invocation))["status"] == "rejected"
+    assert authority.inspect("scope") == before
+
+
+def test_generic_registration_preserves_binding_and_expiry_does_not_prove_retry_safe(tmp_path):
+    authority, record = generic_authority_fixture(tmp_path)
+    before = authority.inspect("scope")
+    authority.register_effect_work("scope", "owner", "0", "root", "effect", "token")
+    assert authority.inspect("scope") == before
+    with pytest.raises(ValueError, match="invalid_host_request"):
+        authority.register_effect_work("scope", "owner", "0", "other-root", "effect", "token")
+    request, invocation = authority_claim_request(authority, "scope", "root", record)
+    assert json.loads(authority.perform(request, invocation))["status"] == "accepted"
+    request, invocation = authority_claim_request(authority, "scope", "root", record, "retry", "1")
+    invocation["trusted_clock_now"] = "10"
+    before = authority.inspect("scope")
+    assert json.loads(authority.perform(request, invocation))["error_code"] == "stale_attempt_fence"
+    assert authority.inspect("scope") == before
+
+
 def test_authority_claim_atomically_updates_native_journal_and_replays_once(tmp_path):
     authority, host, scope, root, record = authority_effect_fixture(tmp_path)
     request, invocation = authority_claim_request(authority, scope, root, record)

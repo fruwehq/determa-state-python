@@ -545,7 +545,7 @@ class SQLiteLocalAuthority:
                 ("journal", "journal-1", Path(__file__).with_name("effects.py")),
                 ("worker", "worker-1", Path(__file__)),
             ):
-                closure = source.read_bytes()
+                closure = _authority_closure() if role == "journal" else source.read_bytes()
                 participant = {
                     "role": role,
                     "provider_reference": {
@@ -699,6 +699,83 @@ class SQLiteLocalAuthority:
         }
         return self._insert_ledger(ledger)
 
+    def register_effect_work(
+        self,
+        scope_identity: str,
+        owner_principal: str,
+        authority_epoch: str,
+        root_instance_id: str,
+        work_identity: str,
+        operation_token: str,
+    ) -> None:
+        """Install new host-owned effect work in the colocated authority journal.
+
+        This trusted host setup binds identity before any worker request. It
+        cannot adopt an existing bare journal entry or replace a native effect.
+        """
+        if not self.worker_fencing or any(
+            type(value) is not str or not value
+            for value in (
+                scope_identity,
+                owner_principal,
+                authority_epoch,
+                root_instance_id,
+                work_identity,
+                operation_token,
+            )
+        ):
+            raise ValueError("host_capability_mismatch")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT ledger FROM determa_scope_authority WHERE scope_identity = ?",
+                (scope_identity,),
+            ).fetchone()
+            if row is None:
+                raise ValueError("unauthorized_scope")
+            ledger = _parse(row[0])
+            if (
+                ledger["owner_principal"] != owner_principal
+                or ledger["authority_epoch"] != authority_epoch
+                or ledger["state"] != "active"
+                or root_instance_id not in ledger["roots"]
+            ):
+                raise ValueError("stale_scope_authority")
+            binding = {
+                "root_instance_id": root_instance_id,
+                "work_kind": "effect",
+                "work_identity": work_identity,
+                "operation_token": operation_token,
+                "participant": "authority_journal",
+            }
+            bindings = ledger.setdefault("authority_effect_bindings", [])
+            existing = next(
+                (item for item in bindings if item["work_identity"] == work_identity), None
+            )
+            if existing is not None:
+                if existing != binding:
+                    raise ValueError("invalid_host_request")
+                return
+            if root_instance_id in ledger.get("native_effect_roots", []) or any(
+                item["work_identity"] == work_identity
+                for item in ledger["journal_entries"]
+                + ledger.get("native_effect_work", [])
+                + ledger["active_claims"]
+                + ledger.get("effect_claim_history", [])
+            ):
+                raise ValueError("host_capability_mismatch")
+            bindings.append(binding)
+            ledger.setdefault("authority_effect_records", []).append(
+                {"work_identity": work_identity, "attempt_fence": "0", "state": "unclaimed"}
+            )
+            ledger["journal_entries"].append({"work_identity": work_identity, "attempt_fence": "0"})
+            ledger["scope_generation"] = str(int(ledger["scope_generation"]) + 1)
+            connection.execute(
+                "UPDATE determa_scope_authority SET ledger = ? WHERE scope_identity = ?",
+                (_compact(ledger), scope_identity),
+            )
+            connection.commit()
+
     def _insert_ledger(self, ledger: Mapping[str, Any]) -> bool:
         """Seed trusted ledger storage; profile fixtures use this private seam."""
         scope = ledger["scope_identity"]
@@ -786,6 +863,46 @@ class SQLiteLocalAuthority:
                 or now >= int(stored["expires_at"])
             ):
                 return False
+            binding = next(
+                (
+                    item
+                    for item in ledger.get("authority_effect_bindings", [])
+                    if item["work_identity"] == stored["work_identity"]
+                ),
+                None,
+            )
+            if binding is not None:
+                record = next(
+                    (
+                        item
+                        for item in ledger.get("authority_effect_records", [])
+                        if item["work_identity"] == stored["work_identity"]
+                    ),
+                    None,
+                )
+                if (
+                    record is None
+                    or record["state"] != "leased"
+                    or record["attempt_fence"] != stored["attempt_fence"]
+                    or any(
+                        binding[key] != stored[key]
+                        for key in ("root_instance_id", "work_kind", "operation_token")
+                    )
+                ):
+                    return False
+            else:
+                from .effects import EffectError, _validate_authority_pair
+
+                try:
+                    native = connection.execute(
+                        "SELECT document FROM determa_committed_effects WHERE root_instance_id = ?",
+                        (stored["root_instance_id"],),
+                    ).fetchone()
+                    if native is None:
+                        return False
+                    _validate_authority_pair(ledger, _parse(bytes(native[0]).decode()))
+                except (EffectError, sqlite3.Error, ValueError):
+                    return False
             if phase == "dispatch" and on_dispatch is not None:
                 on_dispatch()
             return True
@@ -1045,6 +1162,42 @@ class SQLiteLocalAuthority:
                         native_update = (canonical_bytes(native), native_root)
                 if native_owned and native_update is None:
                     return _compact(_result(request, ledger, "host_capability_mismatch"))
+                if native_update is None:
+                    bindings = [
+                        item
+                        for item in ledger.get("authority_effect_bindings", [])
+                        if item["work_identity"] == arguments["work_identity"]
+                    ]
+                    records = [
+                        item
+                        for item in ledger.get("authority_effect_records", [])
+                        if item["work_identity"] == arguments["work_identity"]
+                    ]
+                    if len(bindings) != 1 or len(records) != 1:
+                        return _compact(_result(request, ledger, "host_capability_mismatch"))
+                    binding, record = bindings[0], records[0]
+                    if binding.get("participant") != "authority_journal":
+                        return _compact(_result(request, ledger, "host_capability_mismatch"))
+                    if any(
+                        binding[key] != arguments[key]
+                        for key in ("root_instance_id", "work_kind", "operation_token")
+                    ):
+                        return _compact(_result(request, ledger, "invalid_host_request"))
+                    history = [
+                        claim
+                        for claim in ledger["active_claims"]
+                        + ledger.get("effect_claim_history", [])
+                        if claim["work_identity"] == arguments["work_identity"]
+                    ]
+                    if (
+                        record["attempt_fence"] != entry["attempt_fence"]
+                        or record["state"] != "unclaimed"
+                        or any(int(claim["attempt_fence"]) >= int(fence) for claim in history)
+                    ):
+                        return _compact(_result(request, ledger, "stale_attempt_fence"))
+                    record["attempt_fence"] = fence
+                    record["state"] = "leased"
+                    ledger.setdefault("effect_claim_history", []).append(copy.deepcopy(new_claim))
                 if native_update is not None:
                     connection.execute(
                         "UPDATE determa_committed_effects SET document=? WHERE root_instance_id=?",
