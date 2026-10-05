@@ -492,7 +492,10 @@ def _retained_report(
 
 
 def _reconstruct_producer_response(
-    checkpoint: Mapping[str, Any], journal: Mapping[str, Any], operation_id: str
+    checkpoint: Mapping[str, Any],
+    journal: Mapping[str, Any],
+    operation_id: str,
+    request_identity: Mapping[str, Any],
 ) -> dict[str, Any] | None:
     """Resolve a retained simple producer response from complete checkpoint evidence."""
     reference = next(
@@ -514,6 +517,23 @@ def _reconstruct_producer_response(
     if len(receipts) != 1:
         raise EffectError("replay_evidence_expired")
     receipt = receipts[0]
+    emission_ids = {
+        item["effect_id"]
+        for item in receipt["emission_references"]
+        if item["kind"] == "external_outbox"
+    }
+    records = [
+        record for record in journal["effect_records"] if record["effect_id"] in emission_ids
+    ]
+    if len(records) != len(emission_ids) or not records:
+        raise EffectError("replay_evidence_expired")
+    if any(
+        record["target"]["root_instance_id"] != request_identity["root_instance_id"]
+        or record["target"]["runtime_id"] != request_identity["target_runtime_id"]
+        or record["operation_token"] != request_identity["operation_token"]
+        for record in records
+    ):
+        raise EffectError("operation_id_conflict")
     intents = {
         item["intent"]["effect_id"]: item["intent"] for item in checkpoint["pending_outbox_intents"]
     }
@@ -802,6 +822,7 @@ class SQLiteCommittedEffectHost:
             "result_requests": {},
             "result_responses": {},
             "cancel_requests": {},
+            "producer_requests": {},
         }
         if claim is not None:
             document["claims"][claim["work_identity"]] = copy.deepcopy(dict(claim))
@@ -1108,12 +1129,29 @@ class SQLiteCommittedEffectHost:
     ) -> dict[str, Any]:
         """Step one selected event, pin every emitted external intent, then commit."""
 
+        # CAS and route generation guard new work. Replay identifies the original
+        # production operation independently of current admission preconditions.
+        request_identity = {
+            "operation_kind": "produce",
+            "root_instance_id": root,
+            "target_runtime_id": target_runtime_id,
+            "operation_token": operation_token,
+        }
+
         def change(document: dict[str, Any]) -> dict[str, Any]:
             saved = document["responses"].get(operation_id)
             if saved is not None:
+                if (
+                    document.get("producer_requests", {}).get(operation_id) != request_identity
+                    or saved.get("kind") != "processing"
+                ):
+                    raise EffectError("operation_id_conflict")
                 return copy.deepcopy(saved)
             reconstructed = _reconstruct_producer_response(
-                document["checkpoint"], document["journal"], operation_id
+                document["checkpoint"],
+                document["journal"],
+                operation_id,
+                request_identity,
             )
             if reconstructed is not None:
                 return reconstructed
@@ -1190,6 +1228,9 @@ class SQLiteCommittedEffectHost:
                 key=lambda item: item["operation_id"].encode()
             )
             document["responses"][operation_id] = copy.deepcopy(response)
+            document.setdefault("producer_requests", {})[operation_id] = copy.deepcopy(
+                request_identity
+            )
             document["checkpoint"] = candidate
             _bump(journal, candidate)
             if before_commit is not None:

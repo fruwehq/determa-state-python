@@ -1418,3 +1418,103 @@ def test_historical_child_target_uses_original_definition_after_removal(case, ma
     origin[counter] = str(int(origin[counter]) + 1)
     with pytest.raises(EffectError, match="invalid_effect_journal"):
         _pinned_result_target(checkpoint, record, resolver)
+
+
+def test_producer_replay_cannot_return_a_cancellation_response(tmp_path):
+    host, root, _, _ = host_fixture(tmp_path)
+    request = read("data/cancel-request.json")
+    request["operation_id"] = "shared-id"
+    host.cancel(root, request)
+    before = host.snapshot(root)
+    with pytest.raises(EffectError, match="operation_id_conflict"):
+        host.produce(
+            root,
+            "shared-id",
+            "different-runtime",
+            expected_revision="999",
+            expected_digest="bad",
+            route_generation="999",
+            operation_token="different-token",
+        )
+    assert host.snapshot(root) == before
+
+
+@pytest.mark.parametrize("damage", [None, "target", "token"])
+def test_portable_producer_replay_requires_original_work_identity(tmp_path, damage):
+    host, root, _, _ = host_fixture(tmp_path)
+    record = host.snapshot(root)["journal"]["effect_records"][0]
+    # Restoration has the normative response hash and immutable intent evidence,
+    # but no process-local producer response cache or current route.
+    target = record["target"]["runtime_id"] if damage != "target" else "different-runtime"
+    token = record["operation_token"] if damage != "token" else "different-token"
+    before = host.snapshot(root)
+    arguments = {
+        "expected_revision": "stale",
+        "expected_digest": "stale",
+        "route_generation": "999",
+        "operation_token": token,
+    }
+    if damage is not None:
+        with pytest.raises(EffectError, match="operation_id_conflict"):
+            host.produce(root, "produce-1", target, **arguments)
+    else:
+        # Fixture journal response hash describes its pre-claim producer response.
+        # Use the matching unclaimed journal for exact reconstruction.
+        restored = SQLiteCommittedEffectHost(tmp_path / "producer.sqlite", host.resolver, {}, None)
+        restored.setup_schema()
+        restored.seed(read("pending-checkpoint.json"), read("data/unclaimed-journal.json"))
+        assert restored.produce(root, "produce-1", target, **arguments) == read(
+            "data/producer-response.json"
+        )
+    assert host.snapshot(root) == before
+
+
+@pytest.mark.parametrize("damage", [None, "target", "token", "cancel"])
+def test_native_producer_replay_retains_exact_kind_and_request_identity(tmp_path, damage):
+    original, root, _, _ = host_fixture(tmp_path)
+    checkpoint = read("accepted-checkpoint.json")
+    journal = read("data/empty-journal.json")
+    record = read("data/unclaimed-journal.json")["effect_records"][0]
+    route = {
+        key: record[key]
+        for key in (
+            "handler_reference",
+            "destination_binding_digest",
+            "result_mapping",
+            "target",
+            "idempotency_policy",
+        )
+    }
+    route["generation"] = record["route_configuration_generation"]
+    host = SQLiteCommittedEffectHost(tmp_path / "production.sqlite", original.resolver, route, None)
+    host.setup_schema()
+    host.seed(checkpoint, journal)
+    host = installed_test_handler(host, lambda *_: {})
+    runtime = checkpoint["root_record"]["aggregate_state"]["root_runtime_id"]
+    arguments = {
+        "expected_revision": checkpoint["revision"],
+        "expected_digest": checkpoint["execution_checkpoint_digest"],
+        "route_generation": route["generation"],
+        "operation_token": record["operation_token"],
+    }
+    first = host.produce(root, "shared-id", runtime, **arguments)
+    before = host.snapshot(root)
+    if damage == "cancel":
+        request = read("data/cancel-request.json")
+        request["operation_id"] = "shared-id"
+        with pytest.raises(EffectError, match="operation_id_conflict"):
+            host.cancel(root, request)
+    else:
+        host.route["generation"] = "999"
+        host.handler = None
+        arguments.update(expected_revision="stale", expected_digest="stale", route_generation="999")
+        if damage == "target":
+            runtime = "different-runtime"
+        elif damage == "token":
+            arguments["operation_token"] = "different-token"
+        if damage is not None:
+            with pytest.raises(EffectError, match="operation_id_conflict"):
+                host.produce(root, "shared-id", runtime, **arguments)
+        else:
+            assert host.produce(root, "shared-id", runtime, **arguments) == first
+    assert host.snapshot(root) == before
