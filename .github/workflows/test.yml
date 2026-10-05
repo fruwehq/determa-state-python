@@ -144,7 +144,11 @@ jobs:
         env:
           DETERMA_CONFORMANCE_DIR: ${{ github.workspace }}/.pinned/determa-state-conformance
           DETERMA_SPEC_DIR: ${{ github.workspace }}/.pinned/determa-state-spec
-        run: pytest conformance -q
+        run: |
+          pytest conformance -q
+          PYTHONPATH=src python "$DETERMA_CONFORMANCE_DIR/scripts/run_host_authority_profile.py" \
+            --spec-root "$DETERMA_SPEC_DIR" \
+            --adapter python conformance/authority_adapter.py
 
   postgresql:
     runs-on: ubuntu-24.04

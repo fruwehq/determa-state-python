@@ -67,6 +67,7 @@ def _binding_live() -> tuple[str, SQLiteLocalAuthority]:
             descriptor["source_binding_digest"],
             descriptor["destination_binding_digest"],
             descriptor["extension_report"],
+            descriptor["required_participants"],
         ]
     ), authority
 
