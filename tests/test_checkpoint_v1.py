@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import copy
+import json
 
 import pytest
+import yaml
 
 import determa.state.checkpoint_v1 as checkpoint_v1
+from conformance.harness import conformance_root
 from determa.state import (
     ArtifactError,
     ExecutionHost,
@@ -19,6 +22,21 @@ from determa.state import (
     seal_execution_checkpoint,
 )
 from determa.state.queueing import admit_aggregate_v1, step_aggregate_v1
+
+
+def test_committed_effect_result_checkpoints_restore_with_definition_resolver() -> None:
+    case = conformance_root() / "conformance/profiles/committed-native-effects/effect-01-result"
+    bundle = load_bundle(yaml.safe_load((case / "machine.yaml").read_text()))
+    resolver = MemoryArtifactResolver(definitions={bundle.fingerprint: bundle})
+    for name in (
+        "pending-checkpoint.json",
+        "admitted-checkpoint.json",
+        "cancelled-admitted-checkpoint.json",
+    ):
+        checkpoint = json.loads((case / name).read_text())
+        restored = restore_execution_checkpoint_v1(checkpoint, resolver)
+        assert restored.document == checkpoint
+
 
 MACHINE = """
 format: 1
@@ -87,6 +105,57 @@ machines:
                 payload: { index: "1" }
                 correlation_id: "'batch'"
 """
+
+ENV_MACHINE = """
+format: 1
+namespace: test.checkpoint_v1_env
+machines:
+  - machine_id: env_machine
+    root:
+      type: simple
+      variables:
+        region: { type: string, init: east, external: true }
+      on_events:
+        env:
+          action:
+            - refresh: {}
+"""
+
+
+def test_accepted_env_checkpoint_restores_with_runtime_lookup() -> None:
+    bundle = load_bundle(ENV_MACHINE)
+    resolver = MemoryArtifactResolver(definitions={bundle.fingerprint: bundle})
+    checkpoint = create_checkpoint_v1(bundle, "env_machine", "env-root", "create-env", {})
+    delivery = _delivery(checkpoint, "env", "env-region-west", {"changed": {"region": "west"}})
+    delivery["envelope_digest"] = delivery_request_digest("env-root", "input", delivery["envelope"])
+    accepted = checkpoint_v1.admit_checkpoint_v1(
+        checkpoint,
+        [delivery],
+        resolver,
+        expected_revision=checkpoint["revision"],
+        expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+    )
+    assert accepted["root_record"]["aggregate_state"]["runtimes"][0]["ready_mailbox"]
+    restore_execution_checkpoint_v1(accepted, resolver)
+
+
+def test_optional_input_correlation_survives_checkpoint_restore() -> None:
+    checkpoint, resolver = _created_checkpoint()
+    delivery = _delivery(
+        checkpoint,
+        "increment",
+        "increment-with-correlation",
+        {"amount": 1},
+        correlation_id="business-correlation",
+    )
+    accepted = checkpoint_v1.admit_checkpoint_v1(
+        checkpoint,
+        [delivery],
+        resolver,
+        expected_revision=checkpoint["revision"],
+        expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+    )
+    restore_execution_checkpoint_v1(accepted, resolver)
 
 
 def _bundle_and_resolver():
