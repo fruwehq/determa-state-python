@@ -896,7 +896,9 @@ class SQLiteTimerHelper:
                 if record["state"] == "claimed":
                     if now < _time(record["expires_at"]):
                         return _result(request, record, "timer_fire_in_progress")
-                    self._prove_local_uncommitted_fire(connection, artifact, record)
+                    # Dispatch through the retained implementation: an instance or
+                    # class replacement must not bypass the checks inside the proof.
+                    _FATE_PROOF(self, connection, artifact, record)
                 if now < _time(record["deadline_at"]):
                     return _result(request, record, "timer_not_due")
                 expires_at = now + self.claim_lease_nanoseconds
@@ -931,6 +933,7 @@ class SQLiteTimerHelper:
 
 # Trusted local factory methods remain bound while an instance proves native fate.
 # This guard supplements native origin/history; it is not external registration proof.
+_FATE_PROOF = SQLiteTimerHelper._prove_local_uncommitted_fire
 _FATE_METHODS = tuple(
     (name, getattr(SQLiteTimerHelper, name), getattr(SQLiteTimerHelper, name).__code__)
     for name in (

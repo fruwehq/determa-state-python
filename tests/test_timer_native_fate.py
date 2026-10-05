@@ -67,6 +67,24 @@ def test_expired_local_claim_reclaims_with_new_fence_then_rejects_old_worker(tmp
     assert helper.execute(reclaim(complete), principal="worker-A") == result
 
 
+@pytest.mark.parametrize("replace_class", [False, True])
+def test_replaced_fate_proof_cannot_bypass_its_own_guard(tmp_path, monkeypatch, replace_class):
+    helper, host, complete, _, now, _ = configured(tmp_path, replay_retention="bounded")
+    before_helper, before_root = helper.snapshot(), host.read_checkpoint("server-1").document
+    now[0] = "130"
+    monkeypatch.setattr(
+        SQLiteTimerHelper if replace_class else helper,
+        "_prove_local_uncommitted_fire",
+        lambda *_: None,
+    )
+    assert (
+        helper.execute(reclaim(complete), principal="worker-A")["error_code"]
+        == "delivery_ambiguous"
+    )
+    assert helper.snapshot() == before_helper
+    assert host.read_checkpoint("server-1").document == before_root
+
+
 @pytest.mark.parametrize("changed_content", [False, True])
 def test_independently_admitted_matching_id_never_becomes_helper_fate_proof(
     tmp_path, changed_content
