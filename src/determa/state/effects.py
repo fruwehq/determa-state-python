@@ -451,13 +451,26 @@ class SQLiteCommittedEffectHost:
                 ):
                     raise EffectError("stale_attempt_fence")
                 for record in journal["effect_records"]:
-                    if (
-                        record["attempt_fence"] != "0"
-                        and {
-                            "work_identity": record["effect_id"],
-                            "attempt_fence": record["attempt_fence"],
-                        }
-                        not in ledger["journal_entries"]
+                    expected = {
+                        "work_identity": record["effect_id"],
+                        "attempt_fence": record["attempt_fence"],
+                    }
+                    issued = next(
+                        (
+                            item
+                            for item in ledger["journal_entries"]
+                            if item["work_identity"] == record["effect_id"]
+                        ),
+                        None,
+                    )
+                    if (issued is not None and issued != expected) or (
+                        issued is None and record["attempt_fence"] != "0"
+                    ):
+                        raise EffectError("stale_attempt_fence")
+                    if any(
+                        item["work_identity"] == record["effect_id"]
+                        and document["claims"].get(record["effect_id"]) != item
+                        for item in ledger["active_claims"]
                     ):
                         raise EffectError("stale_attempt_fence")
                 self._mirror_authority(ledger, document)

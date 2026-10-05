@@ -192,3 +192,39 @@ def test_authority_seed_cannot_bypass_scope_or_claim_guard(tmp_path, boundary):
         assert (
             connection.execute("SELECT COUNT(*) FROM determa_committed_effects").fetchone()[0] == 0
         )
+
+
+@pytest.mark.parametrize("journal_name", ["unclaimed-journal.json", "leased-journal.json"])
+def test_seed_cannot_rewind_an_issued_fence_or_remove_its_claim(tmp_path, journal_name):
+    from determa.state.authority import SQLiteLocalAuthority
+
+    bundle = load_bundle((CASE / "machine.yaml").read_text())
+    resolver = MemoryArtifactResolver(definitions={bundle.fingerprint: bundle})
+    checkpoint = read("pending-checkpoint.json")
+    journal = read("data/" + journal_name)
+    claim = read("data/active-claim.json")
+    claim["scope_authority_epoch"] = "0"
+    scope, root = journal["scope_identity"], checkpoint["root_instance_id"]
+    authority = SQLiteLocalAuthority(tmp_path / "issued.sqlite")
+    authority.setup_schema()
+    assert authority.allocate(scope, "owner", roots=(root,))
+    ledger = authority.inspect(scope)
+    ledger["active_claims"] = [claim]
+    ledger["journal_entries"] = [{"work_identity": claim["work_identity"], "attempt_fence": "1"}]
+    with authority._connect() as connection:
+        connection.execute(
+            "UPDATE determa_scope_authority SET ledger=? WHERE scope_identity=?",
+            (json.dumps(ledger), scope),
+        )
+        connection.commit()
+    host = SQLiteCommittedEffectHost(
+        authority.path, resolver, {"authority_epoch": "0"}, lambda *_: {}, authority_scope=scope
+    )
+    host.setup_schema()
+    with pytest.raises(EffectError, match="stale_attempt_fence"):
+        host.seed(checkpoint, journal)
+    assert authority.inspect(scope) == ledger
+    with host._connect() as connection:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM determa_committed_effects").fetchone()[0] == 0
+        )
