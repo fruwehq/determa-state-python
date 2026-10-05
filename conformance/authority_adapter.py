@@ -167,7 +167,11 @@ def _observed_ledger(authority: SQLiteLocalAuthority) -> dict[str, Any] | None:
     if ledger is None:
         return None
     # Project the actual ledger onto the closed conformance observation shape.
-    return {key: value for key, value in ledger.items() if key != "native_checkpoint_bytes"}
+    return {
+        key: value
+        for key, value in ledger.items()
+        if key not in {"native_checkpoint_bytes", "effect_claim_history"}
+    }
 
 
 def _call(authority: SQLiteLocalAuthority, call: dict[str, Any], **kwargs: Any) -> str | None:

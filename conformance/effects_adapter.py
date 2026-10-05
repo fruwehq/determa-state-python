@@ -328,7 +328,19 @@ def _run_operation(payload: dict[str, Any], control: Path | None = None) -> dict
             (_AUTHORITY_SCOPE,),
         ).fetchone()
         ledger = json.loads(row[0])
-        ledger["active_claims"] = [copy.deepcopy(payload["claim"])] if payload["claim"] else []
+        ledger["effect_claim_history"] = (
+            [copy.deepcopy(payload["claim"])] if payload["claim"] else []
+        )
+        ledger["active_claims"] = (
+            [copy.deepcopy(payload["claim"])]
+            if payload["claim"]
+            and any(
+                record["invocation_state"] == "leased"
+                and record["effect_id"] == payload["claim"]["work_identity"]
+                for record in journal["effect_records"]
+            )
+            else []
+        )
         ledger["journal_entries"] = [
             {"work_identity": record["effect_id"], "attempt_fence": record["attempt_fence"]}
             for record in journal["effect_records"]

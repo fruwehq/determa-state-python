@@ -359,6 +359,87 @@ def _reconstruct_producer_response(
     return response
 
 
+def _validate_authority_pair(ledger: Mapping[str, Any], document: Mapping[str, Any]) -> None:
+    """Check the old native pair before any journal transition can be staged."""
+    journal = document["journal"]
+    if (
+        journal["scope_identity"] != ledger["scope_identity"]
+        or journal["root_instance_id"] not in ledger["roots"]
+    ):
+        raise EffectError("unauthorized_scope")
+    for record in journal["effect_records"]:
+        issued = next(
+            (
+                entry
+                for entry in ledger["journal_entries"]
+                if entry["work_identity"] == record["effect_id"]
+            ),
+            None,
+        )
+        if issued is None or issued["attempt_fence"] != record["attempt_fence"]:
+            raise EffectError("stale_attempt_fence")
+        if any(
+            claim["work_identity"] == record["effect_id"]
+            and int(claim["attempt_fence"]) > int(record["attempt_fence"])
+            for claim in ledger.get("effect_claim_history", [])
+        ):
+            raise EffectError("stale_attempt_fence")
+        live = next(
+            (
+                claim
+                for claim in ledger["active_claims"]
+                if claim["work_identity"] == record["effect_id"]
+            ),
+            None,
+        )
+        if record["invocation_state"] == "leased":
+            if live is None or live != document["claims"].get(record["effect_id"]):
+                raise EffectError("stale_attempt_fence")
+        elif live is not None:
+            raise EffectError("stale_attempt_fence")
+
+
+def _issue_effect_claim(
+    document: dict[str, Any],
+    effect_id: str,
+    principal: str,
+    epoch: str,
+    expires_at: str,
+    trusted_now: str,
+    *,
+    deduplication_proven: bool = False,
+) -> dict[str, Any]:
+    now, expiry = _now(trusted_now), _now(expires_at)
+    if expiry <= now:
+        raise EffectError("stale_attempt_fence")
+    journal = document["journal"]
+    record = _record(journal, effect_id)
+    if record["invocation_state"] not in {"unclaimed", "ambiguous"}:
+        raise EffectError("effect_not_outstanding")
+    if record["invocation_state"] == "ambiguous" and not (
+        deduplication_proven and record["idempotency_policy"] == "destination_deduplicates"
+    ):
+        raise EffectError("effect_not_outstanding")
+    fence = str(int(record["attempt_fence"]) + 1)
+    claim = {
+        "scope_identity": journal["scope_identity"],
+        "root_instance_id": journal["root_instance_id"],
+        "work_kind": "effect",
+        "work_identity": effect_id,
+        "operation_token": record["operation_token"],
+        "scope_authority_epoch": epoch,
+        "attempt_fence": fence,
+        "worker_principal": principal,
+        "expires_at": expires_at,
+        "state": "active",
+    }
+    record["attempt_fence"] = fence
+    record["invocation_state"] = "leased"
+    document["claims"][effect_id] = claim
+    _bump(journal)
+    return copy.deepcopy(claim)
+
+
 class SQLiteCommittedEffectHost:
     """One local host with checkpoint, journal, claims and responses in one SQLite row.
 
@@ -444,7 +525,8 @@ class SQLiteCommittedEffectHost:
                 # Restoring an already claimed invocation cannot mint authority.
                 # Its exact claim must already have been issued by this ledger.
                 if claim is not None and (
-                    dict(claim) not in ledger["active_claims"]
+                    dict(claim)
+                    not in ledger["active_claims"] + ledger.get("effect_claim_history", [])
                     or claim.get("scope_identity") != self.authority_scope
                     or claim.get("root_instance_id") != checkpoint["root_instance_id"]
                     or claim.get("scope_authority_epoch") != ledger["authority_epoch"]
@@ -467,9 +549,20 @@ class SQLiteCommittedEffectHost:
                         issued is None and record["attempt_fence"] != "0"
                     ):
                         raise EffectError("stale_attempt_fence")
+                    if (
+                        record["invocation_state"] == "leased"
+                        and document["claims"].get(record["effect_id"])
+                        not in ledger["active_claims"]
+                    ):
+                        raise EffectError("stale_attempt_fence")
                     if any(
                         item["work_identity"] == record["effect_id"]
-                        and document["claims"].get(record["effect_id"]) != item
+                        and (
+                            document["claims"].get(record["effect_id"]) != item
+                            or record["invocation_state"] != "leased"
+                            or item["attempt_fence"] != record["attempt_fence"]
+                            or item["operation_token"] != record["operation_token"]
+                        )
                         for item in ledger["active_claims"]
                     ):
                         raise EffectError("stale_attempt_fence")
@@ -484,7 +577,9 @@ class SQLiteCommittedEffectHost:
             connection.commit()
 
     @staticmethod
-    def _mirror_authority(ledger: dict[str, Any], document: dict[str, Any]) -> None:
+    def _mirror_authority(
+        ledger: dict[str, Any], document: dict[str, Any], *, advance_generation: bool = True
+    ) -> None:
         """Mirror effect fences and exact committed bytes in the colocated authority ledger."""
         records = document["journal"]["effect_records"]
         for record in records:
@@ -501,6 +596,8 @@ class SQLiteCommittedEffectHost:
                     {"work_identity": record["effect_id"], "attempt_fence": record["attempt_fence"]}
                 )
             else:
+                if int(record["attempt_fence"]) < int(entry["attempt_fence"]):
+                    raise EffectError("stale_attempt_fence")
                 entry["attempt_fence"] = record["attempt_fence"]
         work = {record["effect_id"] for record in records}
         ledger["active_claims"] = [
@@ -510,6 +607,10 @@ class SQLiteCommittedEffectHost:
             for record in records
             if record["invocation_state"] == "leased" and record["effect_id"] in document["claims"]
         ]
+        history_claims = ledger.setdefault("effect_claim_history", [])
+        for claim in document["claims"].values():
+            if claim not in history_claims:
+                history_claims.append(copy.deepcopy(claim))
         from .authority import _native_checkpoint_history
 
         source = canonical_bytes(document["checkpoint"]).decode()
@@ -518,7 +619,8 @@ class SQLiteCommittedEffectHost:
             history.append(source)
         ledger["checkpoint_bytes"].append(source)
         ledger["mutation_bytes"].append(canonical_bytes(document["journal"]).decode())
-        ledger["scope_generation"] = str(int(ledger["scope_generation"]) + 1)
+        if advance_generation:
+            ledger["scope_generation"] = str(int(ledger["scope_generation"]) + 1)
 
     def snapshot(self, root_instance_id: str) -> dict[str, Any]:
         with self._connect() as connection:
@@ -574,6 +676,7 @@ class SQLiteCommittedEffectHost:
                     expected_epoch is not None and ledger["authority_epoch"] != expected_epoch
                 ):
                     raise EffectError("stale_scope_authority")
+                _validate_authority_pair(ledger, document)
                 if worker_guard is not None:
                     effect_id, principal, fence, trusted_now = worker_guard
                     journal_record = _record(document["journal"], effect_id)
@@ -753,37 +856,16 @@ class SQLiteCommittedEffectHost:
         trusted_now: str,
         deduplication_proven: bool = False,
     ) -> dict[str, Any]:
-        now, expiry = _now(trusted_now), _now(expires_at)
-        if expiry <= now:
-            raise EffectError("stale_attempt_fence")
-
         def change(document: dict[str, Any]) -> dict[str, Any]:
-            journal = document["journal"]
-            record = _record(journal, effect_id)
-            if record["invocation_state"] not in {"unclaimed", "ambiguous"}:
-                raise EffectError("effect_not_outstanding")
-            if record["invocation_state"] == "ambiguous" and not (
-                deduplication_proven and record["idempotency_policy"] == "destination_deduplicates"
-            ):
-                raise EffectError("effect_not_outstanding")
-            fence = str(int(record["attempt_fence"]) + 1)
-            claim = {
-                "scope_identity": journal["scope_identity"],
-                "root_instance_id": root,
-                "work_kind": "effect",
-                "work_identity": effect_id,
-                "operation_token": record["operation_token"],
-                "scope_authority_epoch": epoch,
-                "attempt_fence": fence,
-                "worker_principal": principal,
-                "expires_at": expires_at,
-                "state": "active",
-            }
-            record["attempt_fence"] = fence
-            record["invocation_state"] = "leased"
-            document["claims"][effect_id] = claim
-            _bump(journal)
-            return copy.deepcopy(claim)
+            return _issue_effect_claim(
+                document,
+                effect_id,
+                principal,
+                epoch,
+                expires_at,
+                trusted_now,
+                deduplication_proven=deduplication_proven,
+            )
 
         return self._transact(
             root, change, expected_epoch=epoch, authority_mutation=self._mirror_authority

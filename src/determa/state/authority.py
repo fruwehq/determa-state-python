@@ -934,7 +934,18 @@ class SQLiteLocalAuthority:
                 if (
                     entry is None
                     or arguments["root_instance_id"] not in ledger["roots"]
-                    or entry["attempt_fence"] != arguments["expected_attempt_fence"]
+                    or (
+                        entry["attempt_fence"] != arguments["expected_attempt_fence"]
+                        and not (
+                            arguments["expected_attempt_fence"] is None
+                            and entry["attempt_fence"] == "0"
+                            and not any(
+                                claim["work_identity"] == arguments["work_identity"]
+                                for claim in ledger["active_claims"]
+                                + ledger.get("effect_claim_history", [])
+                            )
+                        )
+                    )
                 ):
                     return _compact(_result(request, ledger, "stale_attempt_fence"))
                 if invocation.get("assigned_worker_principal") != principal:
@@ -952,6 +963,70 @@ class SQLiteLocalAuthority:
                     "expires_at": str(int(now) + self.worker_lease_nanoseconds),
                     "state": "active",
                 }
+                # An installed effect journal is a participant in this claim,
+                # not an eventually updated mirror of the authority receipt.
+                if connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='determa_committed_effects'"
+                ).fetchone():
+                    from .effects import (
+                        EffectError,
+                        SQLiteCommittedEffectHost,
+                        _issue_effect_claim,
+                        _validate_authority_pair,
+                        validate_journal,
+                    )
+                    from .wire import canonical_bytes
+
+                    native_rows = connection.execute(
+                        "SELECT root_instance_id, document FROM determa_committed_effects"
+                    ).fetchall()
+                    for native_root, native_bytes in native_rows:
+                        native = _parse(bytes(native_bytes).decode())
+                        found = next(
+                            (
+                                record
+                                for record in native["journal"]["effect_records"]
+                                if record["effect_id"] == arguments["work_identity"]
+                            ),
+                            None,
+                        )
+                        if found is None:
+                            continue
+                        if (
+                            native_root != arguments["root_instance_id"]
+                            or found["operation_token"] != arguments["operation_token"]
+                        ):
+                            return _compact(_result(request, ledger, "invalid_host_request"))
+                        try:
+                            validate_journal(native["checkpoint"], native["journal"])
+                            _validate_authority_pair(ledger, native)
+                            issued = _issue_effect_claim(
+                                native,
+                                arguments["work_identity"],
+                                principal,
+                                ledger["authority_epoch"],
+                                new_claim["expires_at"],
+                                now,
+                            )
+                            if issued != new_claim:
+                                raise EffectError("stale_attempt_fence")
+                            validate_journal(native["checkpoint"], native["journal"])
+                            SQLiteCommittedEffectHost._mirror_authority(
+                                ledger, native, advance_generation=False
+                            )
+                        except EffectError as error:
+                            code = (
+                                "stale_attempt_fence"
+                                if error.code == "stale_attempt_fence"
+                                else "host_capability_mismatch"
+                            )
+                            return _compact(_result(request, ledger, code))
+                        connection.execute(
+                            "UPDATE determa_committed_effects SET document=? "
+                            "WHERE root_instance_id=?",
+                            (canonical_bytes(native), native_root),
+                        )
                 entry["attempt_fence"] = fence
                 ledger["active_claims"] = [
                     item
