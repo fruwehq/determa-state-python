@@ -205,7 +205,7 @@ def test_payload_pointer_inserts_pinned_token_before_declared_input_admission(tm
 
 def test_expired_worker_cannot_admit_recorded_outcome_but_host_recovery_can(tmp_path):
     host, root, request, context = host_fixture(tmp_path)
-    host.submit_result(root, request, admit=False, **context)
+    host._record_result(root, request, **context)
     before = host.snapshot(root)
     context["trusted_now"] = read("data/active-claim.json")["expires_at"]
     assert host.submit_result(root, request, **context)["error_code"] == "stale_attempt_fence"
@@ -867,3 +867,198 @@ def test_plain_callback_handler_is_refused_before_opening_storage(tmp_path):
         )
     assert calls == []
     assert not path.exists()
+
+
+def test_public_result_requires_admission_before_committed_response(tmp_path):
+    host, root, request, context = host_fixture(tmp_path)
+    before = host.snapshot(root)
+    with pytest.raises(TypeError, match="admit"):
+        host.submit_result(root, request, admit=False, **context)
+    assert host.snapshot(root) == before
+    staged = host._record_result(root, request, **context)
+    assert staged["status"] == "outcome_recorded"
+    assert staged["admission_receipt"] is None
+    response = host.submit_result(root, request, **context)
+    assert response["status"] == "committed"
+    assert response["admission_receipt"] in host.snapshot(root)["checkpoint"]["operation_receipts"]
+
+
+@pytest.mark.parametrize("operation", ["result", "cancel"])
+@pytest.mark.parametrize(
+    "damage", ["extra", "missing_payload", "native_payload", "missing_identity"]
+)
+def test_effect_requests_fail_closed_before_mutation_or_core_call(tmp_path, operation, damage):
+    calls = []
+    host, root, request, context = host_fixture(tmp_path, lambda *args: calls.append(args))
+    if operation == "cancel":
+        request = read("data/cancel-request.json")
+    if damage == "extra":
+        request["unexpected"] = True
+    elif damage == "missing_payload":
+        del request["payload"]
+    elif damage == "native_payload":
+        request["payload"] = object()
+    else:
+        del request["effect_id"]
+    before = host.snapshot(root)
+
+    def invoke():
+        return (
+            host.submit_result(root, request, **context)
+            if operation == "result"
+            else host.cancel(root, request)
+        )
+
+    if damage == "missing_identity":
+        with pytest.raises(EffectError, match="invalid_host_request"):
+            invoke()
+    else:
+        response = invoke()
+        assert response["status"] == "rejected"
+        assert response["error_code"] == "invalid_host_request"
+    assert calls == []
+    assert host.snapshot(root) == before
+
+
+def test_noncanonical_result_fence_is_refused_before_storage_mutation(tmp_path):
+    host, root, request, context = host_fixture(tmp_path)
+    request["attempt_fence"] = "01"
+    before = host.snapshot(root)
+    with pytest.raises(EffectError, match="invalid_host_request"):
+        host.submit_result(root, request, **context)
+    assert host.snapshot(root) == before
+
+
+@pytest.mark.parametrize("operation_ids", [["z", "a"], ["dup", "dup"]])
+def test_journal_response_references_require_strictly_ordered_unique_ids(operation_ids):
+    journal = read("data/leased-journal.json")
+    journal["operation_response_references"] = [
+        {"operation_id": name, "response_digest": "sha256:" + str(index) * 64}
+        for index, name in enumerate(operation_ids)
+    ]
+    with pytest.raises(EffectError, match="invalid_effect_journal"):
+        validate_journal(read("pending-checkpoint.json"), seal_journal(journal))
+
+
+def test_restoration_rejects_admitted_journal_without_checkpoint_admission(tmp_path):
+    host, root, request, context = host_fixture(tmp_path)
+    before = host.snapshot(root)["checkpoint"]
+    host.submit_result(root, request, **context)
+    journal = host.snapshot(root)["journal"]
+    journal["checkpoint_revision"] = before["revision"]
+    journal["checkpoint_digest"] = before["execution_checkpoint_digest"]
+    restored = SQLiteCommittedEffectHost(tmp_path / "torn.sqlite", host.resolver, {}, None)
+    restored.setup_schema()
+    with pytest.raises(EffectError, match="invalid_effect_journal"):
+        restored.seed(before, seal_journal(journal))
+    with restored._connect() as connection:
+        assert connection.execute("SELECT COUNT(*) FROM determa_committed_effects").fetchone() == (
+            0,
+        )
+
+
+def test_compact_outbox_location_retains_valid_admitted_journal_pair(tmp_path):
+    from determa.state.checkpoint import seal_execution_checkpoint
+    from determa.state.checkpoint_v1 import restore_execution_checkpoint_v1
+    from determa.state.host import outbox_intent_digest
+
+    host, root, request, context = host_fixture(tmp_path)
+    host.submit_result(root, request, **context)
+    host.terminalize_outbox(root, request["effect_id"], {"status": "confirmed"})
+    saved = host.snapshot(root)
+    checkpoint, journal = saved["checkpoint"], saved["journal"]
+    terminal = checkpoint["terminal_outbox_records"].pop()
+    checkpoint["outbox_effect_tombstones"].append(
+        {
+            "terminal_sequence": terminal["terminal_sequence"],
+            "effect_id": terminal["intent"]["effect_id"],
+            "intent_digest": outbox_intent_digest(root, terminal["intent"]),
+            "committed_revision": terminal["committed_revision"],
+            "outcome": terminal["outcome"],
+        }
+    )
+    checkpoint["revision"] = str(int(checkpoint["revision"]) + 1)
+    checkpoint = seal_execution_checkpoint(checkpoint)
+    restore_execution_checkpoint_v1(checkpoint, host.resolver)
+    journal["checkpoint_revision"] = checkpoint["revision"]
+    journal["checkpoint_digest"] = checkpoint["execution_checkpoint_digest"]
+    journal["journal_revision"] = str(int(journal["journal_revision"]) + 1)
+    journal = seal_journal(journal)
+    validate_journal(checkpoint, journal)
+    restored = SQLiteCommittedEffectHost(tmp_path / "compact.sqlite", host.resolver, {}, None)
+    restored.setup_schema()
+    restored.seed(checkpoint, journal)
+    assert restored.recover(root)["journal"] == journal
+
+
+@pytest.mark.parametrize("changed", ["payload", "token", "event", "target", "receipt_kind", "mode"])
+def test_admission_receipt_authenticates_exact_pinned_result(tmp_path, changed):
+    from determa.state.wire import hash_value
+
+    host, root, request, context = host_fixture(tmp_path)
+    host.submit_result(root, request, **context)
+    saved = host.snapshot(root)
+    journal = saved["journal"]
+    record = journal["effect_records"][0]
+    outcome = record["outcome"]
+    if changed == "payload":
+        outcome["payload"][1][0][1][1] = "altered"
+    elif changed == "token":
+        record["operation_token"] = "altered"
+    elif changed == "event":
+        record["result_mapping"][0]["event"] = "native_cancelled"
+    elif changed == "target":
+        record["target"]["runtime_id"] = "different-runtime"
+    elif changed == "receipt_kind":
+        record["admission_receipt"]["operation_kind"] = "event_terminal"
+    else:
+        record["admission_receipt"]["delivery_mode"] = "signal"
+    outcome["digest"] = hash_value(
+        [
+            "determa-effect-outcome-1",
+            record["effect_id"],
+            record["operation_token"],
+            outcome["kind"],
+            outcome["payload"],
+            outcome["attempt_fence"],
+        ]
+    )
+    report = record["attempt_records"][0]
+    report["report_digest"] = hash_value(
+        [
+            "determa-effect-attempt-report-1",
+            record["effect_id"],
+            record["operation_token"],
+            outcome["attempt_fence"],
+            outcome["kind"],
+            outcome["payload"],
+            report["reason"],
+        ]
+    )
+    with pytest.raises(EffectError, match="invalid_effect_journal"):
+        validate_journal(saved["checkpoint"], seal_journal(journal), host.resolver)
+
+
+def test_historical_result_evidence_survives_processing(tmp_path):
+    from determa.state.checkpoint_v1 import step_checkpoint_v1
+
+    host, root, request, context = host_fixture(tmp_path)
+    host.submit_result(root, request, **context)
+    saved = host.snapshot(root)
+    checkpoint = saved["checkpoint"]
+    checkpoint = step_checkpoint_v1(
+        checkpoint,
+        checkpoint["root_record"]["aggregate_state"]["root_runtime_id"],
+        host.resolver,
+        expected_revision=checkpoint["revision"],
+        expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+    )
+    journal = saved["journal"]
+    journal["checkpoint_revision"] = checkpoint["revision"]
+    journal["checkpoint_digest"] = checkpoint["execution_checkpoint_digest"]
+    journal = seal_journal(journal)
+    validate_journal(checkpoint, journal, host.resolver)
+    restored = SQLiteCommittedEffectHost(tmp_path / "processed.sqlite", host.resolver, {}, None)
+    restored.setup_schema()
+    restored.seed(checkpoint, journal)
+    assert restored.recover(root)["journal"] == journal

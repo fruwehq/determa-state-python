@@ -79,6 +79,18 @@ def _journal_validator() -> Any:
     return Draft202012Validator(source, registry=registry)
 
 
+def _validate_request(request: Mapping[str, Any], name: str) -> dict[str, Any]:
+    from jsonschema import Draft202012Validator
+
+    if not isinstance(request, Mapping):
+        raise EffectError("invalid_host_request")
+    normalized = copy.deepcopy(dict(request))
+    source = json.loads((Path(__file__).parent / "data" / name).read_text())
+    if not Draft202012Validator(source, registry=_schema_registry()).is_valid(normalized):
+        raise EffectError("invalid_host_request")
+    return normalized
+
+
 def _now(value: str) -> int:
     if type(value) is not str or not _NANOSECONDS.fullmatch(value):
         raise EffectError("stale_attempt_fence")
@@ -110,7 +122,106 @@ def _bump(journal: dict[str, Any], checkpoint: Mapping[str, Any] | None = None) 
     journal["host_effect_journal_digest"] = journal_digest(journal)
 
 
-def validate_journal(checkpoint: Mapping[str, Any], journal: Mapping[str, Any]) -> None:
+def _result_delivery_evidence(
+    checkpoint: Mapping[str, Any],
+    record: Mapping[str, Any],
+    kind: str,
+    payload: Any,
+    target: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Build pinned admission bytes without consulting current runtime liveness."""
+    mapping = _mapping(record, kind)
+    event_id = hash_value(
+        ["determa-effect-result-event-1", record["effect_id"], mapping["result_slot"]]
+    )
+    envelope = {
+        "event": mapping["event"],
+        "event_id": event_id,
+        "cause_id": event_id,
+        "source": {"host": True},
+        "target": copy.deepcopy(dict(target)),
+        "payload": copy.deepcopy(payload),
+    }
+    location = mapping["operation_token_location"]
+    if location is not None:
+        if location["kind"] == "correlation_id":
+            envelope["correlation_id"] = record["operation_token"]
+        else:
+            try:
+                logical = decoded_typed_value(payload)
+                pointer = location["pointer"]
+                if not pointer.startswith("/") or re.search(r"~(?![01])", pointer):
+                    raise ValueError("invalid token pointer")
+                parts = [
+                    part.replace("~1", "/").replace("~0", "~") for part in pointer[1:].split("/")
+                ]
+                parent = logical
+                for part in parts[:-1]:
+                    parent = parent[part]
+                if not isinstance(parent, dict) or (
+                    parts[-1] in parent and not isinstance(parent[parts[-1]], str)
+                ):
+                    raise ValueError("token field must be a string")
+                parent[parts[-1]] = record["operation_token"]
+                envelope["payload"] = typed_value(logical)
+            except (KeyError, TypeError, ValueError) as exc:
+                raise EffectError("invalid_host_request") from exc
+    from .queueing import _entry_digest
+
+    return {
+        "delivery_mode": "input",
+        "envelope": envelope,
+        "envelope_digest": _entry_digest(checkpoint["root_instance_id"], "input", envelope),
+    }
+
+
+def _pinned_result_target(
+    checkpoint: Mapping[str, Any],
+    record: Mapping[str, Any],
+    resolver: ArtifactResolver | None,
+) -> dict[str, Any]:
+    target = record["target"]
+    origin = target["runtime_incarnation"]
+    aggregate = checkpoint["root_record"].get("aggregate_state")
+    for runtime in aggregate["runtimes"] if aggregate else []:
+        if runtime["runtime_id"] == target["runtime_id"] and runtime["identity_origin"] == origin:
+            return copy.deepcopy(runtime["target_identity"])
+    root, runtime_id = checkpoint["root_instance_id"], target["runtime_id"]
+    if origin["kind"] == "root" and origin["root_instance_id"] == root:
+        return {"root": {"root_instance_id": root, "root_runtime_id": runtime_id}}
+    if origin["kind"] == "owned_spawned_instance":
+        machine = origin["definition"]["machine"]
+        return {
+            "spawned_instance": {
+                "root_instance_id": root,
+                "instance_id": runtime_id,
+                "machine_id": machine["machine_id"],
+                "machine_version": machine["machine_version"],
+            }
+        }
+    if origin["kind"] == "component" and resolver is not None:
+        from .engine import _pointer_get
+        from .wire import _origin_machine
+
+        bundle, _ = _origin_machine(resolver, origin)
+        placement = _pointer_get(bundle.raw, origin["component_definition_pointer"])
+        return {
+            "component": {
+                "root_instance_id": root,
+                "owner_runtime_id": origin["owner_runtime_id"],
+                "component_id": placement["component_id"],
+                "component_runtime_id": runtime_id,
+                "activation_sequence": origin["activation_sequence"],
+            }
+        }
+    raise EffectError("invalid_effect_journal")
+
+
+def validate_journal(
+    checkpoint: Mapping[str, Any],
+    journal: Mapping[str, Any],
+    resolver: ArtifactResolver | None = None,
+) -> None:
     """Reject torn or internally inconsistent journal/checkpoint pairs."""
     if not _journal_validator().is_valid(journal):
         raise EffectError("invalid_effect_journal")
@@ -128,6 +239,11 @@ def validate_journal(checkpoint: Mapping[str, Any], journal: Mapping[str, Any]) 
         {r["effect_id"] for r in records}
     ):
         raise EffectError("invalid_effect_journal")
+    references = journal["operation_response_references"]
+    if [item["operation_id"] for item in references] != sorted(
+        {item["operation_id"] for item in references}
+    ):
+        raise EffectError("invalid_effect_journal")
     intents = {
         item["intent"]["effect_id"]: item["intent"] for item in checkpoint["pending_outbox_intents"]
     }
@@ -137,10 +253,18 @@ def validate_journal(checkpoint: Mapping[str, Any], journal: Mapping[str, Any]) 
             for item in checkpoint["terminal_outbox_records"]
         }
     )
+    compact = {item["effect_id"]: item for item in checkpoint["outbox_effect_tombstones"]}
+    location_ids = [
+        item["intent"]["effect_id"]
+        for item in checkpoint["pending_outbox_intents"] + checkpoint["terminal_outbox_records"]
+    ] + [item["effect_id"] for item in checkpoint["outbox_effect_tombstones"]]
     for record in records:
         intent = intents.get(record["effect_id"])
-        if intent is None or record["intent_digest"] != outbox_intent_digest(
-            checkpoint["root_instance_id"], intent
+        tombstone = compact.get(record["effect_id"])
+        if location_ids.count(record["effect_id"]) != 1 or record["intent_digest"] != (
+            outbox_intent_digest(checkpoint["root_instance_id"], intent)
+            if intent is not None
+            else cast(dict[str, Any], tombstone)["intent_digest"]
         ):
             raise EffectError("invalid_effect_journal")
         reports = record["attempt_records"]
@@ -161,6 +285,7 @@ def validate_journal(checkpoint: Mapping[str, Any], journal: Mapping[str, Any]) 
         if state in {"result_admitted", "closed"} and (
             record["admission_receipt"] is None
             or record["admission_receipt"]["event_id"] != record["result_event_id"]
+            or record["admission_receipt"] not in checkpoint["operation_receipts"]
         ):
             raise EffectError("invalid_effect_journal")
         outcome = record["outcome"]
@@ -192,6 +317,24 @@ def validate_journal(checkpoint: Mapping[str, Any], journal: Mapping[str, Any]) 
                 ]
             ):
                 raise EffectError("invalid_effect_journal")
+            if state in {"result_admitted", "closed"}:
+                try:
+                    delivery = _result_delivery_evidence(
+                        checkpoint,
+                        record,
+                        outcome["kind"],
+                        outcome["payload"],
+                        _pinned_result_target(checkpoint, record, resolver),
+                    )
+                    receipt = record["admission_receipt"]
+                    if (
+                        receipt["operation_kind"] != "acceptance"
+                        or receipt["delivery_mode"] != "input"
+                        or receipt["request_digest"] != delivery["envelope_digest"]
+                    ):
+                        raise EffectError("invalid_effect_journal")
+                except (ArtifactError, KeyError, TypeError, ValueError) as exc:
+                    raise EffectError("invalid_effect_journal") from exc
             preclaim_cancel = (
                 outcome["kind"] == "cancelled"
                 and outcome["attempt_fence"] == "0"
@@ -577,7 +720,7 @@ class SQLiteCommittedEffectHost:
         journal: Mapping[str, Any],
         claim: Mapping[str, Any] | None = None,
     ) -> None:
-        validate_journal(checkpoint, journal)
+        validate_journal(checkpoint, journal, self.resolver)
         restore_execution_checkpoint_v1(checkpoint, self.resolver)
         document: dict[str, Any] = {
             "checkpoint": checkpoint,
@@ -748,7 +891,7 @@ class SQLiteCommittedEffectHost:
         if row is None:
             raise EffectError("wrong_root")
         document: dict[str, Any] = json.loads(row[0])
-        validate_journal(document["checkpoint"], document["journal"])
+        validate_journal(document["checkpoint"], document["journal"], self.resolver)
         restore_execution_checkpoint_v1(document["checkpoint"], self.resolver)
         return document
 
@@ -769,7 +912,7 @@ class SQLiteCommittedEffectHost:
             if row is None:
                 raise EffectError("wrong_root")
             document: dict[str, Any] = json.loads(row[0])
-            validate_journal(document["checkpoint"], document["journal"])
+            validate_journal(document["checkpoint"], document["journal"], self.resolver)
             restore_execution_checkpoint_v1(document["checkpoint"], self.resolver)
             expiry_guard: tuple[Callable[[], str], int] | None = None
             if worker_guard is not None:
@@ -842,7 +985,7 @@ class SQLiteCommittedEffectHost:
                             raise EffectError("stale_attempt_fence")
             before = canonical_bytes(document)
             value = change(document)
-            validate_journal(document["checkpoint"], document["journal"])
+            validate_journal(document["checkpoint"], document["journal"], self.resolver)
             restore_execution_checkpoint_v1(document["checkpoint"], self.resolver)
             if (
                 ledger is not None
@@ -1193,20 +1336,27 @@ class SQLiteCommittedEffectHost:
         scope: str,
         epoch: str,
         trusted_now: str,
-        admit: bool = True,
     ) -> dict[str, Any]:
+        if (
+            not isinstance(request, Mapping)
+            or type(request.get("effect_id")) is not str
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", request["effect_id"]) is None
+            or type(request.get("attempt_fence")) is not str
+            or re.fullmatch(r"0|[1-9][0-9]*", request["attempt_fence"]) is None
+        ):
+            raise EffectError("invalid_host_request")
         effect_id, fence = request["effect_id"], request["attempt_fence"]
         try:
-            response = self._transact(
+            request = _validate_request(request, "effect-result-request-v1.schema.json")
+            response = self._record_result(
                 root,
-                lambda document: self._submit(
-                    document, request, principal, scope, epoch, trusted_now, False
-                ),
-                expected_epoch=epoch,
-                authority_mutation=self._mirror_authority,
-                worker_guard=(effect_id, principal, fence, trusted_now),
+                request,
+                principal=principal,
+                scope=scope,
+                epoch=epoch,
+                trusted_now=trusted_now,
             )
-            if admit and request["outcome_kind"] in _OUTCOMES:
+            if request["outcome_kind"] in _OUTCOMES:
                 # The authenticated outcome is already durable. Admission is a
                 # separate host-owned transaction; its failure cannot erase it.
                 def admission(document: dict[str, Any]) -> dict[str, Any]:
@@ -1229,6 +1379,25 @@ class SQLiteCommittedEffectHost:
         except EffectError as exc:
             return _rejected_result(effect_id, fence, exc.code)
 
+    def _record_result(
+        self,
+        root: str,
+        request: Mapping[str, Any],
+        *,
+        principal: str,
+        scope: str,
+        epoch: str,
+        trusted_now: str,
+    ) -> dict[str, Any]:
+        """Private durable-outcome stage; never a completed public result."""
+        return self._transact(
+            root,
+            lambda document: self._submit(document, request, principal, scope, epoch, trusted_now),
+            expected_epoch=epoch,
+            authority_mutation=self._mirror_authority,
+            worker_guard=(request["effect_id"], principal, request["attempt_fence"], trusted_now),
+        )
+
     def _submit(
         self,
         document: dict[str, Any],
@@ -1237,7 +1406,6 @@ class SQLiteCommittedEffectHost:
         scope: str,
         epoch: str,
         trusted_now: str,
-        admit: bool,
     ) -> dict[str, Any]:
         journal, checkpoint = document["journal"], document["checkpoint"]
         effect_id, fence, kind = (
@@ -1273,14 +1441,11 @@ class SQLiteCommittedEffectHost:
                 return copy.deepcopy(saved)
             if record["invocation_state"] in {"result_admitted", "closed"}:
                 return _result_response(record, journal, checkpoint, "committed")
-            if record["invocation_state"] == "outcome_recorded" and admit:
-                self._admit(document, record)
-                return _result_response(record, journal, document["checkpoint"], "committed")
             return _result_response(
                 record,
                 journal,
                 checkpoint,
-                "report_recorded" if kind not in _OUTCOMES else "committed",
+                "report_recorded" if kind not in _OUTCOMES else "outcome_recorded",
                 next(
                     (item for item in record["attempt_records"] if item["attempt_fence"] == fence),
                     None,
@@ -1337,14 +1502,11 @@ class SQLiteCommittedEffectHost:
         )
         record["invocation_state"] = "outcome_recorded"
         _bump(journal)
-        if admit:
-            self._admit(document, record)
-        return _result_response(record, journal, document["checkpoint"], "committed")
+        return _result_response(record, journal, document["checkpoint"], "outcome_recorded")
 
     def _result_delivery(
         self, checkpoint: dict[str, Any], record: dict[str, Any], kind: str, payload: Any
     ) -> dict[str, Any]:
-        mapping = _mapping(record, kind)
         aggregate = checkpoint["root_record"].get("aggregate_state")
         runtime = next(
             (
@@ -1360,49 +1522,9 @@ class SQLiteCommittedEffectHost:
             or record["target"]["root_instance_id"] != checkpoint["root_instance_id"]
         ):
             raise EffectError("effect_not_outstanding")
-        event_id = hash_value(
-            ["determa-effect-result-event-1", record["effect_id"], mapping["result_slot"]]
+        delivery = _result_delivery_evidence(
+            checkpoint, record, kind, payload, runtime["target_identity"]
         )
-        envelope = {
-            "event": mapping["event"],
-            "event_id": event_id,
-            "cause_id": event_id,
-            "source": {"host": True},
-            "target": copy.deepcopy(runtime["target_identity"]),
-            "payload": copy.deepcopy(payload),
-        }
-        location = mapping["operation_token_location"]
-        if location is not None:
-            if location["kind"] == "correlation_id":
-                envelope["correlation_id"] = record["operation_token"]
-            else:
-                try:
-                    logical = decoded_typed_value(payload)
-                    pointer = location["pointer"]
-                    if not pointer.startswith("/") or re.search(r"~(?![01])", pointer):
-                        raise ValueError("invalid token pointer")
-                    parts = [
-                        part.replace("~1", "/").replace("~0", "~")
-                        for part in pointer[1:].split("/")
-                    ]
-                    parent = logical
-                    for part in parts[:-1]:
-                        parent = parent[part]
-                    if not isinstance(parent, dict) or (
-                        parts[-1] in parent and not isinstance(parent[parts[-1]], str)
-                    ):
-                        raise ValueError("token field must be a string")
-                    parent[parts[-1]] = record["operation_token"]
-                    envelope["payload"] = typed_value(logical)
-                except (KeyError, TypeError, ValueError) as exc:
-                    raise EffectError("invalid_host_request") from exc
-        from .queueing import _entry_digest
-
-        delivery = {
-            "delivery_mode": "input",
-            "envelope": envelope,
-            "envelope_digest": _entry_digest(checkpoint["root_instance_id"], "input", envelope),
-        }
         try:
             _preflight_checkpoint_admission(
                 checkpoint,
@@ -1482,6 +1604,28 @@ class SQLiteCommittedEffectHost:
         return self.snapshot(root)
 
     def cancel(self, root: str, request: Mapping[str, Any]) -> dict[str, Any]:
+        if (
+            not isinstance(request, Mapping)
+            or type(request.get("effect_id")) is not str
+            or re.fullmatch(r"sha256:[0-9a-f]{64}", request["effect_id"]) is None
+            or type(request.get("operation_id")) is not str
+            or not request["operation_id"]
+        ):
+            raise EffectError("invalid_host_request")
+        try:
+            request = _validate_request(request, "effect-cancellation-request-v1.schema.json")
+        except EffectError:
+            return {
+                "status": "rejected",
+                "operation_id": request["operation_id"],
+                "effect_id": request["effect_id"],
+                "cancellation": None,
+                "outcome": None,
+                "result_event_id": None,
+                "journal_revision": None,
+                "error_code": "invalid_host_request",
+            }
+
         def change(document: dict[str, Any]) -> dict[str, Any]:
             journal = document["journal"]
             record = _record(journal, request["effect_id"])
