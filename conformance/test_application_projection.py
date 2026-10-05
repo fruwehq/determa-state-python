@@ -311,3 +311,66 @@ def test_application_row_write_failure_rolls_back_checkpoint() -> None:
             create_bundle=bundle,
         )
     assert store.saved == initial
+
+
+@pytest.mark.parametrize(
+    ("change", "code"),
+    [
+        ("digest", "delivery_digest_mismatch"),
+        ("missing_digest", "malformed_delivery"),
+        ("stale_revision", "checkpoint_revision_conflict"),
+    ],
+)
+def test_projection_validates_caller_before_row_input(change: str, code: str) -> None:
+    vector = next(item for item in VECTORS if item["name"] == "typed_row_input_atomic_admit")
+    request = copy.deepcopy(vector["request"])
+    request["delivery"]["envelope_digest"] = "sha256:" + "0" * 64
+    if change == "missing_digest":
+        del request["delivery"]["envelope_digest"]
+    elif change == "stale_revision":
+        request["expected_checkpoint"]["revision"] = "99"
+    initial = {
+        "selected_rows": copy.deepcopy(vector["before"]["selected_rows"]),
+        **{
+            key: _member(vector["before"].get(key))
+            for key in ("checkpoint", "supplemental_checkpoint", "supplemental_aggregate")
+        },
+    }
+    store = Store(copy.deepcopy(initial), True)
+    bundle = load_bundle((PROFILE / "machine.yaml").read_text())
+    resolver = MemoryArtifactResolver(definitions={bundle.fingerprint: bundle})
+    mapping = Rows(request["mapping"], "complete")
+    with (
+        patch.object(mapping, "prepare_delivery", wraps=mapping.prepare_delivery) as prepare,
+        patch.object(checkpoint_module, "admit_aggregate_v1") as core,
+        pytest.raises(ArtifactError, match=code),
+    ):
+        ApplicationProjectionFacade(store, resolver).run(request, mapping)
+    assert prepare.call_count == core.call_count == 0
+    assert store.saved == initial
+
+
+def test_projection_rejects_foreign_supplemental_aggregate_before_core() -> None:
+    vector = next(item for item in VECTORS if item["name"] == "proposed_supplement_truncation")
+    request = copy.deepcopy(vector["request"])
+    request["root_instance_id"] = "foreign-selected-root"
+    initial = {
+        "selected_rows": copy.deepcopy(vector["before"]["selected_rows"]),
+        **{
+            key: _member(vector["before"].get(key))
+            for key in ("checkpoint", "supplemental_checkpoint", "supplemental_aggregate")
+        },
+    }
+    initial["selected_rows"][0]["root_instance_id"] = request["root_instance_id"]
+    store = Store(copy.deepcopy(initial), True)
+    bundle = load_bundle((PROFILE / "deferral-machine.yaml").read_text())
+    resolver = MemoryArtifactResolver(definitions={bundle.fingerprint: bundle})
+    with (
+        patch.object(projection_module, "step_aggregate_v1") as core,
+        pytest.raises(ProjectionError, match="invalid_projection_selection"),
+    ):
+        ApplicationProjectionFacade(store, resolver).run(
+            request, Rows(request["mapping"], "complete")
+        )
+    assert core.call_count == 0
+    assert store.saved == initial

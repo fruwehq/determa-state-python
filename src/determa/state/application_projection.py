@@ -8,6 +8,7 @@ from typing import Any, Protocol
 
 from .checkpoint import serialize_execution_checkpoint
 from .checkpoint_v1 import (
+    _preflight_checkpoint_admission,
     admit_checkpoint_v1,
     create_checkpoint_v1,
     restore_execution_checkpoint_v1,
@@ -15,7 +16,7 @@ from .checkpoint_v1 import (
 )
 from .definition import Bundle, BundleSource
 from .errors import ArtifactError
-from .queueing import _entry_digest, _valid_envelope_shape, step_aggregate_v1
+from .queueing import _entry_digest, step_aggregate_v1
 from .stores import SHARED_APPLICATION_TRANSACTION, ExecutionStore
 from .wire import DefinitionResolver, canonical_bytes, restore_aggregate
 
@@ -108,6 +109,8 @@ class ApplicationProjectionFacade:
                         ).aggregate_envelope
                     except (ArtifactError, TypeError, ValueError) as exc:
                         raise ProjectionError("projection_not_lossless") from exc
+                    if prior_aggregate["root_instance_id"] != root:
+                        raise ProjectionError("invalid_projection_selection")
                     result = step_aggregate_v1(
                         prior_aggregate, str(request.get("target_runtime_id")), self.resolver
                     )
@@ -167,31 +170,17 @@ class ApplicationProjectionFacade:
                     if not isinstance(supplied, Mapping):
                         raise ProjectionError("invalid_projection_input")
                     delivery = copy.deepcopy(dict(supplied))
-                    envelope = delivery.get("envelope")
-                    if not isinstance(envelope, Mapping) or not _valid_envelope_shape(envelope):
-                        raise ProjectionError("invalid_projection_input")
-                    event_id = envelope["event_id"]
-                    retained = any(
-                        item.get("event_id") == event_id
-                        for item in prior["operation_receipts"] + prior["event_identity_tombstones"]
-                    ) or any(
-                        entry["envelope"]["event_id"] == event_id
-                        for runtime in (prior["root_record"].get("aggregate_state") or {}).get(
-                            "runtimes", []
-                        )
-                        for mailbox in ("ready_mailbox", "deferred_mailbox")
-                        for entry in runtime[mailbox]
+                    _, _, _, replay_result = _preflight_checkpoint_admission(
+                        prior,
+                        [delivery],
+                        self.resolver,
+                        expected_revision=revision,
+                        expected_checkpoint_digest=digest,
                     )
-                    if retained:
-                        # Identity is settled from the immutable caller request before
-                        # the current row is read as input or declaration-checked.
-                        admit_checkpoint_v1(
-                            prior,
-                            [delivery],
-                            self.resolver,
-                            expected_revision=revision,
-                            expected_checkpoint_digest=digest,
-                        )
+                    envelope = delivery["envelope"]
+                    event_id = envelope["event_id"]
+                    if replay_result is not None:
+                        # Retained identity is settled before any row-derived input.
                         receipt = next(
                             (
                                 item
