@@ -112,6 +112,15 @@ class PublicHostClient:
         validate_public_message(response, response=True)
         if response["operation_id"] != request["operation_id"]:
             raise PublicHostError("invalid_host_request")
+        if response["status"] == "committed":
+            operation = request["operation"]
+            required = operation in {"create", "admit", "effect_result", "cancel_effect"}
+            if operation == "process":
+                required = (
+                    response["value"]["result"]["core_result"]["disposition"] != "not_runnable"
+                )
+            if required and response["receipt"] is None:
+                raise PublicHostError("invalid_host_request")
         receipt = response["receipt"]
         if receipt is not None:
             if (
@@ -146,6 +155,18 @@ class PublicHostClient:
                 ["determa-public-host-profile-1", "1", profile["scope_binding_identity"], profile]
             ):
                 raise PublicHostError("invalid_host_request")
+        if request["operation"] == "receipt" and response["status"] == "committed":
+            saved = response["value"]["result"]["saved_response"]
+            if saved is not None:
+                if saved["operation_id"] != request["arguments"]["queried_operation_id"]:
+                    raise PublicHostError("invalid_host_request")
+                evidence = saved["receipt"]
+                if evidence is not None and (
+                    evidence["scope_binding_identity"] != request["scope_binding_identity"]
+                    or evidence["request_digest"] != request["arguments"]["request_digest"]
+                    or evidence["operation_id"] != saved["operation_id"]
+                ):
+                    raise PublicHostError("invalid_host_request")
         return copy.deepcopy(response)
 
     def discover(self, name: str) -> dict[str, Any]:

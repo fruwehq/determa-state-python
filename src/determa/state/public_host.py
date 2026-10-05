@@ -145,6 +145,24 @@ class SQLitePublicExecutionHost:
             return self._response(candidate, code="binding_unavailable")
         if operation not in _OPERATIONS:
             return self._response(candidate, code="host_capability_mismatch")
+        target = candidate["target"]
+        if operation == "capabilities":
+            applicable = all(value is None for value in target.values())
+        elif operation == "receipt":
+            applicable = target["runtime_id"] is None and target["runtime_incarnation"] is None
+        elif operation in {"create", "admit", "read"}:
+            applicable = (
+                target["root_instance_id"] is not None
+                and target["runtime_id"] is None
+                and target["runtime_incarnation"] is None
+            )
+        else:
+            applicable = all(value is not None for value in target.values())
+        if not applicable or (
+            operation in {"capabilities", "receipt", "create"}
+            and candidate["precondition"] is not None
+        ):
+            return self._response(candidate, code="invalid_host_request")
         digest = public_request_digest(candidate)
         try:
             with self._connect() as db:
@@ -176,14 +194,16 @@ class SQLitePublicExecutionHost:
                             ["determa-public-host-evidence-1", "1", response["value"]]
                         ),
                     }
-                    validate_public_message(response, response=True)
+                validate_public_message(response, response=True)
+                if operation in _MUTATIONS:
                     assert checkpoint is not None
-                    db.execute(
-                        "INSERT INTO determa_public_host_checkpoints VALUES (?,?) "
-                        "ON CONFLICT(root_instance_id) DO UPDATE "
-                        "SET checkpoint=excluded.checkpoint",
-                        (checkpoint["root_instance_id"], canonical_bytes(checkpoint)),
-                    )
+                    if changed:
+                        db.execute(
+                            "INSERT INTO determa_public_host_checkpoints VALUES (?,?) "
+                            "ON CONFLICT(root_instance_id) DO UPDATE "
+                            "SET checkpoint=excluded.checkpoint",
+                            (checkpoint["root_instance_id"], canonical_bytes(checkpoint)),
+                        )
                     db.execute(
                         "INSERT INTO determa_public_host_responses VALUES (?,?,?,?)",
                         (
@@ -193,8 +213,6 @@ class SQLitePublicExecutionHost:
                             canonical_bytes(response),
                         ),
                     )
-                else:
-                    validate_public_message(response, response=True)
             return response
         except ArtifactError as error:
             # Pure refusals roll back the transaction; native transaction failures
@@ -203,6 +221,14 @@ class SQLitePublicExecutionHost:
             validate_public_message(response, response=True)
             return response
 
+    @staticmethod
+    def _check_precondition(checkpoint: Mapping[str, Any], precondition: Mapping[str, Any]) -> None:
+        if (
+            checkpoint["revision"] != precondition["revision"]
+            or checkpoint["execution_checkpoint_digest"] != precondition["checkpoint_digest"]
+        ):
+            raise PublicHostError("checkpoint_revision_conflict")
+
     def _execute(self, db: sqlite3.Connection, request: dict[str, Any]) -> tuple[Any, Any, bool]:
         operation = request["operation"]
         arguments = request["arguments"]
@@ -210,12 +236,18 @@ class SQLitePublicExecutionHost:
             return self._capabilities(), None, False
         if operation == "receipt":
             row = db.execute(
-                "SELECT request_digest,response FROM determa_public_host_responses "
+                "SELECT request_digest,response,request FROM determa_public_host_responses "
                 "WHERE operation_id=?",
                 (arguments["queried_operation_id"],),
             ).fetchone()
             if row is not None and row[0] != arguments["request_digest"]:
                 raise PublicHostError("operation_id_conflict")
+            if row is not None and request["target"]["root_instance_id"] is not None:
+                if (
+                    json.loads(row[2])["target"]["root_instance_id"]
+                    != request["target"]["root_instance_id"]
+                ):
+                    raise PublicHostError("invalid_host_request")
             return (
                 {
                     "saved_response": None if row is None else json.loads(row[1]),
@@ -238,6 +270,8 @@ class SQLitePublicExecutionHost:
                 if row is None
                 else restore_execution_checkpoint_v1(row[0], self.resolver).document
             )
+            if request["precondition"] is not None and checkpoint is not None:
+                self._check_precondition(checkpoint, request["precondition"])
             return (
                 {
                     "checkpoint": checkpoint,
@@ -251,6 +285,20 @@ class SQLitePublicExecutionHost:
         if operation == "create":
             if arguments["root_instance_id"] != root_id:
                 raise PublicHostError("invalid_host_request")
+            if row is not None:
+                for saved_request, saved_response in db.execute(
+                    "SELECT request,response FROM determa_public_host_responses"
+                ):
+                    previous = json.loads(saved_request)
+                    if (
+                        previous["operation"] == "create"
+                        and previous["target"]["root_instance_id"] == root_id
+                    ):
+                        if previous["arguments"] != arguments:
+                            raise PublicHostError("creation_id_conflict")
+                        result = json.loads(saved_response)["value"]["result"]
+                        return result, json.loads(row[0]), True
+                raise PublicHostError("replay_evidence_expired")
             source = self.resolver.resolve_definition(arguments["validated_bundle_fingerprint"])
             if source is None or not self.resolver.definition_is_trusted(
                 arguments["validated_bundle_fingerprint"]
@@ -278,11 +326,6 @@ class SQLitePublicExecutionHost:
                 _include_projection_result=True,
             )
             checkpoint = result["checkpoint"]
-            if row is not None:
-                existing = restore_execution_checkpoint_v1(row[0], self.resolver).document
-                if existing["operation_receipts"][0] != checkpoint["operation_receipts"][0]:
-                    raise PublicHostError("creation_id_conflict")
-                checkpoint = existing
             core = result["core_result"]
             return (
                 {
@@ -302,6 +345,8 @@ class SQLitePublicExecutionHost:
         aggregate = checkpoint["root_record"].get("aggregate_state")
         if aggregate is None:
             raise PublicHostError("terminal_root")
+        if request["precondition"] is not None and operation == "inspect":
+            self._check_precondition(checkpoint, request["precondition"])
         if operation == "inspect":
             inspection = arguments["candidate"]
             if (
@@ -312,7 +357,7 @@ class SQLitePublicExecutionHost:
             outcome = inspect_candidate(
                 aggregate, inspection, self.resolver, semantic_enabled=False
             )
-            if outcome.get("result") == "failure":
+            if "code" in outcome:
                 raise PublicHostError(outcome["code"])
             return (
                 {
