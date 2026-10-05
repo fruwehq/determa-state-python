@@ -295,6 +295,45 @@ def test_terminal_outcome_cannot_supersede_a_newer_attempt_fence():
         validate_journal(read("pending-checkpoint.json"), seal_journal(journal))
 
 
+def test_positive_fence_unclaimed_requires_current_safe_retry_report(tmp_path):
+    journal = read("data/leased-journal.json")
+    journal["effect_records"][0]["invocation_state"] = "unclaimed"
+    _assert_invalid_native_seed(tmp_path, read("pending-checkpoint.json"), seal_journal(journal))
+
+
+def test_terminal_outcome_cannot_follow_an_earlier_terminal_attempt(tmp_path):
+    from determa.state.wire import hash_value
+
+    journal = read("data/outcome-recorded-journal.json")
+    record = journal["effect_records"][0]
+    outcome = record["outcome"]
+    report = copy.deepcopy(record["attempt_records"][0])
+    record["attempt_fence"] = outcome["attempt_fence"] = report["attempt_fence"] = "2"
+    report["report_digest"] = hash_value(
+        [
+            "determa-effect-attempt-report-1",
+            record["effect_id"],
+            record["operation_token"],
+            "2",
+            outcome["kind"],
+            outcome["payload"],
+            report["reason"],
+        ]
+    )
+    outcome["digest"] = hash_value(
+        [
+            "determa-effect-outcome-1",
+            record["effect_id"],
+            record["operation_token"],
+            outcome["kind"],
+            outcome["payload"],
+            "2",
+        ]
+    )
+    record["attempt_records"].append(report)
+    _assert_invalid_native_seed(tmp_path, read("pending-checkpoint.json"), seal_journal(journal))
+
+
 @pytest.mark.parametrize("field", ["digest", "attempt_fence"])
 def test_terminal_outcome_rejects_forged_evidence(field):
     journal = copy.deepcopy(read("data/outcome-recorded-journal.json"))
@@ -711,6 +750,11 @@ def test_effect_mutations_refuse_a_torn_authority_journal_pair(tmp_path, changed
     else:
         document = host.snapshot(root)
         document["journal"]["effect_records"][0]["attempt_fence"] = "1"
+        # Keep the journal internally valid so this exercises the separate
+        # native authority/journal fence mismatch, not missing retry evidence.
+        document["journal"]["effect_records"][0]["attempt_records"] = read(
+            "data/retryable-journal.json"
+        )["effect_records"][0]["attempt_records"]
         document["journal"] = seal_journal(document["journal"])
         with host._connect() as connection:
             connection.execute(

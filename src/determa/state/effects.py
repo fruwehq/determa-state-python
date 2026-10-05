@@ -342,6 +342,15 @@ def validate_journal(
             (item for item in reports if item["attempt_fence"] == record["attempt_fence"]),
             None,
         )
+        if state == "unclaimed" and record["attempt_fence"] != "0" and current_report is None:
+            # A consumed attempt cannot become new work without retaining the
+            # current safe-failure report. Missing evidence is not retry proof.
+            raise EffectError("invalid_effect_journal")
+        terminal_reports = [item for item in reports if item["report_kind"] in _OUTCOMES]
+        if len(terminal_reports) > 1:
+            # Terminal outcomes are immutable: no later attempt may supersede
+            # an earlier committed terminal report, even with valid hashes.
+            raise EffectError("invalid_effect_journal")
         if state in {"leased", "ambiguous"} and record["attempt_fence"] == "0":
             raise EffectError("invalid_effect_journal")
         if state in {"unclaimed", "leased", "ambiguous"} and any(
