@@ -22,17 +22,25 @@ from determa.state.authority import (
     configure_bundled_sqlite_authority,
 )
 from determa.state.extensions import bundled_extension_registry
-from determa.state.wire import hash_value
+from determa.state.effects import SQLiteCommittedEffectHost
+from determa.state.wire import MemoryArtifactResolver, hash_value
 
 _PATH = Path(tempfile.gettempdir()) / "determa-python-local-authority-profile.sqlite"
 _INITIAL_BINDING: str | None = None
+_WORKER_MODE = "--worker" in sys.argv[1:]
 
 
 def _profile() -> dict[str, Any]:
     authority = _seed(_baseline_ledger())
     registry = bundled_extension_registry(include_postgresql=False)
     configured, authority, store = configure_bundled_sqlite_authority(
-        registry, authority.path, "scope-42", "owner-1", "2"
+        registry,
+        authority.path,
+        "scope-42",
+        "owner-1",
+        "2",
+        worker_fencing=_WORKER_MODE,
+        worker_lease_nanoseconds=1,
     )
     report = authority.profile_report("scope-42", "owner-1", store, registry, configured)
     installed = authority.profile_descriptor(store, registry, configured)["installation_evidence"]
@@ -47,7 +55,20 @@ def _profile() -> dict[str, Any]:
                 "freeze_waits_for_writer",
                 "freeze_after_drain",
                 "incomplete_frozen_inventory_refuses_freeze",
-            ],
+            ]
+            + (
+                [
+                    "fence_worker_allocates_new_claim",
+                    "dispatch_at_expiry",
+                    "result_at_expiry",
+                    "clock_unavailable",
+                    "old_epoch",
+                    "old_attempt",
+                    "principal_mismatch",
+                ]
+                if _WORKER_MODE
+                else []
+            ),
         },
     }
 
@@ -55,7 +76,13 @@ def _profile() -> dict[str, Any]:
 def _binding_live() -> tuple[str, SQLiteLocalAuthority]:
     registry = bundled_extension_registry(include_postgresql=False)
     configured, authority, store = configure_bundled_sqlite_authority(
-        registry, _PATH, "scope-42", "owner-1", "2"
+        registry,
+        _PATH,
+        "scope-42",
+        "owner-1",
+        "2",
+        worker_fencing=_WORKER_MODE,
+        worker_lease_nanoseconds=1,
     )
     descriptor = authority.profile_descriptor(store, registry, configured)
     return hash_value(
@@ -67,6 +94,7 @@ def _binding_live() -> tuple[str, SQLiteLocalAuthority]:
             descriptor["source_binding_digest"],
             descriptor["destination_binding_digest"],
             descriptor["extension_report"],
+            descriptor["required_participants"],
         ]
     ), authority
 
@@ -111,9 +139,11 @@ def _seed(ledger: dict[str, Any]) -> SQLiteLocalAuthority:
     # removes an allocated scope marker from a live authority domain.
     for suffix in ("", "-wal", "-shm"):
         (_PATH.parent / (_PATH.name + suffix)).unlink(missing_ok=True)
-    authority = SQLiteLocalAuthority(_PATH)
+    authority = SQLiteLocalAuthority(_PATH, worker_fencing=_WORKER_MODE, worker_lease_nanoseconds=1)
     authority.setup_schema()
     AuthoritySQLiteExecutionStore(authority, "scope-42", "owner-1", "2").setup_schema()
+    if _WORKER_MODE:
+        SQLiteCommittedEffectHost(_PATH, MemoryArtifactResolver(), {}, lambda *_: {}).setup_schema()
     if not authority._insert_ledger(_baseline_ledger()):
         raise RuntimeError("fixture scope already allocated")
     _INITIAL_BINDING, authority = _binding_live()
@@ -174,7 +204,9 @@ def _native_trace(payload: dict[str, Any]) -> dict[str, Any]:
             held = context.Event()
 
             def disconnected_writer() -> None:
-                local = SQLiteLocalAuthority(_PATH)
+                local = SQLiteLocalAuthority(
+                    _PATH, worker_fencing=_WORKER_MODE, worker_lease_nanoseconds=1
+                )
 
                 def hold_transaction() -> None:
                     held.set()
@@ -357,7 +389,25 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
     if kind == "profile":
         return _common_rule(payload["configured_facts"], set())
     if kind == "worker_claim_check":
-        raise NotImplementedError("worker claim checks unavailable")
+        if not _WORKER_MODE:
+            raise NotImplementedError("worker claim checks unavailable")
+        item = payload["input"]
+        authority = _seed(item["ledger_before"])
+        dispatched: list[str] = []
+        accepted = authority.check_worker_claim(
+            item["claim"],
+            item["authenticated_principal"],
+            item["trusted_clock_now"],
+            phase=item["phase"],
+            on_dispatch=lambda: dispatched.append("called"),
+        )
+        return {
+            "binding": _binding(),
+            "accepted": accepted,
+            "ledger_after": authority.inspect("scope-42"),
+            "host_mutation_count": 0,
+            "external_dispatch_count": len(dispatched),
+        }
     raise ValueError(f"unknown driver kind: {kind}")
 
 

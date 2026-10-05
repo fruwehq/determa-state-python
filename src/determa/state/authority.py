@@ -97,6 +97,7 @@ def _result(
     code: str | None,
     *,
     early: bool = False,
+    claim: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     response = {
         "interface": _INTERFACE,
@@ -114,7 +115,7 @@ def _result(
         "state": None if early or ledger is None else ledger["state"],
         "evidence_digest": None,
         "error_code": code,
-        "claim": None,
+        "claim": None if claim is None else copy.deepcopy(dict(claim)),
     }
     if not code and request is not None:
         response["evidence_digest"] = hash_value(
@@ -223,11 +224,26 @@ def _inventory(ledger: Mapping[str, Any]) -> list[dict[str, str]]:
 class SQLiteLocalAuthority:
     """Single-database guarded authority; no worker or relocation guarantee."""
 
-    def __init__(self, path: str | Path, *, timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        path: str | Path,
+        *,
+        timeout: float = 30.0,
+        worker_fencing: bool = False,
+        worker_lease_nanoseconds: int = 1_000_000_000,
+    ) -> None:
         if not str(path) or str(path) == ":memory:" or timeout <= 0:
             raise ValueError("a persistent SQLite file and positive timeout are required")
         self.path = str(Path(path).resolve())
         self.timeout = timeout
+        if (
+            type(worker_fencing) is not bool
+            or type(worker_lease_nanoseconds) is not int
+            or worker_lease_nanoseconds <= 0
+        ):
+            raise ValueError("invalid worker authority configuration")
+        self.worker_fencing = worker_fencing
+        self.worker_lease_nanoseconds = worker_lease_nanoseconds
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, timeout=self.timeout, isolation_level=None)
@@ -299,17 +315,50 @@ class SQLiteLocalAuthority:
             "consistent_scope_inventory",
         }:
             raise ValueError("host_capability_mismatch")
-        closure = _authority_closure()
-        configuration = _compact(
-            {
-                "sqlite_path": self.path,
-                "journal_mode": "WAL",
-                "synchronous": "FULL",
-                "topology": "single-sqlite-database",
-                "replay_retention": execution_store.replay_retention,
-                "outbox_retention": execution_store.outbox_retention,
-            }
-        ).encode()
+        authority_closure = _authority_closure()
+        configuration_values = {
+            "sqlite_path": self.path,
+            "journal_mode": "WAL",
+            "synchronous": "FULL",
+            "topology": "single-sqlite-database",
+            "replay_retention": execution_store.replay_retention,
+            "outbox_retention": execution_store.outbox_retention,
+        }
+        if self.worker_fencing:
+            configuration_values["worker_fencing"] = True
+            configuration_values["worker_lease_nanoseconds"] = self.worker_lease_nanoseconds
+        configuration = _compact(configuration_values).encode()
+        participants = []
+        participant_installations = []
+        if self.worker_fencing:
+            with self._connect() as connection:
+                columns = connection.execute(
+                    "PRAGMA table_info(determa_committed_effects)"
+                ).fetchall()
+            if [row[1] for row in columns] != ["root_instance_id", "document"]:
+                raise ValueError("worker journal is not installed")
+            for role, name, source in (
+                ("journal", "journal-1", Path(__file__).with_name("effects.py")),
+                ("worker", "worker-1", Path(__file__)),
+            ):
+                closure = source.read_bytes()
+                participant = {
+                    "role": role,
+                    "provider_reference": {
+                        "identifier": f"reference.local-{role}",
+                        "version": __version__,
+                        "content_digest": "sha256:" + hashlib.sha256(closure).hexdigest(),
+                    },
+                    "instance_id": name,
+                }
+                participants.append(participant)
+                participant_installations.append(
+                    {
+                        "participant": copy.deepcopy(participant),
+                        "closure_bytes_base64": base64.b64encode(closure).decode(),
+                        "observed_health": "healthy",
+                    }
+                )
         return {
             "extension_report": extension_report,
             "authority_storage_boundary": "local-sqlite-authority-db",
@@ -321,18 +370,18 @@ class SQLiteLocalAuthority:
             },
             "source_binding_digest": hash_value(["determa-local-authority-source-1", self.path]),
             "destination_binding_digest": None,
-            "required_participants": [],
+            "required_participants": participants,
             "guarantees": {
                 "guarded_local_writes": True,
-                "worker_fencing": False,
+                "worker_fencing": self.worker_fencing,
                 "complete_scope_inventory": True,
                 "safe_relocation": False,
             },
             "installation_evidence": {
-                "closure_bytes_base64": base64.b64encode(closure).decode(),
+                "closure_bytes_base64": base64.b64encode(authority_closure).decode(),
                 "configuration_bytes_base64": base64.b64encode(configuration).decode(),
                 "observed_health": "healthy",
-                "participant_installations": [],
+                "participant_installations": participant_installations,
             },
         }
 
@@ -440,6 +489,67 @@ class SQLiteLocalAuthority:
             ).fetchone()
             return None if row is None else _parse(row[0])
 
+    def check_worker_claim(
+        self,
+        claim: Mapping[str, Any],
+        authenticated_principal: str,
+        trusted_clock_now: str | None,
+        *,
+        phase: str,
+        on_dispatch: Callable[[], None] | None = None,
+    ) -> bool:
+        """Check the stored claim under the scope guard before dispatch or result work."""
+        if not self.worker_fencing or phase not in {"dispatch", "result"}:
+            return False
+        if (
+            type(trusted_clock_now) is not str
+            or re.fullmatch(r"(?:0|-?[1-9][0-9]*)", trusted_clock_now) is None
+        ):
+            return False
+        now = int(trusted_clock_now)
+        if not -(2**63) <= now < 2**63:
+            return False
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT ledger FROM determa_scope_authority WHERE scope_identity = ?",
+                (claim.get("scope_identity"),),
+            ).fetchone()
+            if row is None:
+                return False
+            ledger = _parse(row[0])
+            stored = next(
+                (
+                    item
+                    for item in ledger["active_claims"]
+                    if item["work_identity"] == claim.get("work_identity")
+                ),
+                None,
+            )
+            journal = next(
+                (
+                    item
+                    for item in ledger["journal_entries"]
+                    if item["work_identity"] == claim.get("work_identity")
+                ),
+                None,
+            )
+            if (
+                stored is None
+                or journal is None
+                or stored != dict(claim)
+                or ledger["state"] != "active"
+                or stored["scope_authority_epoch"] != ledger["authority_epoch"]
+                or stored["attempt_fence"] != journal["attempt_fence"]
+                or stored["worker_principal"] != authenticated_principal
+                or stored["state"] != "active"
+                or now >= int(stored["expires_at"])
+            ):
+                return False
+            if phase == "dispatch" and on_dispatch is not None:
+                on_dispatch()
+            return True
+
     def perform(
         self,
         request_bytes: str,
@@ -531,7 +641,7 @@ class SQLiteLocalAuthority:
                         "scope_fence_unproven" if invalid_proof else "host_capability_mismatch",
                     )
                 )
-            if operation == "fence_worker":
+            if operation == "fence_worker" and not self.worker_fencing:
                 return _compact(_result(request, ledger, "host_capability_mismatch"))
             if isinstance(fault, dict) and fault.get("epoch_check_separate_from_commit"):
                 return _compact(_result(request, ledger, "host_capability_mismatch"))
@@ -553,11 +663,62 @@ class SQLiteLocalAuthority:
                 return _compact(_result(request, ledger, "stale_scope_authority"))
             if request["expected_scope_generation"] != ledger["scope_generation"]:
                 return _compact(_result(request, ledger, "scope_generation_conflict"))
-            if (
-                ledger["state"] != "active"
-                or invocation["authenticated_principal"] != ledger["owner_principal"]
+            if ledger["state"] != "active" or (
+                operation != "fence_worker"
+                and invocation["authenticated_principal"] != ledger["owner_principal"]
             ):
                 return _compact(_result(request, ledger, "stale_scope_authority"))
+            new_claim = None
+            if operation == "fence_worker":
+                arguments = request["arguments"]
+                principal = invocation["authenticated_principal"]
+                if arguments["expected_worker_principal"] != principal:
+                    return _compact(_result(request, ledger, "worker_principal_mismatch"))
+                now = invocation.get("trusted_clock_now")
+                if (
+                    invocation.get("clock_available") is not True
+                    or type(now) is not str
+                    or re.fullmatch(r"(?:0|-?[1-9][0-9]*)", now) is None
+                    or not -(2**63) <= int(now) < 2**63
+                    or int(now) + self.worker_lease_nanoseconds >= 2**63
+                ):
+                    return _compact(_result(request, ledger, "host_capability_mismatch"))
+                entry = next(
+                    (
+                        item
+                        for item in ledger["journal_entries"]
+                        if item["work_identity"] == arguments["work_identity"]
+                    ),
+                    None,
+                )
+                if (
+                    entry is None
+                    or arguments["root_instance_id"] not in ledger["roots"]
+                    or entry["attempt_fence"] != arguments["expected_attempt_fence"]
+                ):
+                    return _compact(_result(request, ledger, "stale_attempt_fence"))
+                if invocation.get("assigned_worker_principal") != principal:
+                    return _compact(_result(request, ledger, "worker_principal_mismatch"))
+                fence = str(int(entry["attempt_fence"]) + 1)
+                new_claim = {
+                    "scope_identity": scope,
+                    "root_instance_id": arguments["root_instance_id"],
+                    "work_kind": "effect",
+                    "work_identity": arguments["work_identity"],
+                    "operation_token": arguments["operation_token"],
+                    "scope_authority_epoch": ledger["authority_epoch"],
+                    "attempt_fence": fence,
+                    "worker_principal": principal,
+                    "expires_at": str(int(now) + self.worker_lease_nanoseconds),
+                    "state": "active",
+                }
+                entry["attempt_fence"] = fence
+                ledger["active_claims"] = [
+                    item
+                    for item in ledger["active_claims"]
+                    if item["work_identity"] != arguments["work_identity"]
+                ]
+                ledger["active_claims"].append(new_claim)
             if operation == "guarded_commit":
                 if (
                     native_mutation_bytes is None
@@ -571,7 +732,7 @@ class SQLiteLocalAuthority:
                 if fault == "omit_receipt_from_inventory":
                     return _compact(_result(request, ledger, "scope_fence_unproven"))
                 if (
-                    ledger["required_participant_records"]
+                    (ledger["required_participant_records"] and not self.worker_fencing)
                     or ledger["journal_entries"]
                     or ledger["active_claims"]
                 ):
@@ -580,7 +741,7 @@ class SQLiteLocalAuthority:
             if operation == "freeze_scope":
                 ledger["state"] = "frozen"
                 ledger["active_claims"] = []
-            response = _result(request, ledger, None)
+            response = _result(request, ledger, None, claim=new_claim)
             ledger["receipts"].append(
                 {
                     "operation_id": request["operation_id"],
@@ -793,7 +954,7 @@ def bundled_authority_descriptor() -> dict[str, Any]:
 
 class _BundledAuthorityProvider:
     def validate_configuration(self, configuration: Mapping[str, Any]) -> dict[str, Any]:
-        if set(configuration) != {
+        required = {
             "instance_id",
             "path",
             "scope_identity",
@@ -801,13 +962,30 @@ class _BundledAuthorityProvider:
             "authority_epoch",
             "replay_retention",
             "outbox_retention",
-        } or any(
-            type(configuration[key]) is not str or not configuration[key] for key in configuration
+        }
+        worker_keys = {"worker_fencing", "worker_lease_nanoseconds"}
+        if (
+            set(configuration) not in (required, required | worker_keys)
+            or any(
+                type(configuration[key]) is not str or not configuration[key] for key in required
+            )
+            or (
+                worker_keys <= set(configuration)
+                and (
+                    configuration["worker_fencing"] is not True
+                    or type(configuration["worker_lease_nanoseconds"]) is not int
+                    or configuration["worker_lease_nanoseconds"] <= 0
+                )
+            )
         ):
             raise ValueError("invalid_extension_configuration")
         if configuration["instance_id"] != "local-authority":
             raise ValueError("invalid_extension_configuration")
-        authority = SQLiteLocalAuthority(configuration["path"])
+        authority = SQLiteLocalAuthority(
+            configuration["path"],
+            worker_fencing=configuration.get("worker_fencing", False),
+            worker_lease_nanoseconds=configuration.get("worker_lease_nanoseconds", 1_000_000_000),
+        )
         if authority.path != configuration["path"]:
             raise ValueError("invalid_extension_configuration")
         store = AuthoritySQLiteExecutionStore(
@@ -841,6 +1019,13 @@ class _BundledAuthorityProvider:
                 or ledger["state"] not in ("active", "frozen")
             ):
                 return "unavailable"
+            if authority.worker_fencing:
+                with authority._connect() as connection:
+                    columns = connection.execute(
+                        "PRAGMA table_info(determa_committed_effects)"
+                    ).fetchall()
+                if [row[1] for row in columns] != ["root_instance_id", "document"]:
+                    return "unavailable"
         except (ValueError, sqlite3.Error, KeyError):
             return "unavailable"
         return "healthy"
@@ -859,9 +1044,11 @@ def configure_bundled_sqlite_authority(
     *,
     replay_retention: str = "bounded",
     outbox_retention: str = "none",
+    worker_fencing: bool = False,
+    worker_lease_nanoseconds: int = 1_000_000_000,
 ) -> tuple[ConfiguredExtension, SQLiteLocalAuthority, AuthoritySQLiteExecutionStore]:
     """Configure and return the exact authority/store instance used for host operations."""
-    configuration = {
+    configuration: dict[str, Any] = {
         "instance_id": "local-authority",
         "path": str(Path(path).resolve()),
         "scope_identity": scope_identity,
@@ -870,6 +1057,9 @@ def configure_bundled_sqlite_authority(
         "replay_retention": replay_retention,
         "outbox_retention": outbox_retention,
     }
+    if worker_fencing:
+        configuration["worker_fencing"] = True
+        configuration["worker_lease_nanoseconds"] = worker_lease_nanoseconds
     configured = registry.validate_configuration(bundled_authority_descriptor(), configuration)
     _, _, instance, _ = registry._bound(configured)
     return configured, instance["authority"], instance["store"]

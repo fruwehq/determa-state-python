@@ -75,6 +75,12 @@ packages = ["src/determa"]
 "src/determa/state/data/inspection-v1.schema.json" = "determa/state/data/inspection-v1.schema.json"
 "src/determa/state/data/host-authority-operation-v1.schema.json" = "determa/state/data/host-authority-operation-v1.schema.json"
 "src/determa/state/data/host-authority-profile-report-v1.schema.json" = "determa/state/data/host-authority-profile-report-v1.schema.json"
+"src/determa/state/data/host-effect-journal-v1.schema.json" = "determa/state/data/host-effect-journal-v1.schema.json"
+"src/determa/state/data/host-effect-claim-v1.schema.json" = "determa/state/data/host-effect-claim-v1.schema.json"
+"src/determa/state/data/effect-result-request-v1.schema.json" = "determa/state/data/effect-result-request-v1.schema.json"
+"src/determa/state/data/effect-result-response-v1.schema.json" = "determa/state/data/effect-result-response-v1.schema.json"
+"src/determa/state/data/effect-cancellation-request-v1.schema.json" = "determa/state/data/effect-cancellation-request-v1.schema.json"
+"src/determa/state/data/effect-cancellation-response-v1.schema.json" = "determa/state/data/effect-cancellation-response-v1.schema.json"
 
 [tool.ruff]
 line-length = 100
