@@ -337,7 +337,9 @@ It prints the normalized bundle fingerprint on success.
 ## Optional local scope authority
 
 `SQLiteLocalAuthority` is an opt-in reference authority for one persistent SQLite
-database. It allocates a permanent scope marker, serializes guarded commits and
+database dedicated permanently to one scope. A second scope requires a separate
+database; allocation refuses a second scope even after restart or retirement.
+It allocates a permanent scope marker, serializes guarded commits and
 freezes under the same SQLite write transaction, retains exact operation receipts,
 and records a frozen inventory of its trusted local scope data. Call
 `setup_schema()` explicitly before allocating a scope. The host supplies the

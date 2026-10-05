@@ -132,6 +132,38 @@ def test_allocation_marker_survives_checkpoint_removal(tmp_path) -> None:
     assert not SQLiteLocalAuthority(authority.path).allocate("scope-1", "owner-1")
 
 
+def test_database_cannot_allocate_another_scope_with_its_own_checkpoint_guard(tmp_path) -> None:
+    authority = SQLiteLocalAuthority(tmp_path / "scope-isolation.sqlite")
+    authority.setup_schema()
+    assert authority.allocate("scope-1", "owner-1", roots=("same-root",))
+    assert not authority.allocate("scope-2", "owner-2", roots=("same-root",))
+    assert not authority.allocate("scope-3", "owner-3", roots=("different-root",))
+    other = AuthoritySQLiteExecutionStore(authority, "scope-2", "owner-2", "0")
+    other.setup_schema()
+    with pytest.raises(ExecutionStoreError, match="unauthorized_scope"):
+        with other.transaction("same-root"):
+            pytest.fail("a second scope obtained access to the checkpoint transaction")
+    restarted = SQLiteLocalAuthority(authority.path)
+    assert not restarted.allocate("scope-2", "owner-2", roots=("same-root",))
+
+
+def test_concurrent_scope_allocation_has_one_permanent_winner(tmp_path) -> None:
+    authority = SQLiteLocalAuthority(tmp_path / "allocation-race.sqlite")
+    authority.setup_schema()
+    barrier = threading.Barrier(2)
+
+    def allocate(number: int) -> bool:
+        barrier.wait()
+        return SQLiteLocalAuthority(authority.path).allocate(
+            f"scope-{number}", f"owner-{number}", roots=("same-root",)
+        )
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(allocate, (1, 2)))
+    assert sorted(outcomes) == [False, True]
+    assert not SQLiteLocalAuthority(authority.path).allocate("scope-3", "owner-3")
+
+
 def test_public_checkpoint_host_commits_under_same_scope_guard(tmp_path) -> None:
     machine = """
 format: 1

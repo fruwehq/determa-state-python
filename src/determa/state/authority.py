@@ -268,6 +268,11 @@ class SQLiteLocalAuthority:
             ).fetchall()
             if {(kind, name): source for kind, name, source in rows} != expected:
                 raise ValueError("authority schema mismatch")
+            if (
+                connection.execute("SELECT COUNT(*) FROM determa_scope_allocations").fetchone()[0]
+                > 1
+            ):
+                raise ValueError("authority topology requires one permanent scope per database")
 
     def profile_descriptor(
         self,
@@ -421,6 +426,12 @@ class SQLiteLocalAuthority:
         scope = ledger["scope_identity"]
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
+            # Checkpoint keys are root-bound, not scope-qualified. This local
+            # topology therefore dedicates the database permanently to one scope.
+            # The immutable allocation marker also prevents reuse after retirement.
+            if connection.execute("SELECT 1 FROM determa_scope_allocations LIMIT 1").fetchone():
+                connection.rollback()
+                return False
             try:
                 connection.execute("INSERT INTO determa_scope_allocations VALUES (?)", (scope,))
                 connection.execute(
