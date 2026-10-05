@@ -1082,7 +1082,15 @@ def test_historical_result_evidence_survives_processing(tmp_path):
 
 @pytest.mark.parametrize(
     "damage",
-    [None, "boolean", "fabricated", "wrong_work", "wrong_destination", "no_native_receipt"],
+    [
+        None,
+        "boolean",
+        "fabricated",
+        "wrong_work",
+        "wrong_destination",
+        "no_native_receipt",
+        "unavailable",
+    ],
 )
 def test_ambiguous_retry_requires_verified_native_destination_evidence(tmp_path, damage):
     import base64
@@ -1114,6 +1122,8 @@ def test_ambiguous_retry_requires_verified_native_destination_evidence(tmp_path,
             )
 
     def verify_receipts(evidence):
+        if damage == "unavailable":
+            raise RuntimeError("destination proof unavailable")
         with sqlite3.connect(native_path) as connection:
             row = connection.execute(
                 "SELECT receipt, calls FROM receipts WHERE scope = ? AND effect = ?",
@@ -1200,3 +1210,211 @@ def test_ambiguous_retry_does_not_accept_legacy_boolean_keyword(tmp_path):
             trusted_now="0",
             deduplication_proven=True,
         )
+
+
+def test_historical_admission_survives_actual_root_completion_and_tombstone(tmp_path):
+    import yaml
+
+    from determa.state import ExecutionHost, MemoryExecutionStore, create_checkpoint_v1
+    from determa.state.checkpoint_v1 import admit_checkpoint_v1, step_checkpoint_v1
+    from determa.state.host import outbox_intent_digest
+    from determa.state.queueing import _entry_digest
+    from determa.state.wire import canonical_bytes
+
+    machine = yaml.safe_load((CASE / "machine.yaml").read_text())
+    events = machine["machines"][0]["root"]["on_events"]
+    events["native_succeeded"] = {"transition_to": "done"}
+    machine["machines"][0]["root"] = {
+        "type": "composite",
+        "initial": {"transition_to": "working"},
+        "states": {"working": {"on_events": events}, "done": {"type": "final"}},
+    }
+    bundle = load_bundle(machine)
+    resolver = MemoryArtifactResolver(definitions={bundle.fingerprint: bundle})
+    root = "historical-root"
+    checkpoint = create_checkpoint_v1(bundle, "workflow", root, "creation")
+    runtime = checkpoint["root_record"]["aggregate_state"]["runtimes"][0]
+    envelope = {
+        "event": "invoke",
+        "event_id": "invoke",
+        "cause_id": "invoke",
+        "source": {"host": True},
+        "target": runtime["target_identity"],
+        "payload": ["map", [["operation_token", ["string", "business-order-42"]]]],
+    }
+    checkpoint = admit_checkpoint_v1(
+        checkpoint,
+        [
+            {
+                "delivery_mode": "input",
+                "envelope": envelope,
+                "envelope_digest": _entry_digest(root, "input", envelope),
+            }
+        ],
+        resolver,
+        expected_revision=checkpoint["revision"],
+        expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+    )
+    checkpoint = step_checkpoint_v1(
+        checkpoint,
+        runtime["runtime_id"],
+        resolver,
+        expected_revision=checkpoint["revision"],
+        expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+    )
+    journal = read("data/unclaimed-journal.json")
+    journal.update(
+        root_instance_id=root,
+        checkpoint_revision=checkpoint["revision"],
+        checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+        operation_response_references=[],
+    )
+    record = journal["effect_records"][0]
+    intent = checkpoint["pending_outbox_intents"][0]["intent"]
+    record.update(
+        effect_id=intent["effect_id"],
+        intent_digest=outbox_intent_digest(root, intent),
+        target={
+            "root_instance_id": root,
+            "runtime_id": runtime["runtime_id"],
+            "runtime_incarnation": runtime["identity_origin"],
+        },
+    )
+    host = SQLiteCommittedEffectHost(
+        tmp_path / "terminal.sqlite", resolver, {}, None, trusted_clock=lambda: "0"
+    )
+    host.setup_schema()
+    host.seed(checkpoint, seal_journal(journal))
+    host.claim(root, record["effect_id"], "worker", "0", expires_at="10", trusted_now="0")
+    request = read("data/result-request.json")
+    request["effect_id"] = record["effect_id"]
+    host.submit_result(
+        root,
+        request,
+        principal="worker",
+        scope=journal["scope_identity"],
+        epoch="0",
+        trusted_now="0",
+    )
+    host.terminalize_outbox(root, record["effect_id"], {"status": "confirmed"})
+    saved = host.snapshot(root)
+    checkpoint = saved["checkpoint"]
+    checkpoint = step_checkpoint_v1(
+        checkpoint,
+        runtime["runtime_id"],
+        resolver,
+        expected_revision=checkpoint["revision"],
+        expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+    )
+    assert checkpoint["root_record"]["aggregate_state"]["runtimes"][0]["status"] == "completed"
+    portable_host = ExecutionHost(
+        MemoryExecutionStore({root: canonical_bytes(checkpoint)}), resolver
+    )
+    portable_host.tombstone_root_v1(
+        root,
+        "tombstone",
+        expected_revision=checkpoint["revision"],
+        expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+    )
+    checkpoint = portable_host.read_checkpoint(root).document
+    journal = saved["journal"]
+    journal["checkpoint_revision"] = checkpoint["revision"]
+    journal["checkpoint_digest"] = checkpoint["execution_checkpoint_digest"]
+    journal = seal_journal(journal)
+    restored = SQLiteCommittedEffectHost(tmp_path / "tombstoned.sqlite", resolver, {}, None)
+    restored.setup_schema()
+    restored.seed(checkpoint, journal)
+    assert restored.recover(root)["journal"] == journal
+
+
+@pytest.mark.parametrize(
+    "case, machine_id, kind",
+    [
+        ("54-stale-component-target", "owner", "component"),
+        ("30-owned-spawn-cancel", "order", "owned_spawned_instance"),
+    ],
+)
+def test_historical_child_target_uses_original_definition_after_removal(case, machine_id, kind):
+    from determa.state import create_checkpoint_v1
+    from determa.state.checkpoint_v1 import admit_checkpoint_v1, step_checkpoint_v1
+    from determa.state.effects import _pinned_result_target
+    from determa.state.queueing import _entry_digest
+
+    bundle = load_bundle(
+        (conformance_root() / "conformance/core" / case / "machine.yaml").read_text()
+    )
+    resolver = MemoryArtifactResolver(definitions={bundle.fingerprint: bundle})
+    checkpoint = create_checkpoint_v1(bundle, machine_id, "root", "creation")
+    runtime = checkpoint["root_record"]["aggregate_state"]["runtimes"][0]
+    envelope = {
+        "event": "start",
+        "event_id": "start",
+        "cause_id": "start",
+        "source": {"host": True},
+        "target": runtime["target_identity"],
+        "payload": ["map", []],
+    }
+    checkpoint = admit_checkpoint_v1(
+        checkpoint,
+        [
+            {
+                "delivery_mode": "input",
+                "envelope": envelope,
+                "envelope_digest": _entry_digest("root", "input", envelope),
+            }
+        ],
+        resolver,
+        expected_revision=checkpoint["revision"],
+        expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+    )
+    checkpoint = step_checkpoint_v1(
+        checkpoint,
+        runtime["runtime_id"],
+        resolver,
+        expected_revision=checkpoint["revision"],
+        expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+    )
+    child = next(
+        item
+        for item in checkpoint["root_record"]["aggregate_state"]["runtimes"]
+        if item["identity_origin"]["kind"] == kind
+    )
+    record = {
+        "target": {
+            "root_instance_id": "root",
+            "runtime_id": child["runtime_id"],
+            "runtime_incarnation": copy.deepcopy(child["identity_origin"]),
+        }
+    }
+    event = "leave" if kind == "component" else "cancel_payment"
+    envelope.update(event=event, event_id=event, cause_id=event)
+    checkpoint = admit_checkpoint_v1(
+        checkpoint,
+        [
+            {
+                "delivery_mode": "input",
+                "envelope": envelope,
+                "envelope_digest": _entry_digest("root", "input", envelope),
+            }
+        ],
+        resolver,
+        expected_revision=checkpoint["revision"],
+        expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+    )
+    checkpoint = step_checkpoint_v1(
+        checkpoint,
+        runtime["runtime_id"],
+        resolver,
+        expected_revision=checkpoint["revision"],
+        expected_checkpoint_digest=checkpoint["execution_checkpoint_digest"],
+    )
+    assert all(
+        item["runtime_id"] != child["runtime_id"]
+        for item in checkpoint["root_record"]["aggregate_state"]["runtimes"]
+    )
+    assert _pinned_result_target(checkpoint, record, resolver) == child["target_identity"]
+    origin = record["target"]["runtime_incarnation"]
+    counter = "activation_sequence" if kind == "component" else "spawn_sequence"
+    origin[counter] = str(int(origin[counter]) + 1)
+    with pytest.raises(EffectError, match="invalid_effect_journal"):
+        _pinned_result_target(checkpoint, record, resolver)

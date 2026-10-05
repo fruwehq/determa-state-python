@@ -416,9 +416,17 @@ independently authenticated principal, current scope/epoch/attempt claim and an
 explicit `trusted_clock` callback. Clock failures or expiry fail closed, including
 expiry during outcome recording before its native commit. An expired external
 attempt remains unresolved and requires destination idempotency or reconciliation;
-lease expiry does not prove the call was undone.
+lease expiry does not prove the call was undone. An ambiguous retry requires
+`deduplication_evidence` bound to the scope, effect and destination. The installed
+provider's `verify_deduplication_evidence(instance, evidence)` must authenticate
+both receipt byte strings against its actual native destination; equal bytes from
+a caller are insufficient. The host retains the verified evidence with the new
+attempt fence in the same transaction as the claim.
 
-Authenticated outcome recording commits before result-event admission. A crash
+The public `submit_result` returns `committed` only after result-event admission.
+Recovery verifies the exact checkpoint acceptance receipt against the pinned
+payload, token mapping and original target identity, even after processing or
+root tombstoning. Authenticated outcome recording commits before result-event admission. A crash
 between those transactions retains the outcome, and `recover` admits it without
 calling the provider again. Each recoverable effect commits separately. Duplicate
 results retain exact first responses; conflicting or stale work is refused.

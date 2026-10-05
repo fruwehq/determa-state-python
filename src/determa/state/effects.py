@@ -715,7 +715,7 @@ class VerifiedNativeHandler:
             if method(instance, copy.deepcopy(dict(evidence))) is not True:
                 raise EffectError("host_capability_mismatch")
             VerifiedNativeHandler.verify(self, reference, destination)
-        except (ExtensionError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        except Exception as exc:
             raise EffectError("host_capability_mismatch") from exc
 
     def invoke(
