@@ -80,6 +80,12 @@ packages = ["src/determa"]
 "src/determa/state/data/runtime-provider-descriptor-v1.schema.json" = "determa/state/data/runtime-provider-descriptor-v1.schema.json"
 "src/determa/state/data/language-source-v1.schema.json" = "determa/state/data/language-source-v1.schema.json"
 "src/determa/state/data/compilation-manifest-v1.schema.json" = "determa/state/data/compilation-manifest-v1.schema.json"
+"src/determa/state/data/host-effect-journal-v1.schema.json" = "determa/state/data/host-effect-journal-v1.schema.json"
+"src/determa/state/data/host-effect-claim-v1.schema.json" = "determa/state/data/host-effect-claim-v1.schema.json"
+"src/determa/state/data/effect-result-request-v1.schema.json" = "determa/state/data/effect-result-request-v1.schema.json"
+"src/determa/state/data/effect-result-response-v1.schema.json" = "determa/state/data/effect-result-response-v1.schema.json"
+"src/determa/state/data/effect-cancellation-request-v1.schema.json" = "determa/state/data/effect-cancellation-request-v1.schema.json"
+"src/determa/state/data/effect-cancellation-response-v1.schema.json" = "determa/state/data/effect-cancellation-response-v1.schema.json"
 
 [tool.ruff]
 line-length = 100

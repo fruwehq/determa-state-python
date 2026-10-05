@@ -110,7 +110,8 @@ def _validate_manifest_artifact(path: Path, artifact: dict) -> None:
     registry = _schema_registry()
     for reference_path in sorted(schema_path.parent.glob("*.schema.json")):
         reference = json.loads(reference_path.read_text(encoding="utf-8"))
-        registry = registry.with_resource(reference["$id"], Resource.from_contents(reference))
+        if "$id" in reference:
+            registry = registry.with_resource(reference["$id"], Resource.from_contents(reference))
     spec_root = _spec_root()
     if spec_root is not None:
         for reference_path in sorted((spec_root / "schema").glob("*.schema.json")):
@@ -147,7 +148,7 @@ def test_suite_present() -> None:
     assert len(core_cases()) == 99
     assert len(version1_vectors()) == 162
     assert len(durable_host_vectors()) == 142
-    assert len(_manifest_artifacts()) == 476
+    assert len(_manifest_artifacts()) == 484
 
 
 @pytest.mark.parametrize("stored", [b"mutated", None])
