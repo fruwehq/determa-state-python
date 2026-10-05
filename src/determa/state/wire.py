@@ -11,7 +11,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from functools import cache, lru_cache
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import rfc8785
 
@@ -24,10 +24,20 @@ from .codes import (
 from .codes import (
     PersistenceFailureCode as PersistenceCode,
 )
-from .definition import Bundle, BundleSource, _escape_pointer, load_bundle
+from .definition import (
+    Bundle,
+    BundleSource,
+    _escape_pointer,
+    _has_runtime_provider,
+    bundle_fingerprint,
+    load_bundle,
+)
 from .errors import ArtifactError, ValidationError
 from .model import BundleModel, MachineModel, StateNode
 from .yaml12 import validate_portable_values, validate_unicode
+
+if TYPE_CHECKING:
+    from .runtime_providers import RuntimeProviderRegistry
 
 ArtifactSource = bytes | str | Mapping[str, Any]
 SHA256_PREFIX = "sha256:"
@@ -357,6 +367,17 @@ def _schema_registry() -> Any:
     ):
         document = artifact_schema(kind)
         registry = registry.with_resource(document["$id"], Resource.from_contents(document))
+    machine = json.loads((_DATA / "machine.schema.json").read_text(encoding="utf-8"))
+    registry = registry.with_resource(machine["$id"], Resource.from_contents(machine))
+    for name in (
+        "provider-reference-v1.schema.json",
+        "runtime-action-output-v1.schema.json",
+        "runtime-provider-descriptor-v1.schema.json",
+        "language-source-v1.schema.json",
+        "compilation-manifest-v1.schema.json",
+    ):
+        document = json.loads((_DATA / name).read_text(encoding="utf-8"))
+        registry = registry.with_resource(document["$id"], Resource.from_contents(document))
     return registry
 
 
@@ -472,7 +493,12 @@ def normalized_definition_attachment(bundle: Bundle) -> dict[str, Any]:
     }
 
 
-def bundle_from_attachment(attachment: Mapping[str, Any]) -> Bundle:
+def bundle_from_attachment(
+    attachment: Mapping[str, Any],
+    *,
+    runtime_providers: RuntimeProviderRegistry | None = None,
+    required_capabilities: frozenset[str] = frozenset(),
+) -> Bundle:
     try:
         raw = decoded_typed_value(attachment["normalized_bundle"])
         fingerprint = attachment["validated_bundle_fingerprint"]
@@ -480,7 +506,11 @@ def bundle_from_attachment(attachment: Mapping[str, Any]) -> Bundle:
         raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE_PACKAGE) from exc
     if not isinstance(raw, dict) or not isinstance(fingerprint, str):
         raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE_PACKAGE)
-    bundle = load_bundle(raw)
+    bundle = load_bundle(
+        raw,
+        runtime_providers=runtime_providers,
+        required_capabilities=required_capabilities,
+    )
     if bundle.fingerprint != fingerprint:
         raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE_PACKAGE)
     return bundle
@@ -506,6 +536,14 @@ def _bundle_from_resolver(
         bundle = definition if isinstance(definition, Bundle) else load_bundle(definition)
     except ValidationError as exc:
         raise ArtifactError(PersistenceCode.DEFINITION_FINGERPRINT_MISMATCH) from exc
+    if isinstance(definition, Bundle) and _has_runtime_provider(bundle.raw):
+        if bundle_fingerprint(bundle.raw) != bundle.fingerprint:
+            raise ArtifactError(PersistenceCode.DEFINITION_FINGERPRINT_MISMATCH)
+        if bundle.runtime_providers is None:
+            from .runtime_providers import RuntimeProviderError
+
+            raise RuntimeProviderError("runtime_provider_unavailable")
+        bundle.verify_runtime_policy()
     if bundle.fingerprint != fingerprint:
         raise ArtifactError(PersistenceCode.DEFINITION_FINGERPRINT_MISMATCH)
     return bundle
@@ -1180,7 +1218,16 @@ def restore_aggregate_package(
     descriptors: dict[str, dict[str, Any]] = {}
     try:
         for attachment in document["normalized_definitions"]:
-            bundle = bundle_from_attachment(attachment)
+            existing = artifact_resolver.resolve_definition(
+                attachment["validated_bundle_fingerprint"]
+            )
+            registry = existing.runtime_providers if isinstance(existing, Bundle) else None
+            required = (
+                existing.required_capabilities if isinstance(existing, Bundle) else frozenset()
+            )
+            bundle = bundle_from_attachment(
+                attachment, runtime_providers=registry, required_capabilities=required
+            )
             if bundle.fingerprint in definitions:
                 raise ArtifactError(PersistenceCode.INVALID_AGGREGATE_STATE_PACKAGE)
             definitions[bundle.fingerprint] = bundle

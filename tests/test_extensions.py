@@ -7,6 +7,7 @@ from dataclasses import replace
 
 import pytest
 
+import determa.state.codes as codes
 import determa.state.extensions as extensions
 import determa.state.stores as bundled_stores
 import determa.state.stores.memory as memory_module
@@ -435,6 +436,278 @@ def test_bundled_absolute_imports_match_installed_bindings(
     assert calls == 0
 
 
+def test_bundled_added_class_dispatch_hook_refuses_capability_and_health(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = bundled_extension_registry(include_postgresql=False)
+    record = next(
+        item
+        for item in registry.descriptors
+        if item["provider_reference"]["identifier"] == "determa.store.memory"
+    )
+    configuration = {"instance_id": "primary", "uri": "memory:", "store_configuration": {}}
+    configured = registry.validate_configuration(record, configuration)
+    called = 0
+    original = memory_module.MemoryExecutionStore.__getattribute__
+
+    def substituted(self: object, name: str) -> object:
+        nonlocal called
+        if name == "health":
+            called += 1
+            return lambda: {"healthy": True}
+        if name == "capabilities":
+            called += 1
+            return frozenset({"ephemeral"})
+        return original(self, name)
+
+    monkeypatch.setattr(memory_module.MemoryExecutionStore, "__getattribute__", substituted)
+    with pytest.raises(ExtensionError, match="extension_identity_mismatch"):
+        registry.capabilities(configured)
+    with pytest.raises(ExtensionError, match="extension_identity_mismatch"):
+        registry.health(configured)
+    with pytest.raises(ExtensionError, match="extension_identity_mismatch"):
+        registry.negotiate(record, configuration)
+    assert called == 0
+
+
+def test_bundled_rejects_rebound_stdlib_module_callable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = bundled_extension_registry(include_postgresql=False)
+    record = next(
+        item
+        for item in registry.descriptors
+        if item["provider_reference"]["identifier"] == "determa.store.memory"
+    )
+    original = memory_module.threading.RLock
+    called = 0
+
+    def substituted() -> object:
+        nonlocal called
+        called += 1
+        return original()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(memory_module.threading, "RLock", substituted)
+        with pytest.raises(ExtensionError, match="extension_identity_mismatch"):
+            registry.negotiate(
+                record, {"instance_id": "primary", "uri": "memory:", "store_configuration": {}}
+            )
+    assert called == 0
+
+
+def test_bundled_contextmanager_rejects_forged_wrapped_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = memory_module.MemoryExecutionStore.transaction
+    called = 0
+
+    def substituted(*args: object, **kwargs: object) -> object:
+        nonlocal called
+        called += 1
+        return original(*args, **kwargs)
+
+    substituted.__wrapped__ = original.__wrapped__  # type: ignore[attr-defined]
+    monkeypatch.setattr(memory_module.MemoryExecutionStore, "transaction", substituted)
+    registry = bundled_extension_registry(include_postgresql=False)
+    record = next(
+        item
+        for item in registry.descriptors
+        if item["provider_reference"]["identifier"] == "determa.store.memory"
+    )
+    with pytest.raises(ExtensionError, match="extension_identity_mismatch"):
+        registry.negotiate(
+            record, {"instance_id": "primary", "uri": "memory:", "store_configuration": {}}
+        )
+    assert called == 0
+
+
+def test_bundled_rejects_transitive_stdlib_callback_before_invocation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = bundled_extension_registry(include_postgresql=False)
+    record = next(
+        item
+        for item in registry.descriptors
+        if item["provider_reference"]["identifier"] == "determa.store.memory"
+    )
+    original = memory_module.threading._CRLock  # type: ignore[attr-defined]
+    called = 0
+
+    def substituted(*args: object, **kwargs: object) -> object:
+        nonlocal called
+        called += 1
+        return original(*args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(memory_module.threading, "_CRLock", substituted)
+        with pytest.raises(ExtensionError, match="extension_identity_mismatch"):
+            registry.negotiate(
+                record, {"instance_id": "primary", "uri": "memory:", "store_configuration": {}}
+            )
+    assert called == 0
+
+
+@pytest.mark.parametrize("replacement", ["dispatch_table", "module_dispatch"])
+def test_bundled_rejects_indirect_platform_dispatch_before_invocation(
+    monkeypatch: pytest.MonkeyPatch, replacement: str
+) -> None:
+    import copy
+    import types
+
+    registry = bundled_extension_registry(include_postgresql=False)
+    record = next(
+        item
+        for item in registry.descriptors
+        if item["provider_reference"]["identifier"] == "determa.store.memory"
+    )
+    called = 0
+    original = (
+        copy._deepcopy_dispatch[dict]  # type: ignore[attr-defined]
+        if replacement == "dispatch_table"
+        else memory_module.threading.RLock
+    )
+
+    def substituted(*args: object, **kwargs: object) -> object:
+        nonlocal called
+        called += 1
+        return original(*args, **kwargs)
+
+    class SubstituteModule(types.ModuleType):
+        def __getattribute__(self, name: str) -> object:
+            if name == "RLock":
+                return substituted
+            return super().__getattribute__(name)
+
+    with monkeypatch.context() as patch:
+        if replacement == "dispatch_table":
+            patch.setitem(copy._deepcopy_dispatch, dict, substituted)  # type: ignore[attr-defined]
+        else:
+            patch.setattr(memory_module.threading, "__class__", SubstituteModule)
+        with pytest.raises(ExtensionError, match="extension_identity_mismatch"):
+            registry.negotiate(
+                record, {"instance_id": "primary", "uri": "memory:", "store_configuration": {}}
+            )
+    assert called == 0
+
+
+def test_bundled_rejects_rebound_decorator_before_reference_execution(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import contextlib
+    import sys
+
+    registry = bundled_extension_registry(include_postgresql=False)
+    record = next(
+        item
+        for item in registry.descriptors
+        if item["provider_reference"]["identifier"] == "determa.store.memory"
+    )
+    original = contextlib.contextmanager
+    called = 0
+
+    def substituted(*args: object, **kwargs: object) -> object:
+        nonlocal called
+        called += 1
+        return original(*args, **kwargs)  # type: ignore[arg-type]
+
+    with monkeypatch.context() as patch:
+        patch.setattr(contextlib, "contextmanager", substituted)
+        for name, module in tuple(sys.modules.items()):
+            if name.startswith("determa.state.") and vars(module).get("contextmanager") is original:
+                patch.setattr(module, "contextmanager", substituted)
+        with pytest.raises(ExtensionError, match="extension_identity_mismatch"):
+            registry.negotiate(
+                record, {"instance_id": "primary", "uri": "memory:", "store_configuration": {}}
+            )
+    assert called == 0
+
+
+def test_bundled_rejects_changed_descriptor_but_allows_mutable_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    registry = bundled_extension_registry(include_postgresql=False)
+    record = next(
+        item
+        for item in registry.descriptors
+        if item["provider_reference"]["identifier"] == "determa.store.memory"
+    )
+    configuration = {"instance_id": "primary", "uri": "memory:", "store_configuration": {}}
+    metrics: dict[str, int] = {}
+    monkeypatch.setattr(memory_module.MemoryExecutionStore, "metrics", metrics, raising=False)
+    assert registry.negotiate(record, configuration)["claims"] == ["ephemeral"]
+    metrics["checks"] = 1
+    assert registry.negotiate(record, configuration)["health"] == "healthy"
+
+    original = memory_module.MemoryExecutionStore.capabilities
+
+    class SubstituteProperty(property):
+        def __get__(self, instance: object, owner: type | None = None) -> frozenset[str]:
+            return frozenset({"ephemeral"})
+
+    monkeypatch.setattr(
+        memory_module.MemoryExecutionStore, "capabilities", SubstituteProperty(original.fget)
+    )
+    with pytest.raises(ExtensionError, match="extension_identity_mismatch"):
+        registry.negotiate(record, configuration)
+
+
+def test_bundled_rejects_changed_function_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    registry = bundled_extension_registry(include_postgresql=False)
+    record = next(
+        item
+        for item in registry.descriptors
+        if item["provider_reference"]["identifier"] == "determa.store.memory"
+    )
+    monkeypatch.setattr(memory_module.MemoryExecutionStore.__init__, "__defaults__", (object(),))
+    with pytest.raises(ExtensionError, match="extension_identity_mismatch"):
+        registry.negotiate(
+            record, {"instance_id": "primary", "uri": "memory:", "store_configuration": {}}
+        )
+
+
+@pytest.mark.parametrize(
+    ("target", "member"),
+    [
+        (extensions.ConfiguredExtension, "__init__"),
+        (extensions._InstanceBinding, "__eq__"),
+        (extensions.ExtensionProvider, "__subclasshook__"),
+        (codes.ExtensionNegotiationFailureCode, "_generate_next_value_"),
+    ],
+)
+@pytest.mark.parametrize("after_configuration", [False, True])
+def test_bundled_rejects_changed_generated_methods(
+    monkeypatch: pytest.MonkeyPatch,
+    target: type,
+    member: str,
+    after_configuration: bool,
+) -> None:
+    registry = bundled_extension_registry(include_postgresql=False)
+    record = next(
+        item
+        for item in registry.descriptors
+        if item["provider_reference"]["identifier"] == "determa.store.memory"
+    )
+    configuration = {"instance_id": "primary", "uri": "memory:", "store_configuration": {}}
+    configured = (
+        registry.validate_configuration(record, configuration) if after_configuration else None
+    )
+    called = 0
+
+    def substituted(*_args: object, **_kwargs: object) -> object:
+        nonlocal called
+        called += 1
+        return object()
+
+    monkeypatch.setattr(target, member, substituted)
+    with pytest.raises(ExtensionError, match="extension_identity_mismatch"):
+        if configured is None:
+            registry.negotiate(record, configuration)
+        else:
+            registry.health(configured)
+    assert called == 0
+
+
 def test_requested_profile_cannot_skip_composition() -> None:
     registry = bundled_extension_registry(include_postgresql=False)
     record = next(
@@ -474,3 +747,53 @@ def test_requested_profile_cannot_skip_composition() -> None:
             weak_profile_opt_in=True,
             host_guarantees={"deterministic": True},
         )
+
+
+def test_bundled_binding_supports_current_python_platform() -> None:
+    """Expose the first failed binding check when an interpreter changes layout."""
+    import sys
+
+    failures: list[tuple[str, int, str, str, str]] = []
+
+    def trace(frame: object, event: str, value: object) -> object:
+        # Only names and source locations are recorded, never runtime values.
+        from types import FrameType
+
+        assert isinstance(frame, FrameType)
+        if (
+            event == "return"
+            and value is False
+            and frame.f_code.co_name
+            in {
+                "walk",
+                "matches",
+                "binding_matches",
+                "installed_module_attribute",
+                "verify_definition",
+                "verify_function",
+                "same_executable",
+            }
+            and len(failures) < 20
+        ):
+            namespace = frame.f_locals
+            target = namespace.get("value", namespace.get("original"))
+            failures.append(
+                (
+                    frame.f_code.co_name,
+                    frame.f_lineno,
+                    str(namespace.get("attribute", namespace.get("member_name", ""))),
+                    type(target).__name__,
+                    str(getattr(target, "__name__", "")),
+                )
+            )
+        return trace
+
+    previous = sys.gettrace()
+    try:
+        sys.settrace(trace)
+        matches = extensions._bundled_factory_matches_source(
+            "memory", memory_module.memory_execution_store_factory
+        )
+    finally:
+        sys.settrace(previous)
+    assert matches, failures

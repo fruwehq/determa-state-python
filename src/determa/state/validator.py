@@ -434,7 +434,7 @@ def _validate_transition(
             "changed": cel.StaticType("map", element=cel.DYNAMIC, fields=external_fields)
         }
     guard = transition.get("guard")
-    if guard is not None:
+    if isinstance(guard, str):
         _check_expression(
             guard,
             scope=scope,
@@ -551,6 +551,8 @@ def _validate_actions(
 ) -> None:
     event_fields = _payload_types(events.get(event_name), event_name or "") if event_name else None
     for action in actions:
+        if "provider_actions" in action:
+            continue  # Exact binding and installed closure are checked at bundle load.
         if "assign" in action:
             name, expression = next(iter(action["assign"].items()))
             if name not in scope_declarations or scope_declarations[name][1].get("external"):

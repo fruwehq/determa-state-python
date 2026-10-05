@@ -99,7 +99,14 @@ def _resolver(path: Path, request: dict[str, Any] | None = None) -> MemoryArtifa
     specification = request.get("artifact_resolver") or request.get("definition_resolver")
     if specification is None:
         definitions = dict(_conformance_definitions())
+        if "inspection-provider" in path.parts:
+            from .provider_fixture import installed_inspection_bundle
+
+            native_bundle, _registry = installed_inspection_bundle(path)
+            definitions[native_bundle.fingerprint] = native_bundle
         for candidate in path.glob("*machine*.yaml"):
+            if "inspection-provider" in path.parts:
+                continue
             bundle = load_bundle(candidate.read_text(encoding="utf-8"))
             definitions[bundle.fingerprint] = bundle
         descriptors = {}

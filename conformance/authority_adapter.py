@@ -14,15 +14,17 @@ import threading
 from pathlib import Path
 from typing import Any
 
+from determa.state.effects import SQLiteCommittedEffectHost
+
 from determa.state.authority import (
     AuthoritySQLiteExecutionStore,
     SQLiteLocalAuthority,
     _compact,
+    _compose_authority_profile,
     _parse,
     configure_bundled_sqlite_authority,
 )
 from determa.state.extensions import bundled_extension_registry
-from determa.state.effects import SQLiteCommittedEffectHost
 from determa.state.wire import MemoryArtifactResolver, hash_value
 
 _PATH = Path(tempfile.gettempdir()) / "determa-python-local-authority-profile.sqlite"
@@ -116,6 +118,7 @@ def _baseline_ledger() -> dict[str, Any]:
         "receipts": [],
         "mutation_bytes": [],
         "checkpoint_bytes": [],
+        "native_checkpoint_bytes": [],
         "journal_entries": [],
         "ingress_acknowledgements": [],
         "active_claims": [],
@@ -135,6 +138,8 @@ def _baseline_ledger() -> dict[str, Any]:
 
 def _seed(ledger: dict[str, Any]) -> SQLiteLocalAuthority:
     global _INITIAL_BINDING
+    # These trusted protocol fixtures contain opaque mutations, not native rows.
+    ledger = {**ledger, "native_checkpoint_bytes": []}
     # A fresh test database for each independent vector. Production never
     # removes an allocated scope marker from a live authority domain.
     for suffix in ("", "-wal", "-shm"):
@@ -156,6 +161,14 @@ def _seed(ledger: dict[str, Any]) -> SQLiteLocalAuthority:
             )
             connection.commit()
     return authority
+
+
+def _observed_ledger(authority: SQLiteLocalAuthority) -> dict[str, Any] | None:
+    ledger = authority.inspect("scope-42")
+    if ledger is None:
+        return None
+    # Project the actual ledger onto the closed conformance observation shape.
+    return {key: value for key, value in ledger.items() if key != "native_checkpoint_bytes"}
 
 
 def _call(authority: SQLiteLocalAuthority, call: dict[str, Any], **kwargs: Any) -> str | None:
@@ -302,10 +315,10 @@ def _native_trace(payload: dict[str, Any]) -> dict[str, Any]:
         elif kind == "observe_native_fate":
             events.append(_event("native_fate", session=session, fate=fates[session]))
         elif kind == "observe_storage":
-            events.append(_event("storage", ledger=authority.inspect("scope-42")))
+            events.append(_event("storage", ledger=_observed_ledger(authority)))
         elif kind == "restart_authority":
             authority = SQLiteLocalAuthority(_PATH)
-            events.append(_event("restarted", ledger=authority.inspect("scope-42")))
+            events.append(_event("restarted", ledger=_observed_ledger(authority)))
         elif kind == "disconnect_session":
             events.append(_event("response", session=session))
         elif kind == "resolve_fate_from_storage":
@@ -331,7 +344,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         observed = {
             "binding": _binding(),
             "response_bytes": response,
-            "ledger_after": authority.inspect("scope-42"),
+            "ledger_after": _observed_ledger(authority),
         }
         if "observed_effects_before" in payload["setup"]:
             observed["observed_effects_after"] = payload["setup"]["observed_effects_before"]
@@ -358,7 +371,7 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
         return {
             "binding": _binding(),
             "allocated": reused,
-            "ledger_after": authority.inspect("scope-42"),
+            "ledger_after": _observed_ledger(authority),
         }
     if kind == "base_core_refusal":
         return {
@@ -412,67 +425,9 @@ def run(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _common_rule(facts: dict[str, Any], verified: set[str]) -> dict[str, Any]:
-    """Compose only the hypothetical common-rule premises supplied by the suite."""
-    requirement = facts["extension_requirement"]
-    claims = set(requirement["required_claims"]) if requirement else set()
-    guarded = (
-        requirement is not None
-        and "authoritative_scope_fencing" in claims
-        and "scope_guard_through_native_commit" in verified
+    return _compose_authority_profile(
+        facts, verified, scope_identity="scope-42", authority_epoch="2", scope_generation="4"
     )
-    inventory = (
-        requirement is not None
-        and "consistent_scope_inventory" in claims
-        and "frozen_authoritative_inventory" in verified
-    )
-    worker = (
-        guarded
-        and {"guarded_journal_claim", "authenticated_worker_checks"} <= verified
-        and {item["role"] for item in facts["required_participants"]} >= {"journal", "worker"}
-    )
-    relocation = (
-        guarded
-        and inventory
-        and "safe_relocation" in claims
-        and "same_authority_transfer_proof" in verified
-        and facts["destination_binding_digest"] is not None
-    )
-    if (requirement is None and verified) or (
-        requirement is not None and not guarded and not inventory
-    ):
-        return {"status": "rejected", "code": "host_capability_mismatch"}
-    if "safe_relocation" in verified and not relocation:
-        return {"status": "rejected", "code": "host_capability_mismatch"}
-    report = {
-        "profile_report_format": "determa.host_authority_profile_report",
-        "profile_report_schema_version": 1,
-        "scope_identity": "scope-42",
-        "authority_epoch": "2" if requirement else None,
-        "scope_generation": "4" if requirement else None,
-        "extension_report": {
-            "category": "authority",
-            "provider_reference": requirement["provider_reference"],
-            "instance_id": requirement["instance_id"],
-            "health": "healthy",
-            "claims": requirement["required_claims"],
-        }
-        if requirement
-        else None,
-        "authority_storage_boundary": facts["storage_boundary"],
-        "topology": facts["topology"],
-        "source_binding_digest": facts["source_binding_digest"],
-        "destination_binding_digest": facts["destination_binding_digest"],
-        "required_participants": facts["required_participants"],
-        "guarantees": {
-            "guarded_local_writes": guarded,
-            "worker_fencing": worker,
-            "complete_scope_inventory": inventory,
-            "safe_relocation": relocation,
-        },
-    }
-    if facts["destination_binding_digest"] is None and "safe_relocation" in verified:
-        return {"status": "rejected", "code": "host_capability_mismatch"}
-    return {"status": "accepted", "report_bytes": _compact(report)}
 
 
 if __name__ == "__main__":

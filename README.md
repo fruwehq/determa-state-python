@@ -4,12 +4,12 @@ Python implementation of [Determa State](https://github.com/fruwehq/determa-stat
 a language-agnostic statechart engine with a shared normative conformance suite.
 
 This implementation supports Determa State `format: 1` at specification
-commit `6207362e879ccca70f709e1eb4cc90448d910c0b`. Correctness is determined by
+commit `86bb88dd21cb1f799eefe5020b6e49dabf6e7225`. Correctness is determined by
 99 format-1 core cases, 162 version-1 vectors, 142 durable-host vectors, 49 core
-inspection vectors, 47 extension negotiation vectors, and 420 manifest artifacts
-at conformance commit `e499a99c3ced88f29008049ea9dddcc17a0d9f51`. The 7
-native guard-provider inspection vectors remain an optional profile pending
-runtime-provider support.
+inspection vectors, 47 extension negotiation vectors, 7 native guard-provider
+inspection vectors, 30 runtime-provider vectors, and 476 manifest artifacts at
+conformance commit `ce6c94ee1929597689403080d1790e2f48f8a5fb`. The native
+runtime-provider profile is optional and is exercised through its production adapter.
 
 The package metadata is `0.3.0`. Artifact and checkpoint schema version 1 is the
 only supported portable artifact format. Machine YAML remains `format: 1`.
@@ -24,6 +24,16 @@ The version-1 checkpoint host returns exact receipt evidence for admission, proc
 and terminal replay. The optional public extension registry validates exact provider
 references, loaded source closure, configured health, and currently proved claims
 before evaluating a requested profile.
+
+`ApplicationProjectionFacade` binds explicitly selected application rows to one
+root. Supply an `ApplicationRowMapping` that reads and writes those rows through
+the configured execution store's native shared transaction. The mapping provides
+typed input, projects the proposed complete checkpoint into selected rows and
+supplemental storage, and reconstructs it for a precommit round-trip check. `run`
+returns the exact create, admit, or step result after commit; a retained delivery
+returns its receipt before current row input is mapped. The optional aggregate-only
+step path uses the mapping's `reconstruct_aggregate` and `project_aggregate`
+methods when no checkpoint exists.
 
 ## Install
 
@@ -272,6 +282,40 @@ source verifier for additional providers. Its only positive claim here is memory
 `ephemeral`, which permits process loss. Category-specific guarantees need their
 operational profile proof before the host can advertise them.
 
+Bundled verification assumes a trusted Python interpreter, standard-library and
+package installation, and trusted package initialization. It captures runtime
+executable bindings during initialization and checks them before using decorators
+or rebuilding reference classes. Hosts must exclude concurrent executable
+rebinding between verification and invocation. These checks are not isolation
+from arbitrary code controlling the interpreter; native runtime implementation,
+the interpreter's import machinery, and the verifier itself remain part of the
+host's trust boundary. Ordinary mutable data may change; executable entries in
+reachable callback tables, defaults, and closures retain their captured bindings.
+
+`RuntimeProviderRegistry` installs exact native guard and action providers through
+that same common registration boundary. `SourceClosure` binds the loaded Python
+callable and its declared dependency files to the reference and source digest.
+The registry checks source-literal function defaults and the selected callable's
+identity before use; mutable provider state may change in place. Hosts loading
+providers with dynamic defaults or external executable dependencies can supply
+`source_identity_verifier` when constructing the registry. That host callback must
+independently attest the selected loaded executable and its source provenance;
+provider self-assertions are not evidence.
+`load_bundle(..., runtime_providers=registry)` preflights every native slot, including
+unreachable declarations. The engine passes immutable typed snapshots, validates
+ordered action proposals, and retains the ordinary atomic rollback and fault codes.
+The registry reports effective guarantees from configured provider proof; unknown
+purity discloses possible external I/O. A host may require guarantees at load with
+`required_capabilities`. Native I/O can occur before a Determa commit and survives
+a failed compare-and-swap; the engine does not retry it automatically.
+
+`compile_language_source(source, registry, manifest=manifest)` verifies the exact
+source and compiler closure, compiles disjoint regions in order, strictly loads the
+generated format-1 bundle, and checks the manifest fingerprint and proved source
+capabilities. A generated CEL bundle restores without an installed compiler.
+Semantic inspection calls only a separately proved, bounded `inspect_guard` method;
+structural inspection never invokes a native provider.
+
 ## Implemented Surface
 
 - strict format-1 loading, default materialization, bundle fingerprinting, and exact
@@ -313,7 +357,9 @@ It prints the normalized bundle fingerprint on success.
 ## Optional local scope authority
 
 `SQLiteLocalAuthority` is an opt-in reference authority for one persistent SQLite
-database. It allocates a permanent scope marker, serializes guarded commits and
+database dedicated permanently to one scope. A second scope requires a separate
+database; allocation refuses a second scope even after restart or retirement.
+It allocates a permanent scope marker, serializes guarded commits and
 freezes under the same SQLite write transaction, retains exact operation receipts,
 and records a frozen inventory of its trusted local scope data. Call
 `setup_schema()` explicitly before allocating a scope. The host supplies the
