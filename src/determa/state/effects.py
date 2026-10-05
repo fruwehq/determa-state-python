@@ -539,6 +539,8 @@ def _reconstruct_producer_response(
             for item in checkpoint["terminal_outbox_records"]
         }
     )
+    if not emission_ids.issubset(intents):
+        raise EffectError("replay_evidence_expired")
     emissions = [
         copy.deepcopy(intents[item["effect_id"]])
         for item in receipt["emission_references"]

@@ -996,6 +996,19 @@ def test_compact_outbox_location_retains_valid_admitted_journal_pair(tmp_path):
     restored.setup_schema()
     restored.seed(checkpoint, journal)
     assert restored.recover(root)["journal"] == journal
+    before = restored.snapshot(root)
+    record = journal["effect_records"][0]
+    with pytest.raises(EffectError, match="replay_evidence_expired"):
+        restored.produce(
+            root,
+            "produce-1",
+            checkpoint["root_record"]["aggregate_state"]["root_runtime_id"],
+            expected_revision="stale",
+            expected_digest="stale",
+            route_generation="999",
+            operation_token=record["operation_token"],
+        )
+    assert restored.snapshot(root) == before
 
 
 @pytest.mark.parametrize(
