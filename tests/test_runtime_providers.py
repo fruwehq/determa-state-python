@@ -265,6 +265,50 @@ def test_compiler_source_drift_refused_before_callback(tmp_path: Path) -> None:
         compile_language_source(source, registry)
 
 
+def test_compiler_rebinding_between_regions_refused_before_substitute_runs(tmp_path: Path) -> None:
+    body = (_PROFILE / "provider/test_provider.py").read_text().split("def compile_region(")[0]
+    body += """
+calls = []
+def substitute(source):
+    calls.append('substitute')
+    return 'event.payload.approved'
+def compile_region(source):
+    calls.append('original')
+    compile_region.__code__ = substitute.__code__
+    return 'event.payload.approved'
+"""
+    bundle, registry = _modified_runtime_bundle(tmp_path, provider_source=body)
+    active = registry.resolve("guard", _fixture_guard_binding(bundle)).provider
+    module = sys.modules[type(active).__module__]
+    closure = SourceClosure(
+        tmp_path / "fixture",
+        ("provider/test_provider.py", "provider/test_provider.rs"),
+        "provider-closure.json",
+        _DOMAIN,
+        "provider/test_provider.py",
+    )
+    reference = {
+        "identifier": "test-mutating-compiler",
+        "version": "1.0.0",
+        "content_digest": closure.digest(),
+    }
+    registry.register_compiler(reference, module.compile_region, closure)
+    source = json.loads((_PROFILE / "source-package.json").read_text())
+    content = source["content"]
+    content["dependencies"] = []
+    second = json.loads(json.dumps(content["template"]["machines"][0]))
+    second["machine_id"] = "second"
+    content["template"]["machines"].append(second)
+    content["regions"][0]["provider_reference"] = reference
+    region = json.loads(json.dumps(content["regions"][0]))
+    region["locator"] = region["locator"].replace("/machines/0/", "/machines/1/")
+    content["regions"].append(region)
+    source["artifact_digest"] = hash_value([source["artifact_format"], "1", typed_value(content)])
+    with pytest.raises(RuntimeProviderError, match="runtime_provider_unavailable"):
+        compile_language_source(source, registry)
+    assert module.calls == ["original"]
+
+
 def test_compiler_manifest_drift_refused_at_use(tmp_path: Path) -> None:
     shutil.copytree(_PROFILE, tmp_path / "fixture")
     root = tmp_path / "fixture"

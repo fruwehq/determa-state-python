@@ -12,10 +12,10 @@ The implementation is conformant only when it passes the language-neutral suite.
 The implementation uses these immutable inputs:
 
 - specification: `77c0a2e60cd0771a6d44ae170a079ddd51d7d9f0`;
-- conformance: `cf7e673b26ebb162dfdc54d9d235300cd3350438` (99 format-1
+- conformance: `c6949440f5b9fd6e06ea5571f4e01681dd59ee04` (99 format-1
   core cases, 162 version-1 vectors, 142 durable-host vectors, 49 core inspection
   vectors, 47 extension negotiation vectors, 7 optional native-provider vectors,
-  41 runtime-provider vectors, and 487 JSON artifacts).
+  52 runtime-provider vectors, and 487 JSON artifacts).
 
 The package metadata is `0.3.0`.
 

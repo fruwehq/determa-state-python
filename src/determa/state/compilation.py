@@ -138,12 +138,14 @@ def compile_language_source(
         ):
             raise RuntimeProviderError("runtime_provider_unavailable")
     compilers = [region["provider_reference"] for region in regions]
-    compiled = [registry.compiler(region["provider_reference"]) for region in regions]
+    for region in regions:
+        registry.compiler(region["provider_reference"])
     compiler_claims_before = [registry.compiler_capabilities(reference) for reference in compilers]
-    for location, region, compiler in zip(locations, regions, compiled, strict=True):
+    for location, region in zip(locations, regions, strict=True):
         if maximum_compilation_steps <= 0:
             raise RuntimeProviderError("language_compilation_limit_exceeded")
         maximum_compilation_steps -= 1
+        compiler = registry.compiler(region["provider_reference"])
         try:
             replacement = compiler(region["source"])
         except Exception as exc:
