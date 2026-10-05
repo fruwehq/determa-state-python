@@ -1118,6 +1118,8 @@ class SQLiteCommittedEffectHost:
                 "operation_token": record["operation_token"],
                 "destination_binding_digest": record["destination_binding_digest"],
                 "credential": credential,
+                "route_configuration_generation": record["route_configuration_generation"],
+                "handler_reference": copy.deepcopy(record["handler_reference"]),
             }
             handler = self._verified_handler(
                 record["handler_reference"], record["destination_binding_digest"]

@@ -3,8 +3,11 @@
 
 from __future__ import annotations
 
+import ast
 import base64
+import builtins
 import copy
+import dataclasses
 import hashlib
 import importlib.util
 import json
@@ -13,12 +16,14 @@ import sqlite3
 import subprocess
 import sys
 import time
+import types
 import uuid
 from pathlib import Path
 from typing import Any
 
 from conformance.authority_adapter import _PATH
 from determa.state import load_bundle
+from determa.state._platform_bindings import PLATFORM_BINDINGS
 from determa.state.authority import (
     AuthoritySQLiteExecutionStore,
     SQLiteLocalAuthority,
@@ -28,9 +33,10 @@ from determa.state.authority import (
 from determa.state.effects import (
     EffectError,
     SQLiteCommittedEffectHost,
+    VerifiedNativeHandler,
     _result_response,
 )
-from determa.state.extensions import bundled_extension_registry
+from determa.state.extensions import ExtensionRegistry, bundled_extension_registry
 from determa.state.wire import (
     MemoryArtifactResolver,
     canonical_bytes,
@@ -258,6 +264,146 @@ def _loaded_handler() -> Any:
     return module
 
 
+def _verified_fixture_handler(module: Any) -> bool:
+    """Check the actual fixture function and its narrow generated dataclass closure.
+
+    Only this allowlisted two-field frozen class is supported. Reference generation
+    uses anchored standard-library machinery, never a provider-supplied decorator.
+    """
+    path = _CASE / _HANDLER_SOURCE
+    source = path.read_bytes()
+    tree = ast.parse(source)
+    declaration = next((node for node in tree.body if isinstance(node, ast.ClassDef)), None)
+    if (
+        declaration is None
+        or declaration.name != "NativeReply"
+        or declaration.bases
+        or declaration.keywords
+        or len(declaration.decorator_list) != 1
+        or ast.dump(declaration.decorator_list[0])
+        != ast.dump(ast.parse("dataclass(frozen=True)", mode="eval").body)
+        or len(declaration.body) != 2
+    ):
+        return False
+    for node, name, kind in zip(
+        declaration.body, ("reference", "accepted"), ("str", "bool"), strict=True
+    ):
+        if not (
+            isinstance(node, ast.AnnAssign)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == name
+            and isinstance(node.annotation, ast.Name)
+            and node.annotation.id == kind
+            and node.value is None
+        ):
+            return False
+    if (
+        not PLATFORM_BINDINGS.matches(dataclasses, "dataclass")
+        or not PLATFORM_BINDINGS.matches(dataclasses, "make_dataclass")
+        or not PLATFORM_BINDINGS.matches(dataclasses, "FrozenInstanceError")
+        or module.dataclass is not dataclasses.dataclass
+    ):
+        return False
+    expected = dataclasses.make_dataclass(
+        "NativeReply",
+        [("reference", str), ("accepted", bool)],
+        namespace={"__module__": module.__name__},
+        frozen=True,
+    )
+    expected.__module__ = module.__name__
+    actual = module.NativeReply
+    if (
+        type(actual) is not type
+        or actual.__bases__ != (object,)
+        or vars(actual).keys() != vars(expected).keys()
+    ):
+        return False
+    seen = set()
+
+    def equal(left: Any, right: Any) -> bool:
+        if left is actual or right is expected:
+            return left is actual and right is expected
+        if type(left) is not type(right):
+            return False
+        if isinstance(left, types.FunctionType):
+            pair = (id(left), id(right))
+            if pair in seen:
+                return True
+            seen.add(pair)
+            return (
+                left.__code__ == right.__code__
+                and all(
+                    equal(
+                        left.__globals__.get(name, vars(builtins).get(name)),
+                        right.__globals__.get(name, vars(builtins).get(name)),
+                    )
+                    for name in right.__code__.co_names
+                    if name in left.__globals__
+                    or name in right.__globals__
+                    or name in vars(builtins)
+                )
+                and equal(left.__defaults__, right.__defaults__)
+                and equal(left.__kwdefaults__, right.__kwdefaults__)
+                and equal(vars(left), vars(right))
+                and equal(
+                    tuple(cell.cell_contents for cell in left.__closure__ or ()),
+                    tuple(cell.cell_contents for cell in right.__closure__ or ()),
+                )
+            )
+        if isinstance(left, (tuple, list)):
+            return len(left) == len(right) and all(
+                equal(a, b) for a, b in zip(left, right, strict=True)
+            )
+        if type(left) is dict:
+            return left.keys() == right.keys() and all(equal(left[key], right[key]) for key in left)
+        if isinstance(left, (types.GetSetDescriptorType, types.MemberDescriptorType)):
+            return (
+                left.__name__ == right.__name__
+                and left.__objclass__ is actual
+                and right.__objclass__ is expected
+            )
+        if type(left) in (dataclasses.Field, type(expected.__dataclass_params__)):
+            return all(
+                equal(getattr(left, name), getattr(right, name))
+                for name in type(left).__slots__
+                if name != "__weakref__"
+            )
+        return left == right
+
+    if not all(equal(member, vars(expected)[name]) for name, member in vars(actual).items()):
+        return False
+    code = next(
+        item
+        for item in compile(source, str(path), "exec", dont_inherit=True).co_consts
+        if isinstance(item, types.CodeType) and item.co_name == "invoke"
+    )
+    return (
+        type(module.invoke) is types.FunctionType
+        and module.invoke.__code__ == code
+        and module.invoke.__globals__ is vars(module)
+        and module.invoke.__closure__ is None
+        and module.invoke.__defaults__ is None
+        and module.invoke.__kwdefaults__ is None
+    )
+
+
+class _FixtureNativeProvider:
+    def __init__(self, invocation: Any) -> None:
+        self.invocation = invocation
+
+    def validate_configuration(self, configuration: dict[str, Any]) -> dict[str, Any]:
+        return copy.deepcopy(configuration)
+
+    def capabilities(self, instance: Any) -> list[str]:
+        return []
+
+    def health(self, instance: Any) -> str:
+        return "healthy"
+
+    def invoke(self, instance: Any, payload: Any, metadata: Any, attempt: Any) -> Any:
+        return self.invocation(payload, metadata, attempt)
+
+
 def _run_operation(payload: dict[str, Any], control: Path | None = None) -> dict[str, Any]:
     checkpoint, journal = payload["checkpoint_before"], payload["journal_before"]
     authority, authority_report, _installation = _reset_authority()
@@ -278,29 +424,33 @@ def _run_operation(payload: dict[str, Any], control: Path | None = None) -> dict
     loaded_handler_source: dict[str, str] = {}
     destination_call_evidence: dict[str, Any] | None = None
 
+    active_attempt: dict[str, Any] = {}
+    active_metadata: dict[str, Any] = {}
+
     class CallLog:
         def call(self, scope: str, effect_id: str, portable_payload: Any) -> tuple[str, bool]:
             nonlocal destination_call_evidence
             destination_call_evidence = {
                 "idempotency_key": [scope, effect_id],
-                "destination_binding_digest": route["destination_binding_digest"],
-                "attempt_fence": journal["effect_records"][0]["attempt_fence"],
+                "destination_binding_digest": active_metadata["destination_binding_digest"],
+                "attempt_fence": active_attempt["attempt_fence"],
             }
             return _destination_call(scope, effect_id, portable_payload)
 
     def handler(
         typed_payload: Any, metadata: dict[str, Any], attempt: dict[str, Any]
     ) -> dict[str, Any]:
-        record = journal["effect_records"][0]
+        active_attempt.update(attempt)
+        active_metadata.update(metadata)
         provider_calls.append(
             {
-                "effect_id": record["effect_id"],
-                "handler_reference": record["handler_reference"],
-                "destination_binding_digest": record["destination_binding_digest"],
-                "route_configuration_generation": record["route_configuration_generation"],
-                "attempt_fence": record["attempt_fence"],
-                "scope_identity": _AUTHORITY_SCOPE,
-                "credential_generation": configuration["credential_generation"],
+                "effect_id": metadata["effect_id"],
+                "handler_reference": descriptor["provider_reference"],
+                "destination_binding_digest": metadata["destination_binding_digest"],
+                "route_configuration_generation": metadata["route_configuration_generation"],
+                "attempt_fence": attempt["attempt_fence"],
+                "scope_identity": metadata["scope_identity"],
+                "credential_generation": metadata["credential"],
             }
         )
         loaded_handler_source[_HANDLER_SOURCE] = _sha((_CASE / _HANDLER_SOURCE).read_bytes())
@@ -311,11 +461,67 @@ def _run_operation(payload: dict[str, Any], control: Path | None = None) -> dict
             {"operation_kind": kind, "event_id": event_id, "target": copy.deepcopy(target)}
         )
 
+    provider = _FixtureNativeProvider(handler)
+
+    def factory() -> _FixtureNativeProvider:
+        return provider
+
+    factory_code, handler_code = factory.__code__, handler.__code__
+    installed_invoke, installed_reply = handler_module.invoke, handler_module.NativeReply
+    installed_members = {
+        name: member
+        for name, member in vars(installed_reply).items()
+        if callable(member) or hasattr(type(member), "__get__")
+    }
+    provider_methods = {
+        name: member.__code__
+        for name, member in vars(_FixtureNativeProvider).items()
+        if isinstance(member, types.FunctionType)
+    }
+    descriptor = {
+        "category": "native_handler",
+        "provider_reference": route["handler_reference"],
+        "interface_version": 1,
+        "supported_capabilities": [],
+    }
+
+    def verify_native(source: Any, selected: Any) -> bool:
+        return (
+            selected == descriptor
+            and (source is factory or source is provider)
+            and factory.__code__ is factory_code
+            and type(provider) is _FixtureNativeProvider
+            and provider.invocation is handler
+            and handler.__code__ is handler_code
+            and all(
+                getattr(_FixtureNativeProvider, name).__code__ is code
+                for name, code in provider_methods.items()
+            )
+            and _sha(_handler_closure()) == selected["provider_reference"]["content_digest"]
+            and handler_module.invoke is installed_invoke
+            and handler_module.NativeReply is installed_reply
+            and all(
+                vars(installed_reply).get(name) is member
+                for name, member in installed_members.items()
+            )
+            and _verified_fixture_handler(handler_module)
+        )
+
+    handler_registry = ExtensionRegistry(source_verifier=verify_native)
+    handler_registry.register(descriptor, factory)
+    configured_handler = handler_registry.validate_configuration(
+        descriptor,
+        {
+            "instance_id": "committed-effect-handler",
+            "destination_binding_digest": route["destination_binding_digest"],
+        },
+    )
+    installed_handler = VerifiedNativeHandler(handler_registry, configured_handler)
     host = SQLiteCommittedEffectHost(
         _PATH,
         resolver,
         route,
-        handler,
+        installed_handler,
         authority_scope=_AUTHORITY_SCOPE,
         core_observer=observe_core,
         trusted_clock=lambda: payload["auth_context"]["trusted_host_now"],

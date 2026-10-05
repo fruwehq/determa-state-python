@@ -660,3 +660,16 @@ def test_native_handler_binding_rejects_changed_execution_or_destination(
         host.dispatch(root, request["effect_id"], credential="test-credential", **context)
     assert calls == []
     assert host.snapshot(root) == before
+
+
+@pytest.mark.parametrize("member", ["__init__", "__repr__", "__eq__", "__setattr__", "invoke"])
+def test_handler_fixture_verifier_rejects_changed_generated_or_executable_code(monkeypatch, member):
+    from conformance.effects_adapter import _loaded_handler, _verified_fixture_handler
+
+    module = _loaded_handler()
+    assert _verified_fixture_handler(module)
+    if member == "invoke":
+        monkeypatch.setattr(module, member, lambda *args: {})
+    else:
+        monkeypatch.setattr(module.NativeReply, member, lambda *args: None)
+    assert not _verified_fixture_handler(module)
