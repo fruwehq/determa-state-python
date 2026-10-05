@@ -21,6 +21,74 @@ def read(name):
     return json.loads((CASE / name).read_text())
 
 
+class NativeTestProvider:
+    def __init__(self, callback):
+        self.callback = callback
+
+    def validate_configuration(self, configuration):
+        return copy.deepcopy(configuration)
+
+    def capabilities(self, instance):
+        return []
+
+    def health(self, instance):
+        return "healthy"
+
+    def invoke(self, instance, payload, metadata, attempt):
+        return self.callback(payload, metadata, attempt)
+
+
+def installed_test_handler(host, callback):
+    from determa.state.effects import VerifiedNativeHandler
+    from determa.state.extensions import ExtensionRegistry
+
+    provider = NativeTestProvider(callback)
+
+    def factory():
+        return provider
+
+    callback_code = callback.__code__
+    factory_code = factory.__code__
+    methods = {
+        name: member.__code__
+        for name, member in vars(NativeTestProvider).items()
+        if callable(member)
+    }
+    descriptor = {
+        "category": "native_handler",
+        "provider_reference": host.route["handler_reference"],
+        "interface_version": 1,
+        "supported_capabilities": [],
+    }
+
+    def verify(source, actual):
+        return (
+            actual == descriptor
+            and (source is factory or source is provider)
+            and factory.__code__ is factory_code
+            and type(provider) is NativeTestProvider
+            and provider.callback is callback
+            and callback.__code__ is callback_code
+            and all(
+                getattr(NativeTestProvider, name).__code__ is code for name, code in methods.items()
+            )
+        )
+
+    registry = ExtensionRegistry(source_verifier=verify)
+    registry.register(descriptor, factory)
+    configured = registry.validate_configuration(
+        descriptor,
+        {
+            "instance_id": "test-handler",
+            "destination_binding_digest": host.route["destination_binding_digest"],
+        },
+    )
+    handler = VerifiedNativeHandler(registry, configured)
+    return SQLiteCommittedEffectHost(
+        host.path, host.resolver, host.route, handler, trusted_clock=host.trusted_clock
+    )
+
+
 def host_fixture(tmp_path, observer=None):
     bundle = load_bundle((CASE / "machine.yaml").read_text())
     resolver = MemoryArtifactResolver(definitions={bundle.fingerprint: bundle})
@@ -454,7 +522,9 @@ def test_confirmed_outbox_does_not_remove_the_business_invocation_payload(tmp_pa
         {key: record[key] for key in ("handler_reference", "destination_binding_digest")}
     )
     calls = []
-    host.handler = lambda *arguments: calls.append(arguments) or {"invoked": True}
+    host = installed_test_handler(
+        host, lambda *arguments: calls.append(arguments) or {"invoked": True}
+    )
     host.trusted_clock = lambda: "0"
     host.terminalize_outbox(root, request["effect_id"], {"status": "confirmed"})
     assert host.dispatch(root, request["effect_id"], credential="test-credential", **context) == {
@@ -544,10 +614,49 @@ def test_dispatch_crossing_lease_expiry_preserves_unresolved_work_for_recovery(t
     readings = iter(["0", expiry])
     host.trusted_clock = lambda: next(readings)
     calls = []
-    host.handler = lambda *args: calls.append(args) or {"accepted": True}
+    host = installed_test_handler(host, lambda *args: calls.append(args) or {"accepted": True})
     before = host.snapshot(root)
     with pytest.raises(EffectError, match="stale_attempt_fence"):
         host.dispatch(root, request["effect_id"], credential="test-credential", **context)
     assert len(calls) == 1
     assert host.snapshot(root) == before
     assert host.recover(root)["journal"]["effect_records"][0]["invocation_state"] == "ambiguous"
+
+
+@pytest.mark.parametrize(
+    "replacement", ["raw_callback", "callback_code", "method", "configuration", "instance"]
+)
+def test_native_handler_binding_rejects_changed_execution_or_destination(
+    tmp_path, monkeypatch, replacement
+):
+    host, root, request, context = host_fixture(tmp_path)
+    record = host.snapshot(root)["journal"]["effect_records"][0]
+    host.route.update(
+        {key: record[key] for key in ("handler_reference", "destination_binding_digest")}
+    )
+    calls = []
+
+    def callback(*args):
+        return calls.append(args) or {}
+
+    host = installed_test_handler(host, callback)
+    host.trusted_clock = lambda: "0"
+    if replacement == "raw_callback":
+        host.handler = callback
+    elif replacement == "callback_code":
+
+        def other(*args):
+            return calls or {"changed": True}
+
+        monkeypatch.setattr(callback, "__code__", other.__code__)
+    elif replacement == "method":
+        monkeypatch.setattr(NativeTestProvider, "invoke", lambda *args: {})
+    elif replacement == "configuration":
+        host.handler._configured._configuration["destination_binding_digest"] = "sha256:" + "0" * 64
+    else:
+        host.handler._configured._instance["destination_binding_digest"] = "sha256:" + "0" * 64
+    before = host.snapshot(root)
+    with pytest.raises(EffectError, match="host_capability_mismatch"):
+        host.dispatch(root, request["effect_id"], credential="test-credential", **context)
+    assert calls == []
+    assert host.snapshot(root) == before

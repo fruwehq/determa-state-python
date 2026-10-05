@@ -23,6 +23,7 @@ from .checkpoint_v1 import (
     step_checkpoint_v1,
 )
 from .errors import ArtifactError
+from .extensions import ConfiguredExtension, ExtensionError, ExtensionRegistry
 from .host import outbox_intent_digest
 from .wire import (
     ArtifactResolver,
@@ -456,6 +457,56 @@ def _issue_effect_claim(
     return copy.deepcopy(claim)
 
 
+class VerifiedNativeHandler:
+    """An exact native-handler instance installed through the public registry.
+
+    The host-owned registry verifier must verify its executing source and
+    dependency closure. This handle never promotes provider claims into proof.
+    """
+
+    def __init__(self, registry: ExtensionRegistry, configured: ConfiguredExtension) -> None:
+        self._registry = registry
+        self._configured = configured
+        descriptor, _provider, _instance, _evaluator = registry._bound(configured)
+        if descriptor["category"] != "native_handler":
+            raise EffectError("host_capability_mismatch")
+        self._reference = copy.deepcopy(descriptor["provider_reference"])
+        self._configuration = copy.deepcopy(configured._configuration)
+        destination = self._configuration.get("destination_binding_digest")
+        if type(destination) is not str or not re.fullmatch(r"sha256:[0-9a-f]{64}", destination):
+            raise EffectError("host_capability_mismatch")
+
+    def verify(self, reference: Mapping[str, Any], destination: str) -> tuple[Any, Any]:
+        from .runtime_providers import _bound_provider_method
+
+        try:
+            descriptor, provider, instance, _evaluator = self._registry._bound(self._configured)
+            if (
+                descriptor["category"] != "native_handler"
+                or descriptor["provider_reference"] != self._reference
+                or reference != self._reference
+                or self._configured._configuration != self._configuration
+                or destination != self._configuration["destination_binding_digest"]
+                or not isinstance(instance, Mapping)
+                or instance.get("destination_binding_digest") != destination
+                or self._registry.health(self._configured) != "healthy"
+            ):
+                raise EffectError("host_capability_mismatch")
+            return _bound_provider_method(provider, "invoke"), instance
+        except (ExtensionError, ValueError, TypeError, KeyError) as error:
+            raise EffectError("host_capability_mismatch") from error
+
+    def invoke(
+        self,
+        reference: Mapping[str, Any],
+        payload: Any,
+        metadata: Mapping[str, Any],
+        attempt: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        method, instance = self.verify(reference, metadata["destination_binding_digest"])
+        return cast(Mapping[str, Any], method(instance, payload, metadata, attempt))
+
+
 class SQLiteCommittedEffectHost:
     """One local host with checkpoint, journal, claims and responses in one SQLite row.
 
@@ -470,7 +521,7 @@ class SQLiteCommittedEffectHost:
         path: str | Path,
         resolver: ArtifactResolver,
         route: Mapping[str, Any],
-        handler: Callable[..., Mapping[str, Any]],
+        handler: VerifiedNativeHandler | Callable[..., Mapping[str, Any]],
         *,
         authority_scope: str | None = None,
         core_observer: Callable[[str, str, Mapping[str, Any]], None] | None = None,
@@ -480,9 +531,21 @@ class SQLiteCommittedEffectHost:
         self.resolver = resolver
         self.route = copy.deepcopy(dict(route))
         self.handler = handler
+        self._installed_handler = handler
         self.authority_scope = authority_scope
         self.core_observer = core_observer
         self.trusted_clock = trusted_clock
+
+    def _verified_handler(
+        self, reference: Mapping[str, Any], destination: str
+    ) -> VerifiedNativeHandler:
+        if (
+            type(self.handler) is not VerifiedNativeHandler
+            or self.handler is not self._installed_handler
+        ):
+            raise EffectError("host_capability_mismatch")
+        self.handler.verify(reference, destination)
+        return self.handler
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, isolation_level=None, timeout=30)
@@ -806,6 +869,9 @@ class SQLiteCommittedEffectHost:
                 return reconstructed
             if route_generation != self.route["generation"]:
                 raise EffectError("scope_generation_conflict")
+            self._verified_handler(
+                self.route["handler_reference"], self.route["destination_binding_digest"]
+            )
             if after_route_resolved is not None:
                 after_route_resolved(self.route)
             checkpoint, journal = document["checkpoint"], document["journal"]
@@ -880,6 +946,9 @@ class SQLiteCommittedEffectHost:
                 before_commit(candidate, journal)
             if route_generation != self.route["generation"]:
                 raise EffectError("scope_generation_conflict")
+            self._verified_handler(
+                self.route["handler_reference"], self.route["destination_binding_digest"]
+            )
             return response
 
         return self._transact(
@@ -1050,7 +1119,11 @@ class SQLiteCommittedEffectHost:
                 "destination_binding_digest": record["destination_binding_digest"],
                 "credential": credential,
             }
-            result = self.handler(
+            handler = self._verified_handler(
+                record["handler_reference"], record["destination_binding_digest"]
+            )
+            result = handler.invoke(
+                record["handler_reference"],
                 copy.deepcopy(intent["payload"]),
                 metadata,
                 {"attempt_fence": record["attempt_fence"]},
