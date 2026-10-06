@@ -1580,6 +1580,43 @@ def test_retryable_report_requires_native_original_invocation_proof(tmp_path, da
         }
 
 
+@pytest.mark.parametrize("operation", ["report", "claim"])
+@pytest.mark.parametrize("receipt_type", [bytes, bytearray])
+def test_nonstring_native_receipts_refuse_before_checker_or_mutation(
+    tmp_path, operation, receipt_type
+):
+    host, root, request, context = host_fixture(tmp_path)
+    if operation == "claim":
+        host = SQLiteCommittedEffectHost(
+            tmp_path / "nonstring-claim.sqlite", host.resolver, {}, None, trusted_clock=lambda: "0"
+        )
+        host.setup_schema()
+        host.seed(read("pending-checkpoint.json"), read("data/ambiguous-journal.json"))
+    host, proof, checks = installed_retry_handler(host, root)
+    for field in ("first_attempt_receipt_bytes_base64", "repeat_attempt_receipt_bytes_base64"):
+        proof[field] = receipt_type(proof[field].encode("ascii"))
+    before = host.snapshot(root)
+    if operation == "report":
+        report = {**request, "outcome_kind": "retryable_failure", "payload": ["map", []]}
+        assert (
+            host.submit_result(root, report, **context, deduplication_evidence=proof)["error_code"]
+            == "host_capability_mismatch"
+        )
+    else:
+        with pytest.raises(EffectError, match="host_capability_mismatch"):
+            host.claim(
+                root,
+                request["effect_id"],
+                "worker",
+                context["epoch"],
+                expires_at="10",
+                trusted_now="0",
+                deduplication_evidence=proof,
+            )
+    assert checks == []
+    assert host.snapshot(root) == before
+
+
 def test_safe_report_replay_and_later_claim_never_reuse_old_verification(tmp_path):
     host, root, request, context = host_fixture(tmp_path)
     host, proof, checks = installed_retry_handler(host, root)

@@ -1064,6 +1064,8 @@ class SQLiteCommittedEffectHost:
         proof = copy.deepcopy(dict(evidence))
         if any(proof[key] != value for key, value in context.items()):
             raise EffectError("host_capability_mismatch")
+        if any(type(proof[field]) is not str for field in receipt_fields):
+            raise EffectError("host_capability_mismatch")
         try:
             first = base64.b64decode(proof["first_attempt_receipt_bytes_base64"], validate=True)
             repeated = base64.b64decode(proof["repeat_attempt_receipt_bytes_base64"], validate=True)
