@@ -1430,6 +1430,94 @@ def test_ambiguous_retry_does_not_accept_legacy_boolean_keyword(tmp_path):
         )
 
 
+@pytest.mark.parametrize("damage", [None, "unavailable", "method", "configuration", "instance"])
+def test_retry_verifier_is_rechecked_after_native_sql_staging(tmp_path, monkeypatch, damage):
+    import base64
+    import sqlite3
+
+    original, root, request, _ = host_fixture(tmp_path)
+    journal = read("data/ambiguous-journal.json")
+    host = SQLiteCommittedEffectHost(tmp_path / "retry-staging.sqlite", original.resolver, {}, None)
+    host.setup_schema()
+    host.seed(read("pending-checkpoint.json"), journal)
+    record = journal["effect_records"][0]
+    host.route.update(
+        {key: record[key] for key in ("handler_reference", "destination_binding_digest")}
+    )
+    receipt = b"independently stored destination receipt"
+    native_path = tmp_path / "retry-destination.sqlite"
+    with sqlite3.connect(native_path) as connection:
+        connection.execute("CREATE TABLE receipts (receipt BLOB NOT NULL)")
+        connection.execute("INSERT INTO receipts VALUES (?)", (receipt,))
+    state = {"staged": False, "checks": 0}
+
+    def verify_receipts(evidence):
+        state["checks"] += 1
+        if state["staged"] and damage == "unavailable":
+            raise RuntimeError("native verifier unavailable after staging")
+        with sqlite3.connect(native_path) as connection:
+            stored = connection.execute("SELECT receipt FROM receipts").fetchone()[0]
+        return all(
+            base64.b64decode(evidence[name], validate=True) == stored
+            for name in (
+                "first_attempt_receipt_bytes_base64",
+                "repeat_attempt_receipt_bytes_base64",
+            )
+        )
+
+    host = installed_test_handler(host, lambda *_: {}, verify_receipts)
+    encoded = base64.b64encode(receipt).decode()
+    proof = {
+        "scope_identity": journal["scope_identity"],
+        "effect_id": record["effect_id"],
+        "destination_binding_digest": record["destination_binding_digest"],
+        "first_attempt_receipt_bytes_base64": encoded,
+        "repeat_attempt_receipt_bytes_base64": encoded,
+    }
+    before = host.snapshot(root)
+
+    class StagingConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            cursor = super().execute(sql, parameters)
+            if sql.startswith("UPDATE determa_committed_effects SET document"):
+                # Observe the actual uncommitted row after SQLite has written it.
+                staged = json.loads(
+                    super()
+                    .execute(
+                        "SELECT document FROM determa_committed_effects WHERE root_instance_id=?",
+                        (root,),
+                    )
+                    .fetchone()[0]
+                )
+                assert staged["claims"][request["effect_id"]]["attempt_fence"] == "2"
+                state["staged"] = True
+                if damage == "method":
+                    monkeypatch.setattr(
+                        NativeTestProvider, "verify_deduplication_evidence", lambda *_: True
+                    )
+                elif damage == "configuration":
+                    host.handler._configured._configuration["instance_id"] = "substituted"
+                elif damage == "instance":
+                    object.__setattr__(host.handler._configured, "_instance", {})
+            return cursor
+
+    monkeypatch.setattr(
+        host,
+        "_connect",
+        lambda: sqlite3.connect(host.path, isolation_level=None, factory=StagingConnection),
+    )
+    arguments = {"expires_at": "10", "trusted_now": "0", "deduplication_evidence": proof}
+    if damage is None:
+        claim = host.claim(root, request["effect_id"], "worker", "0", **arguments)
+        assert claim["attempt_fence"] == "2"
+        assert state["staged"] and state["checks"] >= 2
+    else:
+        with pytest.raises(EffectError, match="host_capability_mismatch"):
+            host.claim(root, request["effect_id"], "worker", "0", **arguments)
+        assert state["staged"]
+        assert host.snapshot(root) == before
+
+
 def test_historical_admission_survives_actual_root_completion_and_tombstone(tmp_path):
     import yaml
 

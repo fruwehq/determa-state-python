@@ -1277,6 +1277,7 @@ class SQLiteCommittedEffectHost:
         expected_epoch: str | None = None,
         authority_mutation: Callable[[dict[str, Any], dict[str, Any]], None] | None = None,
         worker_guard: tuple[str, str, str | None, str] | None = None,
+        before_native_commit: Callable[[], None] | None = None,
     ) -> _T:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1385,6 +1386,8 @@ class SQLiteCommittedEffectHost:
                     "UPDATE determa_committed_effects SET document = ? WHERE root_instance_id = ?",
                     (canonical_bytes(document), root),
                 )
+            if before_native_commit is not None:
+                before_native_commit()
             if expiry_guard is not None:
                 # Keep the original deadline even when this transaction closes
                 # or revokes the claim. Worker rights must still hold at commit.
@@ -1548,7 +1551,19 @@ class SQLiteCommittedEffectHost:
         trusted_now: str,
         deduplication_evidence: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        final_proof: tuple[dict[str, Any], str, dict[str, Any]] | None = None
+
+        def verify_before_commit() -> None:
+            if final_proof is None:
+                return
+            reference, destination, proof = final_proof
+            handler = self._verified_handler(reference, destination)
+            VerifiedNativeHandler.verify_deduplication_evidence(
+                handler, reference, destination, proof
+            )
+
         def change(document: dict[str, Any]) -> dict[str, Any]:
+            nonlocal final_proof
             record = _record(document["journal"], effect_id)
             proof = None
             if deduplication_evidence is not None:
@@ -1589,6 +1604,11 @@ class SQLiteCommittedEffectHost:
                     record["destination_binding_digest"],
                     proof,
                 )
+                final_proof = (
+                    copy.deepcopy(record["handler_reference"]),
+                    record["destination_binding_digest"],
+                    copy.deepcopy(proof),
+                )
             claim = _issue_effect_claim(
                 document,
                 effect_id,
@@ -1611,7 +1631,11 @@ class SQLiteCommittedEffectHost:
             return claim
 
         return self._transact(
-            root, change, expected_epoch=epoch, authority_mutation=self._mirror_authority
+            root,
+            change,
+            expected_epoch=epoch,
+            authority_mutation=self._mirror_authority,
+            before_native_commit=verify_before_commit,
         )
 
     def terminalize_outbox(
