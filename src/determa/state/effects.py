@@ -27,6 +27,7 @@ from .checkpoint_v1 import (
 from .errors import ArtifactError
 from .extensions import ConfiguredExtension, ExtensionError, ExtensionRegistry
 from .host import outbox_intent_digest
+from .native_clock import NativeCommitClock, _read_native_clock
 from .wire import (
     ArtifactResolver,
     _schema_registry,
@@ -1028,6 +1029,7 @@ class SQLiteCommittedEffectHost:
         authority_scope: str | None = None,
         core_observer: Callable[[str, str, Mapping[str, Any]], None] | None = None,
         trusted_clock: Callable[[], str] | None = None,
+        commit_clock: NativeCommitClock | None = None,
     ) -> None:
         if handler is not None and type(handler) is not VerifiedNativeHandler:
             raise EffectError("host_capability_mismatch")
@@ -1039,6 +1041,32 @@ class SQLiteCommittedEffectHost:
         self.authority_scope = authority_scope
         self.core_observer = core_observer
         self.trusted_clock = trusted_clock
+        if commit_clock is not None and type(commit_clock) is not NativeCommitClock:
+            raise EffectError("host_capability_mismatch")
+        self.commit_clock = commit_clock
+        self._installed_commit_clock = commit_clock
+
+    def _retry_commit_clock(self) -> tuple[NativeCommitClock, int]:
+        clock = self.commit_clock
+        if type(clock) is not NativeCommitClock or clock is not self._installed_commit_clock:
+            raise EffectError("host_capability_mismatch")
+        try:
+            return clock, _read_native_clock(clock)
+        except ValueError as exc:
+            raise EffectError("stale_attempt_fence") from exc
+
+    def _check_retry_commit_clock(
+        self, guard: tuple[NativeCommitClock, int], deadline: int
+    ) -> None:
+        clock, start = guard
+        if clock is not self.commit_clock or clock is not self._installed_commit_clock:
+            raise EffectError("host_capability_mismatch")
+        try:
+            now = _read_native_clock(clock)
+        except ValueError as exc:
+            raise EffectError("stale_attempt_fence") from exc
+        if now < start or now >= deadline:
+            raise EffectError("stale_attempt_fence")
 
     def _verified_handler(
         self, reference: Mapping[str, Any], destination: str
@@ -1447,12 +1475,11 @@ class SQLiteCommittedEffectHost:
                     "UPDATE determa_committed_effects SET document = ? WHERE root_instance_id = ?",
                     (canonical_bytes(document), root),
                 )
+            if expiry_guard is not None:
+                # Arbitrary legacy clock callbacks run before native proof.
+                self._check_live_clock(*expiry_guard)
             if before_native_commit is not None:
                 before_native_commit()
-            if expiry_guard is not None:
-                # Keep the original deadline even when this transaction closes
-                # or revokes the claim. Worker rights must still hold at commit.
-                self._check_live_clock(*expiry_guard)
             connection.commit()
             return value
 
@@ -1613,21 +1640,27 @@ class SQLiteCommittedEffectHost:
         deduplication_evidence: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         final_proof: tuple[dict[str, Any], dict[str, Any]] | None = None
+        clock_guard: tuple[NativeCommitClock, int] | None = None
 
         def verify_before_commit() -> None:
-            if final_proof is not None:
-                context, proof = final_proof
-                SQLiteCommittedEffectHost._verify_retry_evidence(self, context, proof)
             if self.trusted_clock is None:
                 raise EffectError("stale_attempt_fence")
             self._check_live_clock(self.trusted_clock, _now(expires_at))
+            if final_proof is not None:
+                context, proof = final_proof
+                SQLiteCommittedEffectHost._verify_retry_evidence(self, context, proof)
+                assert clock_guard is not None
+                SQLiteCommittedEffectHost._check_retry_commit_clock(
+                    self, clock_guard, _now(expires_at)
+                )
 
         def change(document: dict[str, Any]) -> dict[str, Any]:
-            nonlocal final_proof
+            nonlocal final_proof, clock_guard
             record = _record(document["journal"], effect_id)
             proof = None
             if record["attempt_fence"] != "0" or deduplication_evidence is not None:
                 context = SQLiteCommittedEffectHost._retry_context(document, record)
+                clock_guard = SQLiteCommittedEffectHost._retry_commit_clock(self)
                 proof = SQLiteCommittedEffectHost._verify_retry_evidence(
                     self, context, deduplication_evidence
                 )
@@ -1980,9 +2013,11 @@ class SQLiteCommittedEffectHost:
         if saved is not None:
             return saved
         final_proof: tuple[dict[str, Any], dict[str, Any]] | None = None
+        clock_guard: tuple[NativeCommitClock, int] | None = None
+        deadline: int | None = None
 
         def change(document: dict[str, Any]) -> dict[str, Any]:
-            nonlocal final_proof
+            nonlocal final_proof, clock_guard, deadline
             key = request["effect_id"] + ":" + request["attempt_fence"]
             fresh_retry = (
                 request["outcome_kind"] == "retryable_failure"
@@ -2001,6 +2036,8 @@ class SQLiteCommittedEffectHost:
                     trusted_now,
                 )
                 context = SQLiteCommittedEffectHost._retry_context(document, record)
+                clock_guard = SQLiteCommittedEffectHost._retry_commit_clock(self)
+                deadline = _now(document["claims"][request["effect_id"]]["expires_at"])
                 proof = SQLiteCommittedEffectHost._verify_retry_evidence(
                     self, context, deduplication_evidence
                 )
@@ -2036,6 +2073,8 @@ class SQLiteCommittedEffectHost:
         def verify_before_commit() -> None:
             if final_proof is not None:
                 SQLiteCommittedEffectHost._verify_retry_evidence(self, *final_proof)
+                assert clock_guard is not None and deadline is not None
+                SQLiteCommittedEffectHost._check_retry_commit_clock(self, clock_guard, deadline)
 
         return self._transact(
             root,

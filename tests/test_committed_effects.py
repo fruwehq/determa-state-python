@@ -13,6 +13,7 @@ from determa.state.effects import (
     seal_journal,
     validate_journal,
 )
+from determa.state.native_clock import NativeCommitClock
 
 CASE = conformance_root() / "conformance/profiles/committed-native-effects/effect-01-result"
 
@@ -98,6 +99,13 @@ def installed_test_handler(host, callback, proof_verifier=None):
         handler,
         authority_scope=host.authority_scope,
         trusted_clock=host.trusted_clock,
+        commit_clock=(
+            host.commit_clock
+            if host.commit_clock is not None
+            else NativeCommitClock.controlled(int(host.trusted_clock()))
+            if host.trusted_clock is not None
+            else None
+        ),
     )
 
 
@@ -1702,7 +1710,24 @@ def test_authority_noninitial_native_claim_cannot_bypass_retry_verifier(tmp_path
     assert len(checks) == 2
 
 
-@pytest.mark.parametrize("damage", [None, "unavailable", "method", "configuration", "instance"])
+@pytest.mark.parametrize(
+    "damage",
+    [
+        None,
+        "unavailable",
+        "method",
+        "configuration",
+        "instance",
+        "clock_verifier",
+        "clock_method",
+        "clock_configuration",
+        "clock_instance",
+        "proof_expiry",
+        "proof_clock_unavailable",
+        "proof_clock_regression",
+        "proof_clock_replaced",
+    ],
+)
 @pytest.mark.parametrize("operation", ["claim", "report"])
 def test_retry_verifier_is_rechecked_after_native_sql_staging(
     tmp_path, monkeypatch, damage, operation
@@ -1732,9 +1757,21 @@ def test_retry_verifier_is_rechecked_after_native_sql_staging(
         connection.execute("CREATE TABLE receipts (receipt BLOB NOT NULL)")
         connection.execute("INSERT INTO receipts VALUES (?)", (receipt,))
     state = {"staged": False, "checks": 0}
+    lease_deadline = (
+        10 if operation == "claim" else int(read("data/active-claim.json")["expires_at"])
+    )
 
     def verify_receipts(evidence):
         state["checks"] += 1
+        if state["staged"]:
+            if damage == "proof_expiry":
+                host.commit_clock.set_native_sample(lease_deadline)
+            elif damage == "proof_clock_unavailable":
+                host.commit_clock.set_native_sample(0, unavailable=True)
+            elif damage == "proof_clock_regression":
+                host.commit_clock.set_native_sample(-1)
+            elif damage == "proof_clock_replaced":
+                host.commit_clock = NativeCommitClock.controlled(0)
         if state["staged"] and damage == "unavailable":
             raise RuntimeError("native verifier unavailable after staging")
         with sqlite3.connect(native_path) as connection:
@@ -1747,6 +1784,21 @@ def test_retry_verifier_is_rechecked_after_native_sql_staging(
             )
         )
 
+    def trusted_now():
+        if state["staged"]:
+            if damage == "clock_verifier":
+                host.handler._configured._provider.proof_verifier = None
+            elif damage == "clock_method":
+                monkeypatch.setattr(
+                    NativeTestProvider, "verify_deduplication_evidence", lambda *_: True
+                )
+            elif damage == "clock_configuration":
+                host.handler._configured._configuration["instance_id"] = "clock-substituted"
+            elif damage == "clock_instance":
+                object.__setattr__(host.handler._configured, "_instance", {})
+        return "0"
+
+    host.trusted_clock = trusted_now
     host = installed_test_handler(host, lambda *_: {}, verify_receipts)
     encoded = base64.b64encode(receipt).decode()
     proof = {
@@ -1817,7 +1869,12 @@ def test_retry_verifier_is_rechecked_after_native_sql_staging(
         assert response["attempt_fence"] == ("2" if operation == "claim" else "1")
         assert state["staged"] and state["checks"] >= 2
     else:
-        with pytest.raises(EffectError, match="host_capability_mismatch"):
+        code = (
+            "stale_attempt_fence"
+            if damage in {"proof_expiry", "proof_clock_unavailable", "proof_clock_regression"}
+            else "host_capability_mismatch"
+        )
+        with pytest.raises(EffectError, match=code):
             execute()
         assert state["staged"]
         assert host.snapshot(root) == before
@@ -2523,3 +2580,45 @@ def test_private_dispatch_start_loss_cannot_be_blessed_by_dispatch_or_authority(
     assert json.loads(authority.perform(command, invocation))["claim"] == claim
     assert json.loads(authority.perform(fresh_command, fresh_invocation))["status"] == "rejected"
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("operation", ["claim", "report"])
+def test_fresh_retry_refuses_a_callback_clock_without_a_sealed_native_reader(tmp_path, operation):
+    original, root, request, context = host_fixture(tmp_path)
+    if operation == "claim":
+        host = SQLiteCommittedEffectHost(
+            tmp_path / "callback-clock.sqlite",
+            original.resolver,
+            {},
+            None,
+            trusted_clock=lambda: "0",
+        )
+        host.setup_schema()
+        host.seed(read("pending-checkpoint.json"), read("data/ambiguous-journal.json"))
+    else:
+        host = original
+    host, proof, checks = installed_retry_handler(host, root)
+    host.commit_clock = None
+    before = host.snapshot(root)
+    if operation == "claim":
+        with pytest.raises(EffectError, match="host_capability_mismatch"):
+            host.claim(
+                root,
+                request["effect_id"],
+                "worker",
+                "0",
+                expires_at="10",
+                trusted_now="0",
+                deduplication_evidence=proof,
+            )
+    else:
+        result = host.submit_result(
+            root,
+            {**request, "outcome_kind": "retryable_failure", "payload": ["map", []]},
+            **context,
+            deduplication_evidence=proof,
+        )
+        assert result["status"] == "rejected"
+        assert result["error_code"] == "host_capability_mismatch"
+    assert checks == []
+    assert host.snapshot(root) == before

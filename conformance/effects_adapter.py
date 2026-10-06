@@ -546,6 +546,8 @@ def _run_operation(payload: dict[str, Any], control: Path | None = None) -> dict
         },
     )
     installed_handler = VerifiedNativeHandler(handler_registry, configured_handler)
+    from determa.state.native_clock import NativeCommitClock
+
     host = SQLiteCommittedEffectHost(
         _PATH,
         resolver,
@@ -554,6 +556,7 @@ def _run_operation(payload: dict[str, Any], control: Path | None = None) -> dict
         authority_scope=_AUTHORITY_SCOPE,
         core_observer=observe_core,
         trusted_clock=lambda: payload["auth_context"]["trusted_host_now"],
+        commit_clock=NativeCommitClock.controlled(int(payload["auth_context"]["trusted_host_now"])),
     )
     # Install the vector's pre-existing authority facts as trusted test setup.
     # The production seed path may restore these claims, but cannot issue them.
