@@ -1420,8 +1420,12 @@ class AuthoritySQLiteExecutionStore(SQLiteExecutionStore):
             if root_instance_id not in ledger["roots"]:
                 raise ExecutionStoreError("unauthorized_scope")
             try:
+                from .effects import _native_effect_documents
+
                 native_history = _native_checkpoint_history(ledger)
-            except ValueError as error:
+                native_effect_roots = set(_native_effect_documents(ledger))
+                _native_checkpoints(connection, ledger)
+            except (ValueError, TypeError, KeyError, sqlite3.Error) as error:
                 raise ExecutionStoreError("scope_fence_unproven") from error
             transaction = _SQLiteTransaction(connection, root_instance_id)
             previous = transaction.load()
@@ -1430,6 +1434,10 @@ class AuthoritySQLiteExecutionStore(SQLiteExecutionStore):
             yield transaction
             current = transaction.load()
             if current != previous:
+                # A native effects participant owns its checkpoint and journal
+                # together. Ordinary checkpoint-only writers cannot advance it.
+                if root_instance_id in native_effect_roots:
+                    raise ExecutionStoreError("scope_fence_unproven")
                 if current is None:
                     raise ExecutionStoreError("invalid_execution_checkpoint")
                 _, revision, digest = checkpoint_metadata(current)
