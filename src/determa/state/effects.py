@@ -82,12 +82,21 @@ def _journal_validator() -> Any:
 
 def _validate_request(request: Mapping[str, Any], name: str) -> dict[str, Any]:
     from jsonschema import Draft202012Validator
+    from referencing import Resource
 
     if not isinstance(request, Mapping):
         raise EffectError("invalid_host_request")
     normalized = copy.deepcopy(dict(request))
     source = json.loads((Path(__file__).parent / "data" / name).read_text())
-    if not Draft202012Validator(source, registry=_schema_registry()).is_valid(normalized):
+    registry = _schema_registry()
+    for filename in (
+        "host-effect-journal-v1.schema.json",
+        "provider-reference-v1.schema.json",
+        name,
+    ):
+        schema = json.loads((Path(__file__).parent / "data" / filename).read_text())
+        registry = registry.with_resource(schema["$id"], Resource.from_contents(schema))
+    if not Draft202012Validator(source, registry=registry).is_valid(normalized):
         raise EffectError("invalid_host_request")
     return normalized
 
@@ -518,7 +527,7 @@ def _rejected_result(effect_id: str, fence: str, code: str) -> dict[str, Any]:
 def _report_reason(request: Mapping[str, Any]) -> str | None:
     kind = request["outcome_kind"]
     if kind == "retryable_failure":
-        return "no_call_proven"
+        return "destination_deduplication_proven"
     if kind == "ambiguous":
         return "provider_acceptance_unknown"
     return None
@@ -529,22 +538,24 @@ def _retained_report(
 ) -> dict[str, Any] | None:
     """Compare complete immutable report evidence even after a process restart."""
     fence, kind = request["attempt_fence"], request["outcome_kind"]
-    digest = hash_value(
-        [
-            "determa-effect-attempt-report-1",
-            record["effect_id"],
-            record["operation_token"],
-            fence,
-            kind,
-            request["payload"],
-            _report_reason(request),
-        ]
-    )
     return next(
         (
             item
             for item in record["attempt_records"]
-            if item["attempt_fence"] == fence and item["report_digest"] == digest
+            if item["attempt_fence"] == fence
+            and item["report_kind"] == kind
+            and item["report_digest"]
+            == hash_value(
+                [
+                    "determa-effect-attempt-report-1",
+                    record["effect_id"],
+                    record["operation_token"],
+                    fence,
+                    kind,
+                    request["payload"],
+                    item["reason"],
+                ]
+            )
         ),
         None,
     )
@@ -876,7 +887,7 @@ def _issue_effect_claim(
     record = _record(journal, effect_id)
     if record["invocation_state"] not in {"unclaimed", "ambiguous"}:
         raise EffectError("effect_not_outstanding")
-    if record["invocation_state"] == "ambiguous" and not (
+    if record["attempt_fence"] != "0" and not (
         deduplication_proven and record["idempotency_policy"] == "destination_deduplicates"
     ):
         raise EffectError("effect_not_outstanding")
@@ -1039,6 +1050,54 @@ class SQLiteCommittedEffectHost:
             raise EffectError("host_capability_mismatch")
         VerifiedNativeHandler.verify(self.handler, reference, destination)
         return self.handler
+
+    def _verify_retry_evidence(
+        self, context: Mapping[str, Any], evidence: Mapping[str, Any] | None
+    ) -> dict[str, Any]:
+        """Bind a native receipt decision to the original committed invocation."""
+        receipt_fields = {
+            "first_attempt_receipt_bytes_base64",
+            "repeat_attempt_receipt_bytes_base64",
+        }
+        if not isinstance(evidence, Mapping) or set(evidence) != set(context) | receipt_fields:
+            raise EffectError("host_capability_mismatch")
+        proof = copy.deepcopy(dict(evidence))
+        if any(proof[key] != value for key, value in context.items()):
+            raise EffectError("host_capability_mismatch")
+        try:
+            first = base64.b64decode(proof["first_attempt_receipt_bytes_base64"], validate=True)
+            repeated = base64.b64decode(proof["repeat_attempt_receipt_bytes_base64"], validate=True)
+            if not first or first != repeated:
+                raise ValueError("destination receipts differ")
+        except (ValueError, TypeError) as exc:
+            raise EffectError("host_capability_mismatch") from exc
+        handler = SQLiteCommittedEffectHost._verified_handler(
+            self, context["handler_reference"], context["destination_binding_digest"]
+        )
+        VerifiedNativeHandler.verify_deduplication_evidence(
+            handler, context["handler_reference"], context["destination_binding_digest"], proof
+        )
+        return proof
+
+    @staticmethod
+    def _retry_context(document: Mapping[str, Any], record: Mapping[str, Any]) -> dict[str, Any]:
+        if record["idempotency_policy"] != "destination_deduplicates":
+            raise EffectError("host_capability_mismatch")
+        return {
+            "kind": "destination_deduplication",
+            "scope_identity": document["journal"]["scope_identity"],
+            "root_instance_id": document["journal"]["root_instance_id"],
+            **{
+                key: copy.deepcopy(record[key])
+                for key in (
+                    "effect_id",
+                    "operation_token",
+                    "attempt_fence",
+                    "handler_reference",
+                    "destination_binding_digest",
+                )
+            },
+        }
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, isolation_level=None, timeout=30)
@@ -1551,64 +1610,26 @@ class SQLiteCommittedEffectHost:
         trusted_now: str,
         deduplication_evidence: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        final_proof: tuple[dict[str, Any], str, dict[str, Any]] | None = None
+        final_proof: tuple[dict[str, Any], dict[str, Any]] | None = None
 
         def verify_before_commit() -> None:
-            if final_proof is None:
-                return
-            reference, destination, proof = final_proof
-            handler = self._verified_handler(reference, destination)
-            VerifiedNativeHandler.verify_deduplication_evidence(
-                handler, reference, destination, proof
-            )
+            if final_proof is not None:
+                context, proof = final_proof
+                SQLiteCommittedEffectHost._verify_retry_evidence(self, context, proof)
+            if self.trusted_clock is None:
+                raise EffectError("stale_attempt_fence")
+            self._check_live_clock(self.trusted_clock, _now(expires_at))
 
         def change(document: dict[str, Any]) -> dict[str, Any]:
             nonlocal final_proof
             record = _record(document["journal"], effect_id)
             proof = None
-            if deduplication_evidence is not None:
-                if not isinstance(deduplication_evidence, Mapping):
-                    raise EffectError("host_capability_mismatch")
-                proof = copy.deepcopy(dict(deduplication_evidence))
-                fields = {
-                    "scope_identity",
-                    "effect_id",
-                    "destination_binding_digest",
-                    "first_attempt_receipt_bytes_base64",
-                    "repeat_attempt_receipt_bytes_base64",
-                }
-                if (
-                    set(proof) != fields
-                    or proof["scope_identity"] != document["journal"]["scope_identity"]
-                    or proof["effect_id"] != effect_id
-                    or proof["destination_binding_digest"] != record["destination_binding_digest"]
-                ):
-                    raise EffectError("host_capability_mismatch")
-                try:
-                    first = base64.b64decode(
-                        proof["first_attempt_receipt_bytes_base64"], validate=True
-                    )
-                    repeated = base64.b64decode(
-                        proof["repeat_attempt_receipt_bytes_base64"], validate=True
-                    )
-                    if not first or first != repeated:
-                        raise ValueError("destination receipts differ")
-                except (ValueError, TypeError) as exc:
-                    raise EffectError("host_capability_mismatch") from exc
-                handler = self._verified_handler(
-                    record["handler_reference"], record["destination_binding_digest"]
+            if record["attempt_fence"] != "0" or deduplication_evidence is not None:
+                context = SQLiteCommittedEffectHost._retry_context(document, record)
+                proof = SQLiteCommittedEffectHost._verify_retry_evidence(
+                    self, context, deduplication_evidence
                 )
-                VerifiedNativeHandler.verify_deduplication_evidence(
-                    handler,
-                    record["handler_reference"],
-                    record["destination_binding_digest"],
-                    proof,
-                )
-                final_proof = (
-                    copy.deepcopy(record["handler_reference"]),
-                    record["destination_binding_digest"],
-                    copy.deepcopy(proof),
-                )
+                final_proof = (context, proof)
             claim = _issue_effect_claim(
                 document,
                 effect_id,
@@ -1621,6 +1642,7 @@ class SQLiteCommittedEffectHost:
             if proof is not None:
                 document.setdefault("destination_evidence", {}).setdefault(effect_id, []).append(
                     {
+                        "decision": "claim",
                         "root_instance_id": root,
                         "operation_token": record["operation_token"],
                         "handler_reference": copy.deepcopy(record["handler_reference"]),
@@ -1893,6 +1915,7 @@ class SQLiteCommittedEffectHost:
         scope: str,
         epoch: str,
         trusted_now: str,
+        deduplication_evidence: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if (
             not isinstance(request, Mapping)
@@ -1912,7 +1935,10 @@ class SQLiteCommittedEffectHost:
                 scope=scope,
                 epoch=epoch,
                 trusted_now=trusted_now,
+                deduplication_evidence=deduplication_evidence,
             )
+            if response["status"] == "committed":
+                return response
             if request["outcome_kind"] in _OUTCOMES:
                 # The authenticated outcome is already durable. Admission is a
                 # separate host-owned transaction; its failure cannot erase it.
@@ -1945,15 +1971,144 @@ class SQLiteCommittedEffectHost:
         scope: str,
         epoch: str,
         trusted_now: str,
+        deduplication_evidence: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Private durable-outcome stage; never a completed public result."""
+        saved = self._saved_result_response(root, request, principal, scope, epoch)
+        if saved is not None:
+            return saved
+        final_proof: tuple[dict[str, Any], dict[str, Any]] | None = None
+
+        def change(document: dict[str, Any]) -> dict[str, Any]:
+            nonlocal final_proof
+            key = request["effect_id"] + ":" + request["attempt_fence"]
+            fresh_retry = (
+                request["outcome_kind"] == "retryable_failure"
+                and key not in document["result_requests"]
+            )
+            proof = None
+            if fresh_retry:
+                record = self._authorize(
+                    document,
+                    request["effect_id"],
+                    request["operation_token"],
+                    request["attempt_fence"],
+                    principal,
+                    scope,
+                    epoch,
+                    trusted_now,
+                )
+                context = SQLiteCommittedEffectHost._retry_context(document, record)
+                proof = SQLiteCommittedEffectHost._verify_retry_evidence(
+                    self, context, deduplication_evidence
+                )
+                final_proof = (context, proof)
+            response = self._submit(
+                document,
+                request,
+                principal,
+                scope,
+                epoch,
+                trusted_now,
+                retry_verified=proof is not None,
+            )
+            if proof is not None:
+                document["result_requests"][key] = copy.deepcopy(dict(request))
+                document.setdefault("result_responses", {})[key] = copy.deepcopy(response)
+                document.setdefault("result_disclosure", {})[key] = {
+                    "principal": principal,
+                    "scope": scope,
+                    "epoch": epoch,
+                }
+                document.setdefault("destination_evidence", {}).setdefault(
+                    request["effect_id"], []
+                ).append(
+                    {
+                        "decision": "report",
+                        "attempt_fence": request["attempt_fence"],
+                        "evidence": proof,
+                    }
+                )
+            return response
+
+        def verify_before_commit() -> None:
+            if final_proof is not None:
+                SQLiteCommittedEffectHost._verify_retry_evidence(self, *final_proof)
+
         return self._transact(
             root,
-            lambda document: self._submit(document, request, principal, scope, epoch, trusted_now),
+            change,
             expected_epoch=epoch,
             authority_mutation=self._mirror_authority,
             worker_guard=(request["effect_id"], principal, request["attempt_fence"], trusted_now),
+            before_native_commit=verify_before_commit,
         )
+
+    def _saved_result_response(
+        self, root: str, request: Mapping[str, Any], principal: str, scope: str, epoch: str
+    ) -> dict[str, Any] | None:
+        """Disclose retained native evidence without restoring today's executable.
+
+        This read never grants a lease, invokes a verifier, or changes a receipt.
+        A retained request conflict must not fall through to a fresh decision.
+        """
+        with self._connect() as connection:
+            connection.execute("BEGIN")
+            row = connection.execute(
+                "SELECT document FROM determa_committed_effects WHERE root_instance_id=?", (root,)
+            ).fetchone()
+            if row is None:
+                raise EffectError("wrong_root")
+            document = json.loads(row[0])
+            key = request["effect_id"] + ":" + request["attempt_fence"]
+            prior = document["result_requests"].get(key)
+            response = document.get("result_responses", {}).get(key)
+            if prior is None or response is None:
+                return None
+            if self.authority_scope is not None:
+                authority = connection.execute(
+                    "SELECT ledger FROM determa_scope_authority WHERE scope_identity=?",
+                    (self.authority_scope,),
+                ).fetchone()
+                if authority is None:
+                    raise EffectError("unauthorized_scope")
+                _validate_authority_pair(json.loads(authority[0]), document)
+            validate_journal(document["checkpoint"], document["journal"])
+            disclosure = document.get("result_disclosure", {}).get(key)
+            if disclosure is None:
+                self._authorize(
+                    document,
+                    request["effect_id"],
+                    request["operation_token"],
+                    request["attempt_fence"],
+                    principal,
+                    scope,
+                    epoch,
+                    "0",
+                    allow_replay=True,
+                )
+            elif disclosure != {"principal": principal, "scope": scope, "epoch": epoch}:
+                raise EffectError("unauthorized_scope")
+            if prior != dict(request):
+                raise EffectError("effect_result_conflict")
+            record = _record(document["journal"], request["effect_id"])
+            if _retained_report(record, request) is None:
+                raise EffectError("effect_result_conflict")
+            if request["outcome_kind"] == "retryable_failure" and not any(
+                entry.get("decision") == "report"
+                and entry.get("attempt_fence") == request["attempt_fence"]
+                and isinstance(entry.get("evidence"), dict)
+                and all(
+                    entry["evidence"].get(key) == value
+                    for key, value in {
+                        **self._retry_context(document, record),
+                        "attempt_fence": request["attempt_fence"],
+                    }.items()
+                )
+                for entry in document.get("destination_evidence", {}).get(request["effect_id"], [])
+            ):
+                raise EffectError("host_capability_mismatch")
+            return _validate_request(response, "effect-result-response-v1.schema.json")
 
     def _submit(
         self,
@@ -1963,6 +2118,8 @@ class SQLiteCommittedEffectHost:
         scope: str,
         epoch: str,
         trusted_now: str,
+        *,
+        retry_verified: bool = False,
     ) -> dict[str, Any]:
         journal, checkpoint = document["journal"], document["checkpoint"]
         effect_id, fence, kind = (
@@ -2010,6 +2167,8 @@ class SQLiteCommittedEffectHost:
             )
         if record["invocation_state"] != "leased":
             raise EffectError("effect_not_outstanding")
+        if kind == "retryable_failure" and not retry_verified:
+            raise EffectError("host_capability_mismatch")
         payload = copy.deepcopy(request["payload"])
         if kind in _OUTCOMES:
             self._result_delivery(checkpoint, record, kind, payload)
@@ -2032,6 +2191,11 @@ class SQLiteCommittedEffectHost:
         }
         record["attempt_records"].append(report)
         document["result_requests"][key] = copy.deepcopy(dict(request))
+        document.setdefault("result_disclosure", {})[key] = {
+            "principal": principal,
+            "scope": scope,
+            "epoch": epoch,
+        }
         if kind not in _OUTCOMES:
             record["invocation_state"] = "unclaimed" if kind == "retryable_failure" else "ambiguous"
             _bump(journal)

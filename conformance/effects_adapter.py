@@ -396,6 +396,7 @@ def _verified_fixture_handler(module: Any) -> bool:
 class _FixtureNativeProvider:
     def __init__(self, invocation: Any) -> None:
         self.invocation = invocation
+        self.retry_checker_available = True
 
     def validate_configuration(self, configuration: dict[str, Any]) -> dict[str, Any]:
         return copy.deepcopy(configuration)
@@ -410,9 +411,21 @@ class _FixtureNativeProvider:
         return self.invocation(payload, metadata, attempt)
 
     def verify_deduplication_evidence(self, instance: Any, evidence: Any) -> bool:
-        return instance["destination_binding_digest"] == _sha(
-            _destination_configuration()
-        ) and evidence == _destination_proof(evidence["scope_identity"], evidence["effect_id"])
+        return (
+            self.retry_checker_available
+            and instance["destination_binding_digest"] == _sha(_destination_configuration())
+            and {
+                key: evidence[key]
+                for key in (
+                    "scope_identity",
+                    "effect_id",
+                    "destination_binding_digest",
+                    "first_attempt_receipt_bytes_base64",
+                    "repeat_attempt_receipt_bytes_base64",
+                )
+            }
+            == _destination_proof(evidence["scope_identity"], evidence["effect_id"])
+        )
 
 
 def _run_operation(payload: dict[str, Any], control: Path | None = None) -> dict[str, Any]:
@@ -581,6 +594,43 @@ def _run_operation(payload: dict[str, Any], control: Path | None = None) -> dict
     fault = payload["fault"]
     response: dict[str, Any] | None = None
     caller_kind = "completed"
+    retry_evidence = None
+    original_record = next(
+        (
+            record
+            for record in journal["effect_records"]
+            if record["effect_id"] == arguments.get("effect_id")
+        ),
+        None,
+    )
+    retry_decision = (
+        operation == "submit_result" and arguments["outcome_kind"] == "retryable_failure"
+    ) or (
+        operation == "claim"
+        and original_record is not None
+        and original_record["attempt_fence"] != "0"
+    )
+    if retry_decision and configuration["destination_deduplication_proven"]:
+        _destination_call(_AUTHORITY_SCOPE, arguments["effect_id"], None)
+        _destination_call(_AUTHORITY_SCOPE, arguments["effect_id"], None)
+        retry_evidence = {
+            **SQLiteCommittedEffectHost._retry_context(before, original_record),
+            **_destination_proof(_AUTHORITY_SCOPE, arguments["effect_id"]),
+        }
+        if fault == "retry_safety_missing":
+            retry_evidence = None
+        elif fault == "retry_safety_boolean":
+            retry_evidence = True
+        elif fault == "retry_safety_fabricated":
+            retry_evidence["first_attempt_receipt_bytes_base64"] = retry_evidence[
+                "repeat_attempt_receipt_bytes_base64"
+            ] = base64.b64encode(b"fabricated equal receipts").decode()
+        elif fault == "retry_safety_wrong_work":
+            retry_evidence["effect_id"] = "sha256:" + "0" * 64
+        elif fault == "retry_safety_wrong_destination":
+            retry_evidence["destination_binding_digest"] = "sha256:" + "0" * 64
+        elif fault == "retry_safety_verifier_unavailable":
+            provider.retry_checker_available = False
     if operation in {"produce", "produce_replay"}:
         request = arguments["original_request"]
         aggregate = checkpoint["root_record"]["aggregate_state"]
@@ -641,17 +691,6 @@ def _run_operation(payload: dict[str, Any], control: Path | None = None) -> dict
             caller_kind = "aborted"
     elif operation == "claim":
         try:
-            evidence = None
-            if configuration["destination_deduplication_proven"] and any(
-                record["effect_id"] == arguments["effect_id"]
-                and record["invocation_state"] == "ambiguous"
-                for record in journal["effect_records"]
-            ):
-                # Exercise the actual installed destination twice. The configuration
-                # requests this probe; only native receipt verification permits retry.
-                _destination_call(_AUTHORITY_SCOPE, arguments["effect_id"], None)
-                _destination_call(_AUTHORITY_SCOPE, arguments["effect_id"], None)
-                evidence = _destination_proof(_AUTHORITY_SCOPE, arguments["effect_id"])
             claim = host.claim(
                 _ROOT,
                 arguments["effect_id"],
@@ -659,7 +698,7 @@ def _run_operation(payload: dict[str, Any], control: Path | None = None) -> dict
                 context["scope_authority_epoch"],
                 expires_at=str(int(context["trusted_host_now"]) + 1),
                 trusted_now=context["trusted_host_now"],
-                deduplication_evidence=evidence,
+                deduplication_evidence=retry_evidence,
             )
             new_claims.append(
                 {
@@ -704,6 +743,7 @@ def _run_operation(payload: dict[str, Any], control: Path | None = None) -> dict
             scope=context["scope_identity"],
             epoch=context["scope_authority_epoch"],
             trusted_now=context["trusted_host_now"],
+            deduplication_evidence=retry_evidence,
         )
         caller_kind = "response"
         if fault == "after_outcome_before_admission":
@@ -800,6 +840,18 @@ def _run_operation(payload: dict[str, Any], control: Path | None = None) -> dict
             "claim_guard_observed": operation in {"claim", "dispatch", "submit_result"},
             "native_transaction_id": str(uuid.uuid4()),
             "destination_call_evidence": destination_call_evidence,
+            "retry_safety_evidence": (
+                copy.deepcopy(after["destination_evidence"][arguments["effect_id"]][-1]["evidence"])
+                if retry_decision
+                and (
+                    operation == "claim"
+                    and new_claims
+                    or operation == "submit_result"
+                    and response is not None
+                    and response.get("status") == "report_recorded"
+                )
+                else None
+            ),
         },
     }
 

@@ -101,6 +101,67 @@ def installed_test_handler(host, callback, proof_verifier=None):
     )
 
 
+def installed_retry_handler(host, root):
+    """Authenticate scoped native receipt bytes independently of worker input."""
+    import base64
+    import sqlite3
+
+    saved = host.snapshot(root)
+    record = saved["journal"]["effect_records"][0]
+    context = SQLiteCommittedEffectHost._retry_context(saved, record)
+    host.route.update(
+        {key: record[key] for key in ("handler_reference", "destination_binding_digest")}
+    )
+    destination = host.path + ".destination"
+    receipt = json.dumps(
+        {key: value for key, value in context.items() if key != "attempt_fence"}, sort_keys=True
+    ).encode()
+    with sqlite3.connect(destination) as connection:
+        connection.execute("CREATE TABLE receipts (scope TEXT, effect TEXT, receipt BLOB)")
+        connection.execute(
+            "INSERT INTO receipts VALUES (?, ?, ?)",
+            (context["scope_identity"], record["effect_id"], receipt),
+        )
+    observations = []
+
+    def verify_receipts(evidence):
+        observations.append(copy.deepcopy(evidence))
+        with sqlite3.connect(destination) as connection:
+            row = connection.execute(
+                "SELECT receipt FROM receipts WHERE scope=? AND effect=?",
+                (evidence["scope_identity"], evidence["effect_id"]),
+            ).fetchone()
+        return (
+            row is not None
+            and all(
+                base64.b64decode(evidence[name], validate=True) == row[0]
+                for name in (
+                    "first_attempt_receipt_bytes_base64",
+                    "repeat_attempt_receipt_bytes_base64",
+                )
+            )
+            and json.loads(row[0])
+            == {
+                key: value
+                for key, value in evidence.items()
+                if key
+                not in {
+                    "attempt_fence",
+                    "first_attempt_receipt_bytes_base64",
+                    "repeat_attempt_receipt_bytes_base64",
+                }
+            }
+        )
+
+    host = installed_test_handler(host, lambda *_: {}, verify_receipts)
+    proof = {
+        **context,
+        "first_attempt_receipt_bytes_base64": base64.b64encode(receipt).decode(),
+        "repeat_attempt_receipt_bytes_base64": base64.b64encode(receipt).decode(),
+    }
+    return host, proof, observations
+
+
 def host_fixture(tmp_path, observer=None):
     bundle = load_bundle((CASE / "machine.yaml").read_text())
     resolver = MemoryArtifactResolver(definitions={bundle.fingerprint: bundle})
@@ -412,8 +473,8 @@ def test_worker_result_crossing_expiry_rolls_back_outcome_before_commit(tmp_path
     submit = host._submit
     observed = []
 
-    def expires_during_submission(*args):
-        response = submit(*args)
+    def expires_during_submission(*args, **kwargs):
+        response = submit(*args, **kwargs)
         observed.append(args[0]["journal"]["effect_records"][0]["invocation_state"])
         current_time[0] = read("data/active-claim.json")["expires_at"]
         return response
@@ -820,8 +881,15 @@ def test_seed_preserves_historical_claim_without_reviving_it(tmp_path):
         "payload": ["map", []],
     }
     host.trusted_clock = lambda: "0"
+    host, proof, _ = installed_retry_handler(host, root)
     response = host.submit_result(
-        root, report, principal=claim["worker_principal"], scope=scope, epoch="0", trusted_now="0"
+        root,
+        report,
+        principal=claim["worker_principal"],
+        scope=scope,
+        epoch="0",
+        trusted_now="0",
+        deduplication_evidence=proof,
     )
     assert response["status"] == "report_recorded"
     saved = host.snapshot(root)
@@ -835,7 +903,13 @@ def test_seed_preserves_historical_claim_without_reviving_it(tmp_path):
     assert authority.inspect(scope)["active_claims"] == []
     assert host.snapshot(root)["claims"][record["effect_id"]] == claim
     new_claim = host.claim(
-        root, record["effect_id"], "worker-b", "0", expires_at="30", trusted_now="20"
+        root,
+        record["effect_id"],
+        "worker-b",
+        "0",
+        expires_at="30",
+        trusted_now="20",
+        deduplication_evidence=proof,
     )
     assert new_claim["attempt_fence"] == "2"
 
@@ -929,7 +1003,9 @@ def test_multi_effect_recovery_commits_one_journal_revision_per_effect(tmp_path)
     journal["checkpoint_revision"] = checkpoint["revision"]
     journal["checkpoint_digest"] = checkpoint["execution_checkpoint_digest"]
     journal = seal_journal(journal)
-    host = SQLiteCommittedEffectHost(tmp_path / "two.sqlite", original.resolver, {}, None)
+    host = SQLiteCommittedEffectHost(
+        tmp_path / "two.sqlite", original.resolver, {}, None, trusted_clock=lambda: "0"
+    )
     host.setup_schema()
     host.seed(checkpoint, journal)
     for record in journal["effect_records"]:
@@ -1306,6 +1382,10 @@ def test_historical_result_evidence_survives_processing(tmp_path):
         "fabricated",
         "wrong_work",
         "wrong_destination",
+        "wrong_root",
+        "wrong_token",
+        "wrong_fence",
+        "wrong_handler",
         "no_native_receipt",
         "unavailable",
     ],
@@ -1316,7 +1396,9 @@ def test_ambiguous_retry_requires_verified_native_destination_evidence(tmp_path,
 
     original, root, request, _ = host_fixture(tmp_path)
     journal = read("data/ambiguous-journal.json")
-    host = SQLiteCommittedEffectHost(tmp_path / "ambiguous.sqlite", original.resolver, {}, None)
+    host = SQLiteCommittedEffectHost(
+        tmp_path / "ambiguous.sqlite", original.resolver, {}, None, trusted_clock=lambda: "0"
+    )
     host.setup_schema()
     host.seed(read("pending-checkpoint.json"), journal)
     record = journal["effect_records"][0]
@@ -1365,6 +1447,11 @@ def test_ambiguous_retry_requires_verified_native_destination_evidence(tmp_path,
     host = installed_test_handler(host, lambda *_: {}, verify_receipts)
     encoded = base64.b64encode(receipt_bytes).decode()
     proof = {
+        "kind": "destination_deduplication",
+        "root_instance_id": root,
+        "operation_token": record["operation_token"],
+        "attempt_fence": record["attempt_fence"],
+        "handler_reference": copy.deepcopy(record["handler_reference"]),
         "scope_identity": journal["scope_identity"],
         "effect_id": record["effect_id"],
         "destination_binding_digest": record["destination_binding_digest"],
@@ -1381,6 +1468,14 @@ def test_ambiguous_retry_requires_verified_native_destination_evidence(tmp_path,
         proof["effect_id"] = "sha256:" + "0" * 64
     elif damage == "wrong_destination":
         proof["destination_binding_digest"] = "sha256:" + "0" * 64
+    elif damage == "wrong_root":
+        proof["root_instance_id"] = "other-root"
+    elif damage == "wrong_token":
+        proof["operation_token"] = "other-token"
+    elif damage == "wrong_fence":
+        proof["attempt_fence"] = "0"
+    elif damage == "wrong_handler":
+        proof["handler_reference"]["identifier"] = "other-handler"
     before = host.snapshot(root)
     if damage is not None:
         with pytest.raises(EffectError, match="host_capability_mismatch"):
@@ -1430,16 +1525,166 @@ def test_ambiguous_retry_does_not_accept_legacy_boolean_keyword(tmp_path):
         )
 
 
+@pytest.mark.parametrize(
+    "damage",
+    [
+        None,
+        "missing",
+        "boolean",
+        "fabricated",
+        "wrong_root",
+        "wrong_token",
+        "wrong_fence",
+        "wrong_handler",
+        "unavailable",
+    ],
+)
+def test_retryable_report_requires_native_original_invocation_proof(tmp_path, damage):
+    import base64
+
+    host, root, request, context = host_fixture(tmp_path)
+    host, proof, checks = installed_retry_handler(host, root)
+    report = {**request, "outcome_kind": "retryable_failure", "payload": ["map", []]}
+    if damage == "missing":
+        proof = None
+    elif damage == "boolean":
+        proof = True
+    elif damage == "fabricated":
+        proof["first_attempt_receipt_bytes_base64"] = proof[
+            "repeat_attempt_receipt_bytes_base64"
+        ] = base64.b64encode(b"fabricated equal receipts").decode()
+    elif damage == "wrong_root":
+        proof["root_instance_id"] = "other-root"
+    elif damage == "wrong_token":
+        proof["operation_token"] = "other-token"
+    elif damage == "wrong_fence":
+        proof["attempt_fence"] = "0"
+    elif damage == "wrong_handler":
+        proof["handler_reference"]["identifier"] = "other-handler"
+    elif damage == "unavailable":
+        host.handler._configured._provider.proof_verifier = None
+    before = host.snapshot(root)
+    response = host.submit_result(root, report, **context, deduplication_evidence=proof)
+    if damage is not None:
+        assert response["error_code"] == "host_capability_mismatch"
+        assert host.snapshot(root) == before
+    else:
+        assert response["status"] == "report_recorded"
+        assert response["attempt_report"]["reason"] == "destination_deduplication_proven"
+        assert checks == [proof, proof]
+        retained = host.snapshot(root)["destination_evidence"][request["effect_id"]][0]
+        assert retained == {
+            "decision": "report",
+            "attempt_fence": request["attempt_fence"],
+            "evidence": proof,
+        }
+
+
+def test_safe_report_replay_and_later_claim_never_reuse_old_verification(tmp_path):
+    host, root, request, context = host_fixture(tmp_path)
+    host, proof, checks = installed_retry_handler(host, root)
+    report = {**request, "outcome_kind": "retryable_failure", "payload": ["map", []]}
+    first = host.submit_result(root, report, **context, deduplication_evidence=proof)
+    assert first["status"] == "report_recorded"
+    before = host.snapshot(root)
+    with pytest.raises(EffectError, match="host_capability_mismatch"):
+        host.claim(
+            root,
+            request["effect_id"],
+            "worker-b",
+            context["epoch"],
+            expires_at="10",
+            trusted_now="0",
+        )
+    assert host.snapshot(root) == before
+    host.claim(
+        root,
+        request["effect_id"],
+        "worker-b",
+        context["epoch"],
+        expires_at="10",
+        trusted_now="0",
+        deduplication_evidence=proof,
+    )
+    assert len(checks) == 4
+    host.handler._configured._provider.proof_verifier = None
+    host.resolver = MemoryArtifactResolver(definitions={})
+    with host._connect() as connection:
+        before_bytes = connection.execute(
+            "SELECT document FROM determa_committed_effects"
+        ).fetchone()[0]
+    assert host.submit_result(root, report, **context) == first
+    assert len(checks) == 4
+    changed = {**report, "payload": ["map", [["changed", ["boolean", True]]]]}
+    assert host.submit_result(root, changed, **context)["error_code"] == "effect_result_conflict"
+    with host._connect() as connection:
+        assert (
+            connection.execute("SELECT document FROM determa_committed_effects").fetchone()[0]
+            == before_bytes
+        )
+
+
+def test_authority_noninitial_native_claim_cannot_bypass_retry_verifier(tmp_path):
+    authority, host, scope, root, record = authority_effect_fixture(tmp_path)
+    command, invocation = authority_claim_request(authority, scope, root, record)
+    claim = json.loads(authority.perform(command, invocation))["claim"]
+    host.trusted_clock = lambda: "0"
+    host, proof, checks = installed_retry_handler(host, root)
+    report = {
+        "effect_id": record["effect_id"],
+        "operation_token": record["operation_token"],
+        "attempt_fence": claim["attempt_fence"],
+        "outcome_kind": "retryable_failure",
+        "payload": ["map", []],
+    }
+    assert (
+        host.submit_result(
+            root,
+            report,
+            principal=claim["worker_principal"],
+            scope=scope,
+            epoch="0",
+            trusted_now="0",
+            deduplication_evidence=proof,
+        )["status"]
+        == "report_recorded"
+    )
+    before = host.snapshot(root), authority.inspect(scope)
+    command, invocation = authority_claim_request(
+        authority,
+        scope,
+        root,
+        record,
+        expected="1",
+        operation="second-claim-without-native-verification",
+    )
+    response = json.loads(authority.perform(command, invocation))
+    assert response["status"] == "rejected"
+    assert response["error_code"] == "host_capability_mismatch"
+    assert (host.snapshot(root), authority.inspect(scope)) == before
+    assert len(checks) == 2
+
+
 @pytest.mark.parametrize("damage", [None, "unavailable", "method", "configuration", "instance"])
-def test_retry_verifier_is_rechecked_after_native_sql_staging(tmp_path, monkeypatch, damage):
+@pytest.mark.parametrize("operation", ["claim", "report"])
+def test_retry_verifier_is_rechecked_after_native_sql_staging(
+    tmp_path, monkeypatch, damage, operation
+):
     import base64
     import sqlite3
 
-    original, root, request, _ = host_fixture(tmp_path)
-    journal = read("data/ambiguous-journal.json")
+    original, root, request, context = host_fixture(tmp_path)
+    journal = read(
+        "data/ambiguous-journal.json" if operation == "claim" else "data/leased-journal.json"
+    )
     host = SQLiteCommittedEffectHost(tmp_path / "retry-staging.sqlite", original.resolver, {}, None)
     host.setup_schema()
-    host.seed(read("pending-checkpoint.json"), journal)
+    host.seed(
+        read("pending-checkpoint.json"),
+        journal,
+        read("data/active-claim.json") if operation == "report" else None,
+    )
+    host.trusted_clock = lambda: "0"
     record = journal["effect_records"][0]
     host.route.update(
         {key: record[key] for key in ("handler_reference", "destination_binding_digest")}
@@ -1468,6 +1713,11 @@ def test_retry_verifier_is_rechecked_after_native_sql_staging(tmp_path, monkeypa
     host = installed_test_handler(host, lambda *_: {}, verify_receipts)
     encoded = base64.b64encode(receipt).decode()
     proof = {
+        "kind": "destination_deduplication",
+        "root_instance_id": root,
+        "operation_token": record["operation_token"],
+        "attempt_fence": record["attempt_fence"],
+        "handler_reference": copy.deepcopy(record["handler_reference"]),
         "scope_identity": journal["scope_identity"],
         "effect_id": record["effect_id"],
         "destination_binding_digest": record["destination_binding_digest"],
@@ -1489,7 +1739,11 @@ def test_retry_verifier_is_rechecked_after_native_sql_staging(tmp_path, monkeypa
                     )
                     .fetchone()[0]
                 )
-                assert staged["claims"][request["effect_id"]]["attempt_fence"] == "2"
+                assert staged["claims"][request["effect_id"]]["attempt_fence"] == (
+                    "2" if operation == "claim" else "1"
+                )
+                if operation == "report":
+                    assert staged["journal"]["effect_records"][0]["invocation_state"] == "unclaimed"
                 state["staged"] = True
                 if damage == "method":
                     monkeypatch.setattr(
@@ -1507,15 +1761,78 @@ def test_retry_verifier_is_rechecked_after_native_sql_staging(tmp_path, monkeypa
         lambda: sqlite3.connect(host.path, isolation_level=None, factory=StagingConnection),
     )
     arguments = {"expires_at": "10", "trusted_now": "0", "deduplication_evidence": proof}
+
+    def execute():
+        if operation == "claim":
+            return host.claim(root, request["effect_id"], "worker", "0", **arguments)
+        response = host.submit_result(
+            root,
+            {**request, "outcome_kind": "retryable_failure", "payload": ["map", []]},
+            **context,
+            deduplication_evidence=proof,
+        )
+        if response["status"] == "rejected":
+            raise EffectError(response["error_code"])
+        return response
+
     if damage is None:
-        claim = host.claim(root, request["effect_id"], "worker", "0", **arguments)
-        assert claim["attempt_fence"] == "2"
+        response = execute()
+        assert response["attempt_fence"] == ("2" if operation == "claim" else "1")
         assert state["staged"] and state["checks"] >= 2
     else:
         with pytest.raises(EffectError, match="host_capability_mismatch"):
-            host.claim(root, request["effect_id"], "worker", "0", **arguments)
+            execute()
         assert state["staged"]
         assert host.snapshot(root) == before
+
+
+@pytest.mark.parametrize("clock", ["expired", "unavailable", "invalid", "missing"])
+def test_initial_claim_requires_fresh_clock_after_actual_sql_staging(tmp_path, monkeypatch, clock):
+    import sqlite3
+
+    original, root, request, _ = host_fixture(tmp_path)
+    state = {"staged": False}
+
+    def now():
+        if not state["staged"]:
+            return "0"
+        if clock == "unavailable":
+            raise RuntimeError("clock unavailable")
+        return "10" if clock == "expired" else "invalid"
+
+    host = SQLiteCommittedEffectHost(
+        tmp_path / "claim-clock.sqlite", original.resolver, {}, None, trusted_clock=now
+    )
+    host.setup_schema()
+    host.seed(read("pending-checkpoint.json"), read("data/unclaimed-journal.json"))
+    before = host.snapshot(root)
+
+    class StagingConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            result = super().execute(sql, parameters)
+            if sql.startswith("UPDATE determa_committed_effects SET document"):
+                row = (
+                    super()
+                    .execute(
+                        "SELECT document FROM determa_committed_effects WHERE root_instance_id=?",
+                        (root,),
+                    )
+                    .fetchone()
+                )
+                assert json.loads(row[0])["claims"][request["effect_id"]]["attempt_fence"] == "1"
+                state["staged"] = True
+                if clock == "missing":
+                    host.trusted_clock = None
+            return result
+
+    monkeypatch.setattr(
+        host,
+        "_connect",
+        lambda: sqlite3.connect(host.path, isolation_level=None, factory=StagingConnection),
+    )
+    with pytest.raises(EffectError, match="stale_attempt_fence"):
+        host.claim(root, request["effect_id"], "worker", "0", expires_at="10", trusted_now="0")
+    assert state["staged"] and host.snapshot(root) == before
 
 
 def test_historical_admission_survives_actual_root_completion_and_tombstone(tmp_path):
