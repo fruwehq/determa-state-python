@@ -313,18 +313,27 @@ def _native_checkpoints(
                 "ORDER BY root_instance_id"
             )
         )
+    from .effects import _native_effect_documents, validate_journal
+
+    native_documents = _native_effect_documents(ledger)
+    if native_documents and "determa_committed_effects" not in tables:
+        raise ValueError("native effect participant table missing")
     if "determa_committed_effects" in tables:
-        from .effects import validate_journal
         from .wire import canonical_bytes
 
-        for root, payload in connection.execute(
+        native_rows = connection.execute(
             "SELECT root_instance_id, document FROM determa_committed_effects "
             "ORDER BY root_instance_id"
-        ):
+        ).fetchall()
+        if {root for root, _payload in native_rows} != set(native_documents):
+            raise ValueError("native effect participant inventory differs")
+        for root, payload in native_rows:
             native = _parse(bytes(payload).decode("utf-8", "strict"))
             validate_journal(native["checkpoint"], native["journal"])
             if native["journal"]["scope_identity"] != ledger["scope_identity"]:
                 raise ValueError("untracked native effect scope")
+            if native != native_documents[root]:
+                raise ValueError("native effect private history differs")
             for record in native["journal"]["effect_records"]:
                 if {
                     "work_identity": record["effect_id"],
@@ -1049,6 +1058,21 @@ class SQLiteLocalAuthority:
                 and invocation["authenticated_principal"] != ledger["owner_principal"]
             ):
                 return _compact(_result(request, ledger, "stale_scope_authority"))
+            # A new mutation cannot certify a scope around a missing private
+            # native participant. Historical receipt replay above grants no rights.
+            if any(
+                key in ledger
+                for key in (
+                    "native_effect_roots",
+                    "native_effect_document_bytes",
+                    "native_effect_journal_bytes",
+                    "native_effect_work",
+                )
+            ):
+                try:
+                    _native_checkpoints(connection, ledger)
+                except (ValueError, TypeError, KeyError, sqlite3.Error):
+                    return _compact(_result(request, ledger, "scope_fence_unproven"))
             new_claim = None
             if operation == "fence_worker":
                 arguments = request["arguments"]
@@ -1396,9 +1420,18 @@ class AuthoritySQLiteExecutionStore(SQLiteExecutionStore):
             if root_instance_id not in ledger["roots"]:
                 raise ExecutionStoreError("unauthorized_scope")
             try:
+                from .effects import _native_effect_documents
+
                 native_history = _native_checkpoint_history(ledger)
-            except ValueError as error:
+                native_effect_roots = set(_native_effect_documents(ledger))
+                _native_checkpoints(connection, ledger)
+            except (ValueError, TypeError, KeyError, sqlite3.Error) as error:
                 raise ExecutionStoreError("scope_fence_unproven") from error
+            # Checkpoint-only execution cannot enter a joint checkpoint/journal
+            # participant, including reads through this write transaction API.
+            # Refuse before core actions or an application callback can run.
+            if root_instance_id in native_effect_roots:
+                raise ExecutionStoreError("scope_fence_unproven")
             transaction = _SQLiteTransaction(connection, root_instance_id)
             previous = transaction.load()
             if previous is not None and previous.decode("utf-8", "strict") not in native_history:

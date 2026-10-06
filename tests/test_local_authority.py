@@ -271,7 +271,146 @@ def test_freeze_refuses_an_untracked_native_checkpoint_without_committing(tmp_pa
     response = authority.perform(_request("freeze_scope", "freeze-untracked", "0", {}), invocation)
     assert json.loads(response)["error_code"] == "scope_fence_unproven"
     assert authority.inspect("scope-1") == ledger
-    assert bare_host.read_checkpoint("foreign-root").canonical_bytes == before.canonical_bytes
+    with authority._connect() as connection:
+        actual = connection.execute(
+            "SELECT checkpoint FROM determa_execution_checkpoints WHERE root_instance_id=?",
+            ("foreign-root",),
+        ).fetchone()
+    assert actual is not None and bytes(actual[0]) == before.canonical_bytes
+    with pytest.raises(ExecutionStoreError, match="scope_fence_unproven"):
+        bare_host.read_checkpoint("foreign-root")
+
+
+@pytest.mark.parametrize(
+    "damage",
+    [
+        None,
+        "row",
+        "table",
+        "history",
+        "ownership",
+        "missing_indexes",
+        "empty_indexes",
+        "journal_history",
+        "missing_journal_history",
+        "wrong_journal_scope",
+        "unowned_work",
+        "malformed_work",
+    ],
+)
+def test_freeze_requires_complete_private_native_inventory_even_for_zero_effect_roots(
+    tmp_path, damage
+):
+    from determa.state import create_checkpoint_v1
+    from determa.state.effects import SQLiteCommittedEffectHost, seal_journal
+
+    bundle = load_bundle(
+        "format: 1\nnamespace: test.private_inventory\nmachines:\n"
+        "  - machine_id: simple\n    root: {type: simple}\n"
+    )
+    resolver = MemoryArtifactResolver(definitions={bundle.fingerprint: bundle})
+    authority = SQLiteLocalAuthority(tmp_path / "inventory.sqlite")
+    authority.setup_schema()
+    assert authority.allocate("scope-1", "owner-1", roots=("root-a", "root-b"))
+    host = SQLiteCommittedEffectHost(
+        authority.path, resolver, {"authority_epoch": "0"}, None, authority_scope="scope-1"
+    )
+    host.setup_schema()
+    for root in ("root-a", "root-b"):
+        checkpoint = create_checkpoint_v1(bundle, "simple", root, "create-" + root, {})
+        document = checkpoint
+        journal = seal_journal(
+            {
+                "host_effect_journal_format": "determa.host_effect_journal",
+                "host_effect_journal_schema_version": 1,
+                "scope_identity": "scope-1",
+                "root_instance_id": root,
+                "checkpoint_revision": document["revision"],
+                "checkpoint_digest": document["execution_checkpoint_digest"],
+                "journal_revision": "0",
+                "effect_records": [],
+                "operation_response_references": [],
+            }
+        )
+        host.seed(document, journal)
+    before = authority.inspect("scope-1")
+    if damage is not None:
+        with authority._connect() as connection:
+            if damage == "row":
+                connection.execute(
+                    "DELETE FROM determa_committed_effects WHERE root_instance_id='root-b'"
+                )
+            elif damage == "table":
+                connection.execute("DROP TABLE determa_committed_effects")
+            else:
+                ledger = json.loads(
+                    connection.execute("SELECT ledger FROM determa_scope_authority").fetchone()[0]
+                )
+                if damage == "history":
+                    ledger["native_effect_document_bytes"] = [
+                        source
+                        for source in ledger["native_effect_document_bytes"]
+                        if json.loads(source)["checkpoint"]["root_instance_id"] != "root-b"
+                    ]
+                elif damage == "ownership":
+                    ledger["native_effect_roots"].remove("root-b")
+                elif damage in {"missing_indexes", "empty_indexes"}:
+                    for key in ("native_effect_roots", "native_effect_document_bytes"):
+                        if damage == "missing_indexes":
+                            del ledger[key]
+                        else:
+                            ledger[key] = []
+                    connection.execute("DELETE FROM determa_committed_effects")
+                elif damage == "missing_journal_history":
+                    del ledger["native_effect_journal_bytes"]
+                elif damage in {"journal_history", "wrong_journal_scope"}:
+                    latest = json.loads(ledger["native_effect_journal_bytes"][-1])
+                    if damage == "journal_history":
+                        latest["journal_revision"] = "99"
+                    else:
+                        latest["scope_identity"] = "other-scope"
+                    from determa.state.wire import canonical_bytes
+
+                    ledger["native_effect_journal_bytes"][-1] = canonical_bytes(
+                        seal_journal(latest)
+                    ).decode()
+                elif damage == "unowned_work":
+                    ledger["native_effect_work"] = [
+                        {
+                            "participant": "native_effects",
+                            "work_kind": "effect",
+                            "root_instance_id": "unowned-root",
+                        }
+                    ]
+                else:
+                    assert damage == "malformed_work"
+                    ledger["native_effect_work"] = None
+                connection.execute(
+                    "UPDATE determa_scope_authority SET ledger=?", (json.dumps(ledger),)
+                )
+    invocation = {
+        "authenticated_principal": "owner-1",
+        "authorized_scopes": ["scope-1"],
+        "operation_rights": ["freeze_scope"],
+    }
+    result = json.loads(
+        authority.perform(
+            _request("freeze_scope", "freeze-native-inventory", before["scope_generation"], {}),
+            invocation,
+        )
+    )
+    if damage is None:
+        assert result["status"] == "accepted" and result["state"] == "frozen"
+        inventory = authority.inspect("scope-1")["inventory"]
+        assert {item["identity"] for item in inventory if item["kind"] == "root"} == {
+            "root-a",
+            "root-b",
+        }
+        assert sum(item["kind"] == "checkpoint" for item in inventory) >= 2
+    else:
+        assert result["error_code"] == "scope_fence_unproven"
+        assert authority.inspect("scope-1")["state"] == "active"
+        assert authority.inspect("scope-1")["scope_generation"] == before["scope_generation"]
 
 
 def test_public_checkpoint_commit_serializes_with_freeze(tmp_path) -> None:
@@ -380,7 +519,14 @@ def test_guarded_write_cannot_adopt_a_preexisting_untracked_checkpoint(tmp_path)
             expected_checkpoint_digest=before.document["execution_checkpoint_digest"],
         )
     assert authority.inspect("scope-1") == ledger
-    assert bare_host.read_checkpoint("root-1").canonical_bytes == before.canonical_bytes
+    with authority._connect() as connection:
+        actual = connection.execute(
+            "SELECT checkpoint FROM determa_execution_checkpoints WHERE root_instance_id=?",
+            ("root-1",),
+        ).fetchone()
+    assert actual is not None and bytes(actual[0]) == before.canonical_bytes
+    with pytest.raises(ExecutionStoreError, match="scope_fence_unproven"):
+        bare_host.read_checkpoint("root-1")
 
 
 @pytest.mark.parametrize("terminal", [False, True])

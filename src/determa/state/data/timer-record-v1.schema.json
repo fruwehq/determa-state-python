@@ -1,0 +1,177 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://determa.dev/state/schema/timer-record-v1.schema.json",
+  "title": "Separate portable timer records artifact version 1",
+  "type": "object",
+  "properties": {
+    "timer_artifact_format": {
+      "const": "determa.timer_records"
+    },
+    "timer_artifact_schema_version": {
+      "const": 1
+    },
+    "records": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "scope_identity": {
+            "type": "string",
+            "minLength": 1
+          },
+          "root_instance_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "root_runtime_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "timer_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "schedule_request_digest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+          },
+          "clock_basis": {
+            "const": "unix_nanoseconds"
+          },
+          "deadline_at": {
+            "type": "string",
+            "pattern": "^(0|[1-9][0-9]*|-[1-9][0-9]*)$"
+          },
+          "event_name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "payload": {
+            "$ref": "aggregate-state-v1.schema.json#/$defs/typedMap"
+          },
+          "correlation_id": {
+            "oneOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "event_id": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+          },
+          "state": {
+            "enum": [
+              "pending",
+              "claimed",
+              "fired",
+              "cancelled"
+            ]
+          },
+          "revision": {
+            "type": "string",
+            "pattern": "^(0|[1-9][0-9]*)$"
+          },
+          "attempt_fence": {
+            "type": "string",
+            "pattern": "^(0|[1-9][0-9]*)$"
+          },
+          "worker_principal": {
+            "oneOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "expires_at": {
+            "oneOf": [
+              {
+                "type": "string",
+                "pattern": "^(0|[1-9][0-9]*|-[1-9][0-9]*)$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "admission_receipt_digest": {
+            "oneOf": [
+              {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "scope_identity",
+          "root_instance_id",
+          "root_runtime_id",
+          "timer_id",
+          "schedule_request_digest",
+          "clock_basis",
+          "deadline_at",
+          "event_name",
+          "payload",
+          "correlation_id",
+          "event_id",
+          "state",
+          "revision",
+          "attempt_fence",
+          "worker_principal",
+          "expires_at",
+          "admission_receipt_digest"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "operation_receipts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "operation_id": {
+            "type": "string",
+            "minLength": 1
+          },
+          "request_digest": {
+            "type": "string",
+            "pattern": "^sha256:[0-9a-f]{64}$"
+          },
+          "result": {
+            "$ref": "timer-helper-operation-v1.schema.json#/$defs/result"
+          }
+        },
+        "required": [
+          "operation_id",
+          "request_digest",
+          "result"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "timer_artifact_digest": {
+      "type": "string",
+      "pattern": "^sha256:[0-9a-f]{64}$"
+    }
+  },
+  "required": [
+    "timer_artifact_format",
+    "timer_artifact_schema_version",
+    "records",
+    "operation_receipts",
+    "timer_artifact_digest"
+  ],
+  "additionalProperties": false
+}

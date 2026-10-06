@@ -27,6 +27,7 @@ from .checkpoint_v1 import (
 from .errors import ArtifactError
 from .extensions import ConfiguredExtension, ExtensionError, ExtensionRegistry
 from .host import outbox_intent_digest
+from .native_clock import NativeCommitClock, _native_clock_mode, _read_native_clock
 from .wire import (
     ArtifactResolver,
     _schema_registry,
@@ -82,12 +83,21 @@ def _journal_validator() -> Any:
 
 def _validate_request(request: Mapping[str, Any], name: str) -> dict[str, Any]:
     from jsonschema import Draft202012Validator
+    from referencing import Resource
 
     if not isinstance(request, Mapping):
         raise EffectError("invalid_host_request")
     normalized = copy.deepcopy(dict(request))
     source = json.loads((Path(__file__).parent / "data" / name).read_text())
-    if not Draft202012Validator(source, registry=_schema_registry()).is_valid(normalized):
+    registry = _schema_registry()
+    for filename in (
+        "host-effect-journal-v1.schema.json",
+        "provider-reference-v1.schema.json",
+        name,
+    ):
+        schema = json.loads((Path(__file__).parent / "data" / filename).read_text())
+        registry = registry.with_resource(schema["$id"], Resource.from_contents(schema))
+    if not Draft202012Validator(source, registry=registry).is_valid(normalized):
         raise EffectError("invalid_host_request")
     return normalized
 
@@ -190,6 +200,13 @@ def _pinned_result_target(
     machine = definition["machine"]
     identity = [machine["namespace"], machine["machine_id"], machine["machine_version"]]
     if origin["kind"] == "root":
+        root_record = checkpoint["root_record"]
+        aggregate = root_record.get("aggregate_state")
+        actual_root_runtime_id = (
+            aggregate["root_runtime_id"] if aggregate else root_record["root_runtime_id"]
+        )
+        if origin["root_instance_id"] != root or runtime_id != actual_root_runtime_id:
+            raise EffectError("invalid_effect_journal")
         expected_id = hash_value(
             [
                 "determa-root-runtime-identity-1",
@@ -308,6 +325,13 @@ def validate_journal(
         for item in checkpoint["pending_outbox_intents"] + checkpoint["terminal_outbox_records"]
     ] + [item["effect_id"] for item in checkpoint["outbox_effect_tombstones"]]
     for record in records:
+        # Validate every pinned incarnation before dispatch or native seeding,
+        # including nonterminal work. A self-consistent alternate trusted origin
+        # cannot replace the checkpoint's immutable root runtime identity.
+        try:
+            pinned_target = _pinned_result_target(checkpoint, record, resolver)
+        except (ArtifactError, KeyError, TypeError, ValueError) as exc:
+            raise EffectError("invalid_effect_journal") from exc
         intent = intents.get(record["effect_id"])
         tombstone = compact.get(record["effect_id"])
         if location_ids.count(record["effect_id"]) != 1 or record["intent_digest"] != (
@@ -318,9 +342,53 @@ def validate_journal(
             raise EffectError("invalid_effect_journal")
         reports = record["attempt_records"]
         fences = [int(item["attempt_fence"]) for item in reports]
-        if fences != sorted(set(fences)) or any(f > int(record["attempt_fence"]) for f in fences):
+        if fences != sorted(set(fences)) or any(
+            f == 0 or f > int(record["attempt_fence"]) for f in fences
+        ):
             raise EffectError("invalid_effect_journal")
         state = record["invocation_state"]
+        outcome = record["outcome"]
+        current_report = next(
+            (item for item in reports if item["attempt_fence"] == record["attempt_fence"]),
+            None,
+        )
+        if state == "unclaimed" and record["attempt_fence"] != "0" and current_report is None:
+            # A consumed attempt cannot become new work without retaining the
+            # current safe-failure report. Missing evidence is not retry proof.
+            raise EffectError("invalid_effect_journal")
+        terminal_reports = [item for item in reports if item["report_kind"] in _OUTCOMES]
+        if len(terminal_reports) > 1:
+            # Terminal outcomes are immutable: no later attempt may supersede
+            # an earlier committed terminal report, even with valid hashes.
+            raise EffectError("invalid_effect_journal")
+        if state in {"leased", "ambiguous"} and record["attempt_fence"] == "0":
+            raise EffectError("invalid_effect_journal")
+        if state in {"unclaimed", "leased", "ambiguous"} and any(
+            item["report_kind"] in _OUTCOMES for item in reports
+        ):
+            # A committed terminal report cannot become retryable work merely
+            # because its outcome/result fields were stripped.
+            raise EffectError("invalid_effect_journal")
+        if current_report is not None and (
+            state == "leased"
+            or (state == "unclaimed" and current_report["report_kind"] != "retryable_failure")
+            or (state == "ambiguous" and current_report["report_kind"] != "ambiguous")
+        ):
+            raise EffectError("invalid_effect_journal")
+        cancellation = record["cancellation"]
+        if (
+            cancellation is not None
+            and cancellation["state"] == "prevented_start"
+            and (
+                state not in {"outcome_recorded", "result_admitted", "closed"}
+                or record["attempt_fence"] != "0"
+                or reports
+                or outcome is None
+                or outcome["kind"] != "cancelled"
+                or outcome["attempt_fence"] != "0"
+            )
+        ):
+            raise EffectError("invalid_effect_journal")
         if state in {"unclaimed", "leased", "ambiguous"} and any(
             record[key] is not None for key in ("outcome", "result_event_id", "admission_receipt")
         ):
@@ -337,8 +405,9 @@ def validate_journal(
             or record["admission_receipt"] not in checkpoint["operation_receipts"]
         ):
             raise EffectError("invalid_effect_journal")
-        outcome = record["outcome"]
         if outcome is not None:
+            if outcome["attempt_fence"] != record["attempt_fence"]:
+                raise EffectError("invalid_effect_journal")
             if outcome["digest"] != hash_value(
                 [
                     "determa-effect-outcome-1",
@@ -373,7 +442,7 @@ def validate_journal(
                         record,
                         outcome["kind"],
                         outcome["payload"],
-                        _pinned_result_target(checkpoint, record, resolver),
+                        pinned_target,
                     )
                     receipt = record["admission_receipt"]
                     if (
@@ -459,7 +528,7 @@ def _rejected_result(effect_id: str, fence: str, code: str) -> dict[str, Any]:
 def _report_reason(request: Mapping[str, Any]) -> str | None:
     kind = request["outcome_kind"]
     if kind == "retryable_failure":
-        return "no_call_proven"
+        return "destination_deduplication_proven"
     if kind == "ambiguous":
         return "provider_acceptance_unknown"
     return None
@@ -470,22 +539,24 @@ def _retained_report(
 ) -> dict[str, Any] | None:
     """Compare complete immutable report evidence even after a process restart."""
     fence, kind = request["attempt_fence"], request["outcome_kind"]
-    digest = hash_value(
-        [
-            "determa-effect-attempt-report-1",
-            record["effect_id"],
-            record["operation_token"],
-            fence,
-            kind,
-            request["payload"],
-            _report_reason(request),
-        ]
-    )
     return next(
         (
             item
             for item in record["attempt_records"]
-            if item["attempt_fence"] == fence and item["report_digest"] == digest
+            if item["attempt_fence"] == fence
+            and item["report_kind"] == kind
+            and item["report_digest"]
+            == hash_value(
+                [
+                    "determa-effect-attempt-report-1",
+                    record["effect_id"],
+                    record["operation_token"],
+                    fence,
+                    kind,
+                    request["payload"],
+                    item["reason"],
+                ]
+            )
         ),
         None,
     )
@@ -627,6 +698,119 @@ def _reconstruct_producer_response(
     return response
 
 
+def _native_effect_journals(ledger: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Resolve only host-participant history, never generic proposed mutation bytes."""
+    from .authority import _parse
+
+    history = ledger.get("native_effect_journal_bytes", [])
+    if type(history) is not list or any(type(source) is not str for source in history):
+        raise EffectError("unauthorized_scope")
+    latest = {}
+    for source in history:
+        try:
+            journal = _parse(source)
+            if type(journal) is not dict:
+                raise EffectError("unauthorized_scope")
+            root = journal["root_instance_id"]
+            if (
+                canonical_bytes(journal).decode() != source
+                or journal.get("host_effect_journal_format") != "determa.host_effect_journal"
+                or journal.get("host_effect_journal_schema_version") != 1
+                or journal.get("scope_identity") != ledger["scope_identity"]
+                or journal.get("host_effect_journal_digest") != journal_digest(journal)
+                or type(root) is not str
+                or not root
+            ):
+                raise EffectError("unauthorized_scope")
+            latest[root] = journal
+        except (ValueError, TypeError, KeyError) as error:
+            raise EffectError("unauthorized_scope") from error
+    return latest
+
+
+def _native_effect_journal(ledger: Mapping[str, Any], root: str) -> dict[str, Any]:
+    latest = _native_effect_journals(ledger).get(root)
+    if latest is None:
+        raise EffectError("unauthorized_scope")
+    return latest
+
+
+def _native_effect_documents(ledger: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """Only independently retained native-role bytes certify private call history."""
+    roots = ledger.get("native_effect_roots", [])
+    if (
+        not isinstance(roots, list)
+        or any(type(root) is not str or not root for root in roots)
+        or len(set(roots)) != len(roots)
+    ):
+        raise EffectError("unauthorized_scope")
+    journals = _native_effect_journals(ledger)
+    # Losing both indexes cannot turn retained native journal/work into freshness.
+    if set(journals) != set(roots):
+        raise EffectError("unauthorized_scope")
+    work = ledger.get("native_effect_work", [])
+    if type(work) is not list or any(
+        type(item) is not dict
+        or item.get("participant") != "native_effects"
+        or item.get("work_kind") != "effect"
+        or item.get("root_instance_id") not in roots
+        for item in work
+    ):
+        raise EffectError("unauthorized_scope")
+    history = ledger.get("native_effect_document_bytes", [] if not roots else None)
+    if not isinstance(history, list):
+        raise EffectError("unauthorized_scope")
+    latest = {}
+    for source in history:
+        if type(source) is not str:
+            raise EffectError("unauthorized_scope")
+        try:
+            value = json.loads(source)
+            if not isinstance(value, dict) or canonical_bytes(value).decode() != source:
+                raise ValueError("invalid native participant bytes")
+            if (
+                value["journal"]["scope_identity"] != ledger["scope_identity"]
+                or value["journal"]["host_effect_journal_format"] != "determa.host_effect_journal"
+                or value["journal"]["host_effect_journal_schema_version"] != 1
+                or value["journal"]["host_effect_journal_digest"]
+                != journal_digest(value["journal"])
+            ):
+                raise ValueError("wrong native journal provenance")
+            if not isinstance(value["invocation_starts"], dict):
+                raise ValueError("missing private start inventory")
+            root = value["checkpoint"]["root_instance_id"]
+            if type(root) is not str or not root or value["journal"]["root_instance_id"] != root:
+                raise ValueError("wrong native root")
+            latest[root] = value
+        except (ValueError, TypeError, KeyError) as error:
+            raise EffectError("unauthorized_scope") from error
+    if set(latest) != set(roots) or any(
+        document["journal"] != journals[root] for root, document in latest.items()
+    ):
+        raise EffectError("unauthorized_scope")
+    expected_work = [
+        {
+            "root_instance_id": root,
+            "work_kind": "effect",
+            "work_identity": record["effect_id"],
+            "operation_token": record["operation_token"],
+            "participant": "native_effects",
+        }
+        for root, document in latest.items()
+        for record in document["journal"]["effect_records"]
+    ]
+    if len(work) != len(expected_work) or any(item not in work for item in expected_work):
+        raise EffectError("unauthorized_scope")
+    return latest
+
+
+def _native_effect_document(ledger: Mapping[str, Any], root: str) -> dict[str, Any]:
+    latest = _native_effect_documents(ledger).get(root)
+    if latest is None:
+        raise EffectError("unauthorized_scope")
+    return latest
+
+
 def _validate_authority_pair(ledger: Mapping[str, Any], document: Mapping[str, Any]) -> None:
     """Check the old native pair before any journal transition can be staged."""
     from .authority import _native_checkpoint_history
@@ -681,6 +865,10 @@ def _validate_authority_pair(ledger: Mapping[str, Any], document: Mapping[str, A
                 raise EffectError("stale_attempt_fence")
         elif live is not None:
             raise EffectError("stale_attempt_fence")
+    if journal != _native_effect_journal(ledger, journal["root_instance_id"]):
+        raise EffectError("unauthorized_scope")
+    if document != _native_effect_document(ledger, journal["root_instance_id"]):
+        raise EffectError("unauthorized_scope")
 
 
 def _issue_effect_claim(
@@ -700,7 +888,7 @@ def _issue_effect_claim(
     record = _record(journal, effect_id)
     if record["invocation_state"] not in {"unclaimed", "ambiguous"}:
         raise EffectError("effect_not_outstanding")
-    if record["invocation_state"] == "ambiguous" and not (
+    if record["attempt_fence"] != "0" and not (
         deduplication_proven and record["idempotency_policy"] == "destination_deduplicates"
     ):
         raise EffectError("effect_not_outstanding")
@@ -799,10 +987,27 @@ class VerifiedNativeHandler:
         metadata: Mapping[str, Any],
         attempt: Mapping[str, Any],
     ) -> Mapping[str, Any]:
+        return VerifiedNativeHandler._invoke_with_guard(
+            self, reference, payload, metadata, attempt, lambda: None
+        )
+
+    def _invoke_with_guard(
+        self,
+        reference: Mapping[str, Any],
+        payload: Any,
+        metadata: Mapping[str, Any],
+        attempt: Mapping[str, Any],
+        guard: Callable[[], None],
+    ) -> Mapping[str, Any]:
         method, instance = VerifiedNativeHandler.verify(
             self, reference, metadata["destination_binding_digest"]
         )
-        return cast(Mapping[str, Any], method(instance, payload, metadata, attempt))
+        # Provider verification may execute native callbacks. Live host rights and
+        # trusted time must be checked after those callbacks, immediately before I/O.
+        guard()
+        result = method(instance, payload, metadata, attempt)
+        VerifiedNativeHandler.verify(self, reference, metadata["destination_binding_digest"])
+        return cast(Mapping[str, Any], result)
 
 
 class SQLiteCommittedEffectHost:
@@ -824,6 +1029,7 @@ class SQLiteCommittedEffectHost:
         authority_scope: str | None = None,
         core_observer: Callable[[str, str, Mapping[str, Any]], None] | None = None,
         trusted_clock: Callable[[], str] | None = None,
+        commit_clock: NativeCommitClock | None = None,
     ) -> None:
         if handler is not None and type(handler) is not VerifiedNativeHandler:
             raise EffectError("host_capability_mismatch")
@@ -835,6 +1041,41 @@ class SQLiteCommittedEffectHost:
         self.authority_scope = authority_scope
         self.core_observer = core_observer
         self.trusted_clock = trusted_clock
+        if commit_clock is not None and type(commit_clock) is not NativeCommitClock:
+            raise EffectError("host_capability_mismatch")
+        self.commit_clock = commit_clock
+        self._installed_commit_clock = commit_clock
+        try:
+            self._installed_commit_clock_mode = (
+                _native_clock_mode(commit_clock) if commit_clock is not None else None
+            )
+        except ValueError as exc:
+            raise EffectError("host_capability_mismatch") from exc
+
+    def _retry_commit_clock(self) -> tuple[NativeCommitClock, int, bool]:
+        clock = self.commit_clock
+        if type(clock) is not NativeCommitClock or clock is not self._installed_commit_clock:
+            raise EffectError("host_capability_mismatch")
+        try:
+            mode = self._installed_commit_clock_mode
+            if type(mode) is not bool:
+                raise ValueError("native clock mode absent")
+            return clock, _read_native_clock(clock, mode=mode), mode
+        except ValueError as exc:
+            raise EffectError("stale_attempt_fence") from exc
+
+    def _check_retry_commit_clock(
+        self, guard: tuple[NativeCommitClock, int, bool], deadline: int
+    ) -> None:
+        clock, start, mode = guard
+        if clock is not self.commit_clock or clock is not self._installed_commit_clock:
+            raise EffectError("host_capability_mismatch")
+        try:
+            now = _read_native_clock(clock, mode=mode)
+        except ValueError as exc:
+            raise EffectError("stale_attempt_fence") from exc
+        if now < start or now >= deadline:
+            raise EffectError("stale_attempt_fence")
 
     def _verified_handler(
         self, reference: Mapping[str, Any], destination: str
@@ -846,6 +1087,56 @@ class SQLiteCommittedEffectHost:
             raise EffectError("host_capability_mismatch")
         VerifiedNativeHandler.verify(self.handler, reference, destination)
         return self.handler
+
+    def _verify_retry_evidence(
+        self, context: Mapping[str, Any], evidence: Mapping[str, Any] | None
+    ) -> dict[str, Any]:
+        """Bind a native receipt decision to the original committed invocation."""
+        receipt_fields = {
+            "first_attempt_receipt_bytes_base64",
+            "repeat_attempt_receipt_bytes_base64",
+        }
+        if not isinstance(evidence, Mapping) or set(evidence) != set(context) | receipt_fields:
+            raise EffectError("host_capability_mismatch")
+        proof = copy.deepcopy(dict(evidence))
+        if any(proof[key] != value for key, value in context.items()):
+            raise EffectError("host_capability_mismatch")
+        if any(type(proof[field]) is not str for field in receipt_fields):
+            raise EffectError("host_capability_mismatch")
+        try:
+            first = base64.b64decode(proof["first_attempt_receipt_bytes_base64"], validate=True)
+            repeated = base64.b64decode(proof["repeat_attempt_receipt_bytes_base64"], validate=True)
+            if not first or first != repeated:
+                raise ValueError("destination receipts differ")
+        except (ValueError, TypeError) as exc:
+            raise EffectError("host_capability_mismatch") from exc
+        handler = SQLiteCommittedEffectHost._verified_handler(
+            self, context["handler_reference"], context["destination_binding_digest"]
+        )
+        VerifiedNativeHandler.verify_deduplication_evidence(
+            handler, context["handler_reference"], context["destination_binding_digest"], proof
+        )
+        return proof
+
+    @staticmethod
+    def _retry_context(document: Mapping[str, Any], record: Mapping[str, Any]) -> dict[str, Any]:
+        if record["idempotency_policy"] != "destination_deduplicates":
+            raise EffectError("host_capability_mismatch")
+        return {
+            "kind": "destination_deduplication",
+            "scope_identity": document["journal"]["scope_identity"],
+            "root_instance_id": document["journal"]["root_instance_id"],
+            **{
+                key: copy.deepcopy(record[key])
+                for key in (
+                    "effect_id",
+                    "operation_token",
+                    "attempt_fence",
+                    "handler_reference",
+                    "destination_binding_digest",
+                )
+            },
+        }
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.path, isolation_level=None, timeout=30)
@@ -877,6 +1168,7 @@ class SQLiteCommittedEffectHost:
             "result_responses": {},
             "cancel_requests": {},
             "producer_requests": {},
+            "invocation_starts": {},
         }
         if claim is not None:
             document["claims"][claim["work_identity"]] = copy.deepcopy(dict(claim))
@@ -904,6 +1196,23 @@ class SQLiteCommittedEffectHost:
                     or journal["scope_identity"] != self.authority_scope
                 ):
                     raise EffectError("unauthorized_scope")
+                _native_effect_documents(ledger)
+                if checkpoint["root_instance_id"] in ledger.get(
+                    "native_effect_roots", []
+                ) and journal != _native_effect_journal(ledger, checkpoint["root_instance_id"]):
+                    raise EffectError("unauthorized_scope")
+                if checkpoint["root_instance_id"] in ledger.get("native_effect_roots", []):
+                    retained = _native_effect_document(ledger, checkpoint["root_instance_id"])
+                    # Portable equality never restores private call permission.
+                    # Existing starts require explicit native recovery, not seed.
+                    if retained["invocation_starts"] or retained["checkpoint"] != checkpoint:
+                        raise EffectError("unauthorized_scope")
+                    if (
+                        claim is not None
+                        and retained["claims"].get(claim["work_identity"]) != claim
+                    ):
+                        raise EffectError("stale_attempt_fence")
+                    document = copy.deepcopy(retained)
                 # Restoring an already claimed invocation cannot mint authority.
                 # Its exact claim must already have been issued by this ledger.
                 if claim is not None and (
@@ -956,6 +1265,10 @@ class SQLiteCommittedEffectHost:
                         raise EffectError("stale_attempt_fence")
                 self._mirror_authority(ledger, document)
                 connection.execute(
+                    "UPDATE determa_committed_effects SET document=? WHERE root_instance_id=?",
+                    (canonical_bytes(document), checkpoint["root_instance_id"]),
+                )
+                connection.execute(
                     "UPDATE determa_scope_authority SET ledger = ? WHERE scope_identity = ?",
                     (
                         json.dumps(ledger, sort_keys=True, separators=(",", ":")),
@@ -969,8 +1282,12 @@ class SQLiteCommittedEffectHost:
         ledger: dict[str, Any], document: dict[str, Any], *, advance_generation: bool = True
     ) -> None:
         """Mirror effect fences and exact committed bytes in the colocated authority ledger."""
+        _native_effect_documents(ledger)
         native_roots = ledger.setdefault("native_effect_roots", [])
         root = document["checkpoint"]["root_instance_id"]
+        fresh = root not in native_roots
+        if not fresh:
+            _native_effect_document(ledger, root)
         if root not in native_roots:
             native_roots.append(root)
         records = document["journal"]["effect_records"]
@@ -1026,6 +1343,14 @@ class SQLiteCommittedEffectHost:
             history.append(source)
         ledger["checkpoint_bytes"].append(source)
         ledger["mutation_bytes"].append(canonical_bytes(document["journal"]).decode())
+        # This private native role history cannot be fabricated by a generic
+        # guarded_commit payload that happens to resemble a journal.
+        ledger.setdefault("native_effect_journal_bytes", []).append(
+            canonical_bytes(document["journal"]).decode()
+        )
+        ledger.setdefault("native_effect_document_bytes", []).append(
+            canonical_bytes(document).decode()
+        )
         if advance_generation:
             ledger["scope_generation"] = str(int(ledger["scope_generation"]) + 1)
 
@@ -1050,6 +1375,7 @@ class SQLiteCommittedEffectHost:
         expected_epoch: str | None = None,
         authority_mutation: Callable[[dict[str, Any], dict[str, Any]], None] | None = None,
         worker_guard: tuple[str, str, str | None, str] | None = None,
+        before_native_commit: Callable[[], None] | None = None,
     ) -> _T:
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -1095,6 +1421,12 @@ class SQLiteCommittedEffectHost:
                 ):
                     raise EffectError("stale_scope_authority")
                 _validate_authority_pair(ledger, document)
+                from .authority import _native_checkpoints
+
+                try:
+                    _native_checkpoints(connection, ledger)
+                except (ValueError, TypeError, KeyError, sqlite3.Error) as error:
+                    raise EffectError("unauthorized_scope") from error
                 if worker_guard is not None:
                     effect_id, principal, fence, trusted_now = worker_guard
                     journal_record = _record(document["journal"], effect_id)
@@ -1153,9 +1485,10 @@ class SQLiteCommittedEffectHost:
                     (canonical_bytes(document), root),
                 )
             if expiry_guard is not None:
-                # Keep the original deadline even when this transaction closes
-                # or revokes the claim. Worker rights must still hold at commit.
+                # Arbitrary legacy clock callbacks run before native proof.
                 self._check_live_clock(*expiry_guard)
+            if before_native_commit is not None:
+                before_native_commit()
             connection.commit()
             return value
 
@@ -1315,47 +1648,32 @@ class SQLiteCommittedEffectHost:
         trusted_now: str,
         deduplication_evidence: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
+        final_proof: tuple[dict[str, Any], dict[str, Any]] | None = None
+        clock_guard: tuple[NativeCommitClock, int, bool] | None = None
+
+        def verify_before_commit() -> None:
+            if self.trusted_clock is None:
+                raise EffectError("stale_attempt_fence")
+            self._check_live_clock(self.trusted_clock, _now(expires_at))
+            if final_proof is not None:
+                context, proof = final_proof
+                SQLiteCommittedEffectHost._verify_retry_evidence(self, context, proof)
+                assert clock_guard is not None
+                SQLiteCommittedEffectHost._check_retry_commit_clock(
+                    self, clock_guard, _now(expires_at)
+                )
+
         def change(document: dict[str, Any]) -> dict[str, Any]:
+            nonlocal final_proof, clock_guard
             record = _record(document["journal"], effect_id)
             proof = None
-            if deduplication_evidence is not None:
-                if not isinstance(deduplication_evidence, Mapping):
-                    raise EffectError("host_capability_mismatch")
-                proof = copy.deepcopy(dict(deduplication_evidence))
-                fields = {
-                    "scope_identity",
-                    "effect_id",
-                    "destination_binding_digest",
-                    "first_attempt_receipt_bytes_base64",
-                    "repeat_attempt_receipt_bytes_base64",
-                }
-                if (
-                    set(proof) != fields
-                    or proof["scope_identity"] != document["journal"]["scope_identity"]
-                    or proof["effect_id"] != effect_id
-                    or proof["destination_binding_digest"] != record["destination_binding_digest"]
-                ):
-                    raise EffectError("host_capability_mismatch")
-                try:
-                    first = base64.b64decode(
-                        proof["first_attempt_receipt_bytes_base64"], validate=True
-                    )
-                    repeated = base64.b64decode(
-                        proof["repeat_attempt_receipt_bytes_base64"], validate=True
-                    )
-                    if not first or first != repeated:
-                        raise ValueError("destination receipts differ")
-                except (ValueError, TypeError) as exc:
-                    raise EffectError("host_capability_mismatch") from exc
-                handler = self._verified_handler(
-                    record["handler_reference"], record["destination_binding_digest"]
+            if record["attempt_fence"] != "0" or deduplication_evidence is not None:
+                context = SQLiteCommittedEffectHost._retry_context(document, record)
+                clock_guard = SQLiteCommittedEffectHost._retry_commit_clock(self)
+                proof = SQLiteCommittedEffectHost._verify_retry_evidence(
+                    self, context, deduplication_evidence
                 )
-                VerifiedNativeHandler.verify_deduplication_evidence(
-                    handler,
-                    record["handler_reference"],
-                    record["destination_binding_digest"],
-                    proof,
-                )
+                final_proof = (context, proof)
             claim = _issue_effect_claim(
                 document,
                 effect_id,
@@ -1368,6 +1686,7 @@ class SQLiteCommittedEffectHost:
             if proof is not None:
                 document.setdefault("destination_evidence", {}).setdefault(effect_id, []).append(
                     {
+                        "decision": "claim",
                         "root_instance_id": root,
                         "operation_token": record["operation_token"],
                         "handler_reference": copy.deepcopy(record["handler_reference"]),
@@ -1378,7 +1697,11 @@ class SQLiteCommittedEffectHost:
             return claim
 
         return self._transact(
-            root, change, expected_epoch=epoch, authority_mutation=self._mirror_authority
+            root,
+            change,
+            expected_epoch=epoch,
+            authority_mutation=self._mirror_authority,
+            before_native_commit=verify_before_commit,
         )
 
     def terminalize_outbox(
@@ -1480,8 +1803,73 @@ class SQLiteCommittedEffectHost:
         if clock is None:
             raise EffectError("stale_attempt_fence")
 
+        def start(document: dict[str, Any]) -> str:
+            record = _record(document["journal"], effect_id)
+            if record["invocation_state"] != "leased":
+                raise EffectError("effect_not_outstanding")
+            self._authorize(
+                document,
+                effect_id,
+                record["operation_token"],
+                record["attempt_fence"],
+                principal,
+                scope,
+                epoch,
+                clock(),
+            )
+            if (
+                not authorized
+                or credential is None
+                or record["handler_reference"] != self.route["handler_reference"]
+                or record["destination_binding_digest"] != self.route["destination_binding_digest"]
+            ):
+                raise EffectError("unauthorized_scope")
+            self._verified_handler(
+                record["handler_reference"], record["destination_binding_digest"]
+            )
+            identifier = hash_value(
+                [
+                    "determa-native-invocation-start-1",
+                    scope,
+                    root,
+                    effect_id,
+                    record["attempt_fence"],
+                ]
+            )
+            starts = document["invocation_starts"]
+            if identifier in starts:
+                raise EffectError("native_invocation_already_started")
+            intent = next(
+                item["intent"]
+                for item in document["checkpoint"]["pending_outbox_intents"]
+                + document["checkpoint"]["terminal_outbox_records"]
+                if item["intent"]["effect_id"] == effect_id
+            )
+            starts[identifier] = {
+                "claim": copy.deepcopy(document["claims"][effect_id]),
+                "intent": copy.deepcopy(intent),
+                "effect_record": copy.deepcopy(record),
+            }
+            return identifier
+
+        # Only this successful new native commit reaches the call phase. A saved
+        # marker is historical evidence, never permission for another invocation.
+        start_id = self._transact(
+            root,
+            start,
+            expected_epoch=epoch,
+            authority_mutation=self._mirror_authority,
+            worker_guard=(effect_id, principal, None, trusted_now),
+        )
+
         def call(document: dict[str, Any]) -> Mapping[str, Any]:
             record = _record(document["journal"], effect_id)
+            retained_start = document["invocation_starts"].get(start_id)
+            if not isinstance(retained_start, dict) or (
+                retained_start.get("claim") != document["claims"].get(effect_id)
+                or retained_start.get("effect_record") != record
+            ):
+                raise EffectError("invalid_effect_journal")
             if record["invocation_state"] != "leased":
                 raise EffectError("effect_not_outstanding")
             self._authorize(
@@ -1509,6 +1897,8 @@ class SQLiteCommittedEffectHost:
                 )
                 if item["intent"]["effect_id"] == effect_id
             )
+            if retained_start.get("intent") != intent:
+                raise EffectError("invalid_effect_journal")
             metadata = {
                 "scope_identity": scope,
                 "effect_id": effect_id,
@@ -1521,12 +1911,26 @@ class SQLiteCommittedEffectHost:
             handler = self._verified_handler(
                 record["handler_reference"], record["destination_binding_digest"]
             )
-            result = VerifiedNativeHandler.invoke(
+
+            def live_call_guard() -> None:
+                self._authorize(
+                    document,
+                    effect_id,
+                    record["operation_token"],
+                    record["attempt_fence"],
+                    principal,
+                    scope,
+                    epoch,
+                    clock(),
+                )
+
+            result = VerifiedNativeHandler._invoke_with_guard(
                 handler,
                 record["handler_reference"],
                 copy.deepcopy(intent["payload"]),
                 metadata,
                 {"attempt_fence": record["attempt_fence"]},
+                live_call_guard,
             )
             # External acceptance cannot extend an expired worker's mutation
             # rights. A refusal leaves its leased journal for reconciliation.
@@ -1555,6 +1959,7 @@ class SQLiteCommittedEffectHost:
         scope: str,
         epoch: str,
         trusted_now: str,
+        deduplication_evidence: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         if (
             not isinstance(request, Mapping)
@@ -1574,7 +1979,10 @@ class SQLiteCommittedEffectHost:
                 scope=scope,
                 epoch=epoch,
                 trusted_now=trusted_now,
+                deduplication_evidence=deduplication_evidence,
             )
+            if response["status"] == "committed":
+                return response
             if request["outcome_kind"] in _OUTCOMES:
                 # The authenticated outcome is already durable. Admission is a
                 # separate host-owned transaction; its failure cannot erase it.
@@ -1607,15 +2015,150 @@ class SQLiteCommittedEffectHost:
         scope: str,
         epoch: str,
         trusted_now: str,
+        deduplication_evidence: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Private durable-outcome stage; never a completed public result."""
+        saved = self._saved_result_response(root, request, principal, scope, epoch)
+        if saved is not None:
+            return saved
+        final_proof: tuple[dict[str, Any], dict[str, Any]] | None = None
+        clock_guard: tuple[NativeCommitClock, int, bool] | None = None
+        deadline: int | None = None
+
+        def change(document: dict[str, Any]) -> dict[str, Any]:
+            nonlocal final_proof, clock_guard, deadline
+            key = request["effect_id"] + ":" + request["attempt_fence"]
+            fresh_retry = (
+                request["outcome_kind"] == "retryable_failure"
+                and key not in document["result_requests"]
+            )
+            proof = None
+            if fresh_retry:
+                record = self._authorize(
+                    document,
+                    request["effect_id"],
+                    request["operation_token"],
+                    request["attempt_fence"],
+                    principal,
+                    scope,
+                    epoch,
+                    trusted_now,
+                )
+                context = SQLiteCommittedEffectHost._retry_context(document, record)
+                clock_guard = SQLiteCommittedEffectHost._retry_commit_clock(self)
+                deadline = _now(document["claims"][request["effect_id"]]["expires_at"])
+                proof = SQLiteCommittedEffectHost._verify_retry_evidence(
+                    self, context, deduplication_evidence
+                )
+                final_proof = (context, proof)
+            response = self._submit(
+                document,
+                request,
+                principal,
+                scope,
+                epoch,
+                trusted_now,
+                retry_verified=proof is not None,
+            )
+            if proof is not None:
+                document["result_requests"][key] = copy.deepcopy(dict(request))
+                document.setdefault("result_responses", {})[key] = copy.deepcopy(response)
+                document.setdefault("result_disclosure", {})[key] = {
+                    "principal": principal,
+                    "scope": scope,
+                    "epoch": epoch,
+                }
+                document.setdefault("destination_evidence", {}).setdefault(
+                    request["effect_id"], []
+                ).append(
+                    {
+                        "decision": "report",
+                        "attempt_fence": request["attempt_fence"],
+                        "evidence": proof,
+                    }
+                )
+            return response
+
+        def verify_before_commit() -> None:
+            if final_proof is not None:
+                SQLiteCommittedEffectHost._verify_retry_evidence(self, *final_proof)
+                assert clock_guard is not None and deadline is not None
+                SQLiteCommittedEffectHost._check_retry_commit_clock(self, clock_guard, deadline)
+
         return self._transact(
             root,
-            lambda document: self._submit(document, request, principal, scope, epoch, trusted_now),
+            change,
             expected_epoch=epoch,
             authority_mutation=self._mirror_authority,
             worker_guard=(request["effect_id"], principal, request["attempt_fence"], trusted_now),
+            before_native_commit=verify_before_commit,
         )
+
+    def _saved_result_response(
+        self, root: str, request: Mapping[str, Any], principal: str, scope: str, epoch: str
+    ) -> dict[str, Any] | None:
+        """Disclose retained native evidence without restoring today's executable.
+
+        This read never grants a lease, invokes a verifier, or changes a receipt.
+        A retained request conflict must not fall through to a fresh decision.
+        """
+        with self._connect() as connection:
+            connection.execute("BEGIN")
+            row = connection.execute(
+                "SELECT document FROM determa_committed_effects WHERE root_instance_id=?", (root,)
+            ).fetchone()
+            if row is None:
+                raise EffectError("wrong_root")
+            document = json.loads(row[0])
+            key = request["effect_id"] + ":" + request["attempt_fence"]
+            prior = document["result_requests"].get(key)
+            response = document.get("result_responses", {}).get(key)
+            if prior is None or response is None:
+                return None
+            if self.authority_scope is not None:
+                authority = connection.execute(
+                    "SELECT ledger FROM determa_scope_authority WHERE scope_identity=?",
+                    (self.authority_scope,),
+                ).fetchone()
+                if authority is None:
+                    raise EffectError("unauthorized_scope")
+                _validate_authority_pair(json.loads(authority[0]), document)
+            validate_journal(document["checkpoint"], document["journal"])
+            disclosure = document.get("result_disclosure", {}).get(key)
+            if disclosure is None:
+                self._authorize(
+                    document,
+                    request["effect_id"],
+                    request["operation_token"],
+                    request["attempt_fence"],
+                    principal,
+                    scope,
+                    epoch,
+                    "0",
+                    allow_replay=True,
+                )
+            elif disclosure != {"principal": principal, "scope": scope, "epoch": epoch}:
+                raise EffectError("unauthorized_scope")
+            if prior != dict(request):
+                raise EffectError("effect_result_conflict")
+            record = _record(document["journal"], request["effect_id"])
+            if _retained_report(record, request) is None:
+                raise EffectError("effect_result_conflict")
+            if request["outcome_kind"] == "retryable_failure" and not any(
+                entry.get("decision") == "report"
+                and entry.get("attempt_fence") == request["attempt_fence"]
+                and isinstance(entry.get("evidence"), dict)
+                and all(
+                    entry["evidence"].get(key) == value
+                    for key, value in {
+                        **self._retry_context(document, record),
+                        "attempt_fence": request["attempt_fence"],
+                    }.items()
+                )
+                for entry in document.get("destination_evidence", {}).get(request["effect_id"], [])
+            ):
+                raise EffectError("host_capability_mismatch")
+            return _validate_request(response, "effect-result-response-v1.schema.json")
 
     def _submit(
         self,
@@ -1625,6 +2168,8 @@ class SQLiteCommittedEffectHost:
         scope: str,
         epoch: str,
         trusted_now: str,
+        *,
+        retry_verified: bool = False,
     ) -> dict[str, Any]:
         journal, checkpoint = document["journal"], document["checkpoint"]
         effect_id, fence, kind = (
@@ -1672,6 +2217,8 @@ class SQLiteCommittedEffectHost:
             )
         if record["invocation_state"] != "leased":
             raise EffectError("effect_not_outstanding")
+        if kind == "retryable_failure" and not retry_verified:
+            raise EffectError("host_capability_mismatch")
         payload = copy.deepcopy(request["payload"])
         if kind in _OUTCOMES:
             self._result_delivery(checkpoint, record, kind, payload)
@@ -1694,6 +2241,11 @@ class SQLiteCommittedEffectHost:
         }
         record["attempt_records"].append(report)
         document["result_requests"][key] = copy.deepcopy(dict(request))
+        document.setdefault("result_disclosure", {})[key] = {
+            "principal": principal,
+            "scope": scope,
+            "epoch": epoch,
+        }
         if kind not in _OUTCOMES:
             record["invocation_state"] = "unclaimed" if kind == "retryable_failure" else "ambiguous"
             _bump(journal)
@@ -1822,6 +2374,32 @@ class SQLiteCommittedEffectHost:
             )
         return self.snapshot(root)
 
+    def _validate_cancelled_payload(
+        self, checkpoint: dict[str, Any], record: dict[str, Any], payload: Any
+    ) -> None:
+        """Validate the original declaration without requiring current runtime liveness."""
+        from .engine import _normalize_payload
+        from .wire import _origin_machine
+
+        try:
+            target = _pinned_result_target(checkpoint, record, self.resolver)
+            delivery = _result_delivery_evidence(checkpoint, record, "cancelled", payload, target)
+            bundle, machine = _origin_machine(
+                self.resolver, record["target"]["runtime_incarnation"]
+            )
+            declarations = dict(bundle.raw.get("events") or {})
+            declarations.update(machine.raw.get("events") or {})
+            declaration = declarations.get(_mapping(record, "cancelled")["event"])
+            if not isinstance(declaration, dict) or declaration.get("direction") != "input":
+                raise EffectError("invalid_host_request")
+            logical = decoded_typed_value(delivery["envelope"]["payload"])
+            if _normalize_payload(declaration, logical) is None:
+                raise EffectError("invalid_host_request")
+        except (ArtifactError, KeyError, TypeError, ValueError) as exc:
+            if isinstance(exc, EffectError):
+                raise
+            raise EffectError("invalid_host_request") from exc
+
     def cancel(self, root: str, request: Mapping[str, Any]) -> dict[str, Any]:
         if (
             not isinstance(request, Mapping)
@@ -1890,7 +2468,11 @@ class SQLiteCommittedEffectHost:
                 ):
                     raise EffectError("operation_id_conflict")
                 return replay
-            if record["invocation_state"] == "unclaimed" and record["attempt_fence"] == "0":
+            self._validate_cancelled_payload(document["checkpoint"], record, request["payload"])
+            if record["outcome"] is not None:
+                state = "too_late"
+                outcome = copy.deepcopy(record["outcome"])
+            elif record["invocation_state"] == "unclaimed" and record["attempt_fence"] == "0":
                 mapping = _mapping(record, "cancelled")
                 self._result_delivery(
                     document["checkpoint"], record, "cancelled", request["payload"]
@@ -1924,7 +2506,8 @@ class SQLiteCommittedEffectHost:
                 "reason": request["reason"],
                 "state": state,
             }
-            record["cancellation"] = cancellation
+            if state != "too_late":
+                record["cancellation"] = cancellation
             _bump(journal)
             response = {
                 "status": "committed" if outcome else "reconciliation_required",

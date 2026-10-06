@@ -53,6 +53,7 @@ SCHEMAS = (
     "runtime-action-output-v1.schema.json",
     "runtime-provider-descriptor-v1.schema.json",
     "timer-helper-operation-v1.schema.json",
+    "timer-record-v1.schema.json",
 )
 SPEC_COMMIT = "77c0a2e60cd0771a6d44ae170a079ddd51d7d9f0"
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import sqlite3
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -17,6 +17,7 @@ from .base import (
     PERMANENT_OUTBOX_TERMINAL_RETENTION,
     PERMANENT_RECEIPT_RETENTION,
     ROOT_IDENTITY_RETENTION,
+    SHARED_APPLICATION_TRANSACTION,
     ExecutionStore,
     ExecutionStoreError,
     ExecutionStoreTransaction,
@@ -40,21 +41,49 @@ _METADATA_DELETE_TRIGGER = "determa_execution_metadata_forbid_delete"
 _IMMUTABLE_MESSAGE = "execution_store_immutable"
 
 
+def _refuse_native_owned_database(connection: sqlite3.Connection) -> None:
+    """The base adapter cannot prove native authority or joint journal ownership.
+
+    Check permanent schema markers under the writer lock, before any caller or
+    core code runs. Even a partial native schema requires the native adapter.
+    """
+    if (
+        connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name COLLATE NOCASE IN (?, ?, ?) LIMIT 1",
+            ("determa_scope_authority", "determa_scope_allocations", "determa_committed_effects"),
+        ).fetchone()
+        is not None
+    ):
+        raise ExecutionStoreError("scope_fence_unproven")
+
+
 def _schema_tokens(source: str) -> list[str]:
     return re.findall(r"[a-z_][a-z0-9_]*|[(),]", source.lower())
 
 
 class _SQLiteTransaction(ExecutionStoreTransaction):
-    def __init__(self, connection: sqlite3.Connection, root_instance_id: str) -> None:
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        root_instance_id: str,
+        *,
+        application_sql: bool = False,
+    ) -> None:
         self._connection = connection
         self._root_instance_id = root_instance_id
+        self._application_sql = application_sql
+
+    def _execute(self, statement: str, parameters: Any = ()) -> sqlite3.Cursor:
+        if self._application_sql:
+            return _execute_host_owned(self._connection, statement, parameters)
+        return self._connection.execute(statement, parameters)
 
     @property
     def root_instance_id(self) -> str:
         return self._root_instance_id
 
     def load(self) -> bytes | None:
-        row = self._connection.execute(
+        row = self._execute(
             f"SELECT checkpoint FROM {_TABLE} WHERE root_instance_id = ?",
             (self._root_instance_id,),
         ).fetchone()
@@ -65,7 +94,7 @@ class _SQLiteTransaction(ExecutionStoreTransaction):
         if root_instance_id != self._root_instance_id:
             raise ExecutionStoreError("transaction_root_mismatch")
         try:
-            self._connection.execute(
+            self._execute(
                 f"""
                 INSERT INTO {_TABLE}
                     (root_instance_id, revision, checkpoint_digest, checkpoint)
@@ -86,7 +115,7 @@ class _SQLiteTransaction(ExecutionStoreTransaction):
         root_instance_id, revision, digest = checkpoint_metadata(checkpoint)
         if root_instance_id != self._root_instance_id:
             raise ExecutionStoreError("transaction_root_mismatch")
-        cursor = self._connection.execute(
+        cursor = self._execute(
             f"""
             UPDATE {_TABLE}
             SET revision = ?, checkpoint_digest = ?, checkpoint = ?
@@ -106,6 +135,92 @@ class _SQLiteTransaction(ExecutionStoreTransaction):
         return cursor.rowcount == 1
 
 
+class SQLiteApplicationCursor:
+    """Rows from host-owned SQL without exposing the connection's commit controls."""
+
+    def __init__(self, cursor: sqlite3.Cursor) -> None:
+        self._cursor = cursor
+
+    @property
+    def rowcount(self) -> int:
+        return self._cursor.rowcount
+
+    def fetchone(self) -> Any:
+        return self._cursor.fetchone()
+
+    def fetchall(self) -> list[Any]:
+        return self._cursor.fetchall()
+
+
+class SQLiteApplicationTransaction:
+    """Foreground SQL resource whose lifetime and commit belong to ExecutionHost.
+
+    Application callbacks receive statement execution and rows, not a second
+    transaction API. SQL transaction control, attached databases and PRAGMA changes
+    are refused. The resource is closed before the host commits or rolls back.
+    """
+
+    def __init__(self, connection: sqlite3.Connection) -> None:
+        self._connection = connection
+        self._active = True
+        self._commit_checks: list[Callable[[], None]] = []
+
+    def execute(self, statement: str, parameters: Any = ()) -> SQLiteApplicationCursor:
+        if not self._active:
+            raise ExecutionStoreError("shared_transaction_closed")
+        return SQLiteApplicationCursor(self._connection.execute(statement, parameters))
+
+    def _close(self) -> None:
+        self._active = False
+
+    def _execute_host_owned(self, statement: str, parameters: Any = ()) -> SQLiteApplicationCursor:
+        if not self._active:
+            raise ExecutionStoreError("shared_transaction_closed")
+        return SQLiteApplicationCursor(_execute_host_owned(self._connection, statement, parameters))
+
+    def _before_commit(self, check: Callable[[], None]) -> None:
+        if not self._active:
+            raise ExecutionStoreError("shared_transaction_closed")
+        self._commit_checks.append(check)
+
+
+def _execute_host_owned(
+    connection: sqlite3.Connection, statement: str, parameters: Any
+) -> sqlite3.Cursor:
+    """Trusted adapter/helper path; application SQL never receives this operation."""
+    connection.set_authorizer(None)
+    try:
+        return connection.execute(statement, parameters)
+    finally:
+        connection.set_authorizer(_application_authorizer)
+
+
+def _application_authorizer(
+    operation: int,
+    first: str | None,
+    second: str | None,
+    database: str | None,
+    trigger: str | None,
+) -> int:
+    del database, trigger
+    if any(name and name.lower().startswith("determa_") for name in (first, second)):
+        return sqlite3.SQLITE_DENY
+    if operation == sqlite3.SQLITE_PRAGMA and first == "integrity_check" and second is None:
+        return sqlite3.SQLITE_OK
+    return (
+        sqlite3.SQLITE_DENY
+        if operation
+        in (
+            sqlite3.SQLITE_TRANSACTION,
+            sqlite3.SQLITE_SAVEPOINT,
+            sqlite3.SQLITE_ATTACH,
+            sqlite3.SQLITE_DETACH,
+            sqlite3.SQLITE_PRAGMA,
+        )
+        else sqlite3.SQLITE_OK
+    )
+
+
 class SQLiteExecutionStore(ExecutionStore):
     """Single-writer durable SQLite storage under verified PRAGMA settings."""
 
@@ -118,6 +233,7 @@ class SQLiteExecutionStore(ExecutionStore):
         timeout: float = 30.0,
         replay_retention: str = "bounded",
         outbox_retention: str = "none",
+        shared_application_transactions: bool = False,
     ) -> None:
         self.path = str(path)
         self.journal_mode = journal_mode.upper()
@@ -125,6 +241,7 @@ class SQLiteExecutionStore(ExecutionStore):
         self.timeout = timeout
         self.replay_retention = replay_retention
         self.outbox_retention = outbox_retention
+        self.shared_application_transactions = shared_application_transactions
         if (
             not self.path
             or self.path == ":memory:"
@@ -133,6 +250,7 @@ class SQLiteExecutionStore(ExecutionStore):
             or timeout <= 0
             or replay_retention not in _REPLAY_RETENTION_MODES
             or outbox_retention not in _OUTBOX_RETENTION_MODES
+            or type(shared_application_transactions) is not bool
         ):
             raise ExecutionStoreError(AdapterCode.INVALID_ADAPTER_CONFIGURATION)
 
@@ -142,6 +260,8 @@ class SQLiteExecutionStore(ExecutionStore):
         if not self._policy_is_valid():
             return frozenset(capabilities)
         capabilities.add(ROOT_IDENTITY_RETENTION)
+        if self.shared_application_transactions:
+            capabilities.add(SHARED_APPLICATION_TRANSACTION)
         if self.replay_retention == "permanent":
             capabilities.add(PERMANENT_RECEIPT_RETENTION)
         if self.outbox_retention == "strict":
@@ -339,6 +459,7 @@ class SQLiteExecutionStore(ExecutionStore):
         try:
             self._validate_schema(connection)
             connection.execute("BEGIN IMMEDIATE")
+            _refuse_native_owned_database(connection)
             transaction = _SQLiteTransaction(connection, root_instance_id)
             yield transaction
             connection.commit()
@@ -416,6 +537,40 @@ class SQLiteExecutionStore(ExecutionStore):
         finally:
             connection.close()
 
+    @contextmanager
+    def shared_transaction(
+        self,
+        root_instance_id: str,
+    ) -> Iterator[tuple[SQLiteApplicationTransaction, ExecutionStoreTransaction]]:
+        if not self.shared_application_transactions:
+            raise ExecutionStoreError(AdapterCode.ADAPTER_CAPABILITY_MISMATCH)
+        connection = self._connect()
+        application = SQLiteApplicationTransaction(connection)
+        try:
+            self._validate_schema(connection)
+            connection.execute("BEGIN IMMEDIATE")
+            _refuse_native_owned_database(connection)
+            connection.set_authorizer(_application_authorizer)
+            yield (
+                application,
+                _SQLiteTransaction(connection, root_instance_id, application_sql=True),
+            )
+            application._close()
+            connection.set_authorizer(None)
+            if not connection.in_transaction:
+                raise ExecutionStoreError(AdapterCode.ADAPTER_CAPABILITY_MISMATCH)
+            self._validate_schema(connection)
+            for check in application._commit_checks:
+                check()
+            connection.commit()
+        except BaseException:
+            application._close()
+            connection.set_authorizer(None)
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
     def health(self) -> Mapping[str, Any]:
         try:
             connection = self._connect()
@@ -461,6 +616,7 @@ def sqlite_execution_store_factory(uri: str, configuration: Mapping[str, Any]) -
         "timeout",
         "replay_retention",
         "outbox_retention",
+        "shared_application_transactions",
     }:
         raise ExecutionStoreError(AdapterCode.INVALID_ADAPTER_CONFIGURATION)
     journal_mode = _single_query(query, "journal_mode", "WAL")
@@ -468,6 +624,9 @@ def sqlite_execution_store_factory(uri: str, configuration: Mapping[str, Any]) -
     timeout_text = _single_query(query, "timeout", "30")
     replay_retention = _single_query(query, "replay_retention", "bounded")
     outbox_retention = _single_query(query, "outbox_retention", "none")
+    shared = _single_query(query, "shared_application_transactions", "false")
+    if shared not in {"true", "false"}:
+        raise ExecutionStoreError(AdapterCode.INVALID_ADAPTER_CONFIGURATION)
     try:
         timeout = float(timeout_text)
     except ValueError as exc:
@@ -479,4 +638,5 @@ def sqlite_execution_store_factory(uri: str, configuration: Mapping[str, Any]) -
         timeout=timeout,
         replay_retention=replay_retention,
         outbox_retention=outbox_retention,
+        shared_application_transactions=shared == "true",
     )

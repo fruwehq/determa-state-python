@@ -8,7 +8,7 @@ commit `77c0a2e60cd0771a6d44ae170a079ddd51d7d9f0`. Correctness is determined by
 99 format-1 core cases, 162 version-1 vectors, 142 durable-host vectors, 49 core
 inspection vectors, 47 extension negotiation vectors, 7 native guard-provider
 inspection vectors, 52 runtime-provider vectors, and 487 manifest artifacts at
-conformance commit `c6949440f5b9fd6e06ea5571f4e01681dd59ee04`. The native
+conformance commit `090aa297389e416121c25ef29fb0a75671d83233`. The native
 runtime-provider profile is optional and is exercised through its production adapter.
 
 The package metadata is `0.3.0`. Artifact and checkpoint schema version 1 is the
