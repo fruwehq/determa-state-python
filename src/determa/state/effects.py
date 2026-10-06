@@ -2374,6 +2374,32 @@ class SQLiteCommittedEffectHost:
             )
         return self.snapshot(root)
 
+    def _validate_cancelled_payload(
+        self, checkpoint: dict[str, Any], record: dict[str, Any], payload: Any
+    ) -> None:
+        """Validate the original declaration without requiring current runtime liveness."""
+        from .engine import _normalize_payload
+        from .wire import _origin_machine
+
+        try:
+            target = _pinned_result_target(checkpoint, record, self.resolver)
+            delivery = _result_delivery_evidence(checkpoint, record, "cancelled", payload, target)
+            bundle, machine = _origin_machine(
+                self.resolver, record["target"]["runtime_incarnation"]
+            )
+            declarations = dict(bundle.raw.get("events") or {})
+            declarations.update(machine.raw.get("events") or {})
+            declaration = declarations.get(_mapping(record, "cancelled")["event"])
+            if not isinstance(declaration, dict) or declaration.get("direction") != "input":
+                raise EffectError("invalid_host_request")
+            logical = decoded_typed_value(delivery["envelope"]["payload"])
+            if _normalize_payload(declaration, logical) is None:
+                raise EffectError("invalid_host_request")
+        except (ArtifactError, KeyError, TypeError, ValueError) as exc:
+            if isinstance(exc, EffectError):
+                raise
+            raise EffectError("invalid_host_request") from exc
+
     def cancel(self, root: str, request: Mapping[str, Any]) -> dict[str, Any]:
         if (
             not isinstance(request, Mapping)
@@ -2442,7 +2468,11 @@ class SQLiteCommittedEffectHost:
                 ):
                     raise EffectError("operation_id_conflict")
                 return replay
-            if record["invocation_state"] == "unclaimed" and record["attempt_fence"] == "0":
+            self._validate_cancelled_payload(document["checkpoint"], record, request["payload"])
+            if record["outcome"] is not None:
+                state = "too_late"
+                outcome = copy.deepcopy(record["outcome"])
+            elif record["invocation_state"] == "unclaimed" and record["attempt_fence"] == "0":
                 mapping = _mapping(record, "cancelled")
                 self._result_delivery(
                     document["checkpoint"], record, "cancelled", request["payload"]
@@ -2476,7 +2506,8 @@ class SQLiteCommittedEffectHost:
                 "reason": request["reason"],
                 "state": state,
             }
-            record["cancellation"] = cancellation
+            if state != "too_late":
+                record["cancellation"] = cancellation
             _bump(journal)
             response = {
                 "status": "committed" if outcome else "reconciliation_required",
