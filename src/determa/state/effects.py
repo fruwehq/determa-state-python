@@ -27,7 +27,7 @@ from .checkpoint_v1 import (
 from .errors import ArtifactError
 from .extensions import ConfiguredExtension, ExtensionError, ExtensionRegistry
 from .host import outbox_intent_digest
-from .native_clock import NativeCommitClock, _read_native_clock
+from .native_clock import NativeCommitClock, _native_clock_mode, _read_native_clock
 from .wire import (
     ArtifactResolver,
     _schema_registry,
@@ -1045,24 +1045,33 @@ class SQLiteCommittedEffectHost:
             raise EffectError("host_capability_mismatch")
         self.commit_clock = commit_clock
         self._installed_commit_clock = commit_clock
+        try:
+            self._installed_commit_clock_mode = (
+                _native_clock_mode(commit_clock) if commit_clock is not None else None
+            )
+        except ValueError as exc:
+            raise EffectError("host_capability_mismatch") from exc
 
-    def _retry_commit_clock(self) -> tuple[NativeCommitClock, int]:
+    def _retry_commit_clock(self) -> tuple[NativeCommitClock, int, bool]:
         clock = self.commit_clock
         if type(clock) is not NativeCommitClock or clock is not self._installed_commit_clock:
             raise EffectError("host_capability_mismatch")
         try:
-            return clock, _read_native_clock(clock)
+            mode = self._installed_commit_clock_mode
+            if type(mode) is not bool:
+                raise ValueError("native clock mode absent")
+            return clock, _read_native_clock(clock, mode=mode), mode
         except ValueError as exc:
             raise EffectError("stale_attempt_fence") from exc
 
     def _check_retry_commit_clock(
-        self, guard: tuple[NativeCommitClock, int], deadline: int
+        self, guard: tuple[NativeCommitClock, int, bool], deadline: int
     ) -> None:
-        clock, start = guard
+        clock, start, mode = guard
         if clock is not self.commit_clock or clock is not self._installed_commit_clock:
             raise EffectError("host_capability_mismatch")
         try:
-            now = _read_native_clock(clock)
+            now = _read_native_clock(clock, mode=mode)
         except ValueError as exc:
             raise EffectError("stale_attempt_fence") from exc
         if now < start or now >= deadline:
@@ -1640,7 +1649,7 @@ class SQLiteCommittedEffectHost:
         deduplication_evidence: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
         final_proof: tuple[dict[str, Any], dict[str, Any]] | None = None
-        clock_guard: tuple[NativeCommitClock, int] | None = None
+        clock_guard: tuple[NativeCommitClock, int, bool] | None = None
 
         def verify_before_commit() -> None:
             if self.trusted_clock is None:
@@ -2013,7 +2022,7 @@ class SQLiteCommittedEffectHost:
         if saved is not None:
             return saved
         final_proof: tuple[dict[str, Any], dict[str, Any]] | None = None
-        clock_guard: tuple[NativeCommitClock, int] | None = None
+        clock_guard: tuple[NativeCommitClock, int, bool] | None = None
         deadline: int | None = None
 
         def change(document: dict[str, Any]) -> dict[str, Any]:

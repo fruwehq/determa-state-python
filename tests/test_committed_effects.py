@@ -1726,6 +1726,8 @@ def test_authority_noninitial_native_claim_cannot_bypass_retry_verifier(tmp_path
         "proof_clock_unavailable",
         "proof_clock_regression",
         "proof_clock_replaced",
+        "proof_clock_descriptor",
+        "proof_clock_mode",
     ],
 )
 @pytest.mark.parametrize("operation", ["claim", "report"])
@@ -1756,7 +1758,7 @@ def test_retry_verifier_is_rechecked_after_native_sql_staging(
     with sqlite3.connect(native_path) as connection:
         connection.execute("CREATE TABLE receipts (receipt BLOB NOT NULL)")
         connection.execute("INSERT INTO receipts VALUES (?)", (receipt,))
-    state = {"staged": False, "checks": 0}
+    state = {"staged": False, "checks": 0, "late_callbacks": 0}
     lease_deadline = (
         10 if operation == "claim" else int(read("data/active-claim.json")["expires_at"])
     )
@@ -1772,6 +1774,17 @@ def test_retry_verifier_is_rechecked_after_native_sql_staging(
                 host.commit_clock.set_native_sample(-1)
             elif damage == "proof_clock_replaced":
                 host.commit_clock = NativeCommitClock.controlled(0)
+            elif damage == "proof_clock_descriptor":
+                sample = NativeCommitClock._sample.__get__(host.commit_clock, NativeCommitClock)
+
+                def late_sample(_clock):
+                    state["late_callbacks"] += 1
+                    host.handler._configured._provider.proof_verifier = None
+                    return sample
+
+                monkeypatch.setattr(NativeCommitClock, "_sample", property(late_sample))
+            elif damage == "proof_clock_mode":
+                host.commit_clock._system = True
         if state["staged"] and damage == "unavailable":
             raise RuntimeError("native verifier unavailable after staging")
         with sqlite3.connect(native_path) as connection:
@@ -1850,6 +1863,8 @@ def test_retry_verifier_is_rechecked_after_native_sql_staging(
         lambda: sqlite3.connect(host.path, isolation_level=None, factory=StagingConnection),
     )
     arguments = {"expires_at": "10", "trusted_now": "0", "deduplication_evidence": proof}
+    if damage == "proof_clock_mode":
+        arguments["expires_at"] = read("data/active-claim.json")["expires_at"]
 
     def execute():
         if operation == "claim":
@@ -1871,13 +1886,21 @@ def test_retry_verifier_is_rechecked_after_native_sql_staging(
     else:
         code = (
             "stale_attempt_fence"
-            if damage in {"proof_expiry", "proof_clock_unavailable", "proof_clock_regression"}
+            if damage
+            in {
+                "proof_expiry",
+                "proof_clock_unavailable",
+                "proof_clock_regression",
+                "proof_clock_descriptor",
+                "proof_clock_mode",
+            }
             else "host_capability_mismatch"
         )
         with pytest.raises(EffectError, match=code):
             execute()
         assert state["staged"]
         assert host.snapshot(root) == before
+        assert state["late_callbacks"] == 0
 
 
 @pytest.mark.parametrize("clock", ["expired", "unavailable", "invalid", "missing"])
