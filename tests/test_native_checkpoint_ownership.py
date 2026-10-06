@@ -9,6 +9,7 @@ from determa.state import delivery_request_digest, portable_envelope
 from determa.state.authority import AuthoritySQLiteExecutionStore
 from determa.state.host import ExecutionHost, ExecutionHostError
 from determa.state.stores.base import ExecutionStoreError
+from determa.state.stores.sqlite import SQLiteExecutionStore
 from determa.state.wire import canonical_bytes
 
 from .test_committed_effects import authority_effect_fixture
@@ -74,12 +75,66 @@ def test_ordinary_checkpoint_mutations_refuse_effects_owned_root(tmp_path, mutat
     assert effects.snapshot(root) == initial
 
 
-def test_ordinary_read_preserves_an_equal_legacy_checkpoint_and_native_history(tmp_path):
+def test_native_owned_transaction_refuses_before_ordinary_core_or_callback(tmp_path):
     authority, effects, root, checkpoint, store = fixture(tmp_path, legacy_checkpoint=True)
     before = database_snapshot(authority.path)
-    actual = ExecutionHost(store, effects.resolver).read_checkpoint(root)
-    assert actual is not None and actual.document == checkpoint
+    entered = False
+    with pytest.raises(ExecutionStoreError, match="scope_fence_unproven"):
+        with store.transaction(root):
+            entered = True
+    assert not entered
+    assert effects.snapshot(root)["checkpoint"] == checkpoint
     assert database_snapshot(authority.path) == before
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_base_sqlite_adapter_cannot_enter_authority_owned_transaction(tmp_path, shared):
+    authority, effects, root, checkpoint, _store = fixture(tmp_path, legacy_checkpoint=True)
+    store = SQLiteExecutionStore(authority.path, shared_application_transactions=shared)
+    before = database_snapshot(authority.path)
+    entered = False
+    with pytest.raises(ExecutionStoreError, match="scope_fence_unproven"):
+        if shared:
+            with store.shared_transaction(root) as (application, transaction):
+                entered = True
+                application.execute("CREATE TABLE application_side_effect (value TEXT)")
+                assert transaction.load() is not None
+        else:
+            with store.transaction(root) as transaction:
+                entered = True
+                assert transaction.load() is not None
+    assert not entered
+    assert database_snapshot(authority.path) == before
+    assert effects.snapshot(root)["checkpoint"] == checkpoint
+
+
+@pytest.mark.parametrize(
+    "marker",
+    [
+        "determa_scope_authority",
+        "determa_scope_allocations",
+        "determa_committed_effects",
+        "DETERMA_SCOPE_AUTHORITY",
+        "Determa_Scope_Allocations",
+        "Determa_Committed_Effects",
+    ],
+)
+@pytest.mark.parametrize("shared", [False, True])
+def test_partial_native_ownership_markers_fail_closed(tmp_path, marker, shared):
+    store = SQLiteExecutionStore(
+        tmp_path / "partial.sqlite", shared_application_transactions=shared
+    )
+    store.setup_schema()
+    with sqlite3.connect(store.path) as connection:
+        connection.execute(f"CREATE TABLE {marker} (damaged TEXT)")
+    before = database_snapshot(store.path)
+    entered = False
+    with pytest.raises(ExecutionStoreError, match="scope_fence_unproven"):
+        context = store.shared_transaction("root") if shared else store.transaction("root")
+        with context:
+            entered = True
+    assert not entered
+    assert database_snapshot(store.path) == before
 
 
 @pytest.mark.parametrize("damage", ["missing_indexes", "empty_indexes"])

@@ -271,7 +271,14 @@ def test_freeze_refuses_an_untracked_native_checkpoint_without_committing(tmp_pa
     response = authority.perform(_request("freeze_scope", "freeze-untracked", "0", {}), invocation)
     assert json.loads(response)["error_code"] == "scope_fence_unproven"
     assert authority.inspect("scope-1") == ledger
-    assert bare_host.read_checkpoint("foreign-root").canonical_bytes == before.canonical_bytes
+    with authority._connect() as connection:
+        actual = connection.execute(
+            "SELECT checkpoint FROM determa_execution_checkpoints WHERE root_instance_id=?",
+            ("foreign-root",),
+        ).fetchone()
+    assert actual is not None and bytes(actual[0]) == before.canonical_bytes
+    with pytest.raises(ExecutionStoreError, match="scope_fence_unproven"):
+        bare_host.read_checkpoint("foreign-root")
 
 
 @pytest.mark.parametrize(
@@ -512,7 +519,14 @@ def test_guarded_write_cannot_adopt_a_preexisting_untracked_checkpoint(tmp_path)
             expected_checkpoint_digest=before.document["execution_checkpoint_digest"],
         )
     assert authority.inspect("scope-1") == ledger
-    assert bare_host.read_checkpoint("root-1").canonical_bytes == before.canonical_bytes
+    with authority._connect() as connection:
+        actual = connection.execute(
+            "SELECT checkpoint FROM determa_execution_checkpoints WHERE root_instance_id=?",
+            ("root-1",),
+        ).fetchone()
+    assert actual is not None and bytes(actual[0]) == before.canonical_bytes
+    with pytest.raises(ExecutionStoreError, match="scope_fence_unproven"):
+        bare_host.read_checkpoint("root-1")
 
 
 @pytest.mark.parametrize("terminal", [False, True])

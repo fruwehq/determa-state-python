@@ -41,6 +41,22 @@ _METADATA_DELETE_TRIGGER = "determa_execution_metadata_forbid_delete"
 _IMMUTABLE_MESSAGE = "execution_store_immutable"
 
 
+def _refuse_native_owned_database(connection: sqlite3.Connection) -> None:
+    """The base adapter cannot prove native authority or joint journal ownership.
+
+    Check permanent schema markers under the writer lock, before any caller or
+    core code runs. Even a partial native schema requires the native adapter.
+    """
+    if (
+        connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name COLLATE NOCASE IN (?, ?, ?) LIMIT 1",
+            ("determa_scope_authority", "determa_scope_allocations", "determa_committed_effects"),
+        ).fetchone()
+        is not None
+    ):
+        raise ExecutionStoreError("scope_fence_unproven")
+
+
 def _schema_tokens(source: str) -> list[str]:
     return re.findall(r"[a-z_][a-z0-9_]*|[(),]", source.lower())
 
@@ -443,6 +459,7 @@ class SQLiteExecutionStore(ExecutionStore):
         try:
             self._validate_schema(connection)
             connection.execute("BEGIN IMMEDIATE")
+            _refuse_native_owned_database(connection)
             transaction = _SQLiteTransaction(connection, root_instance_id)
             yield transaction
             connection.commit()
@@ -532,6 +549,7 @@ class SQLiteExecutionStore(ExecutionStore):
         try:
             self._validate_schema(connection)
             connection.execute("BEGIN IMMEDIATE")
+            _refuse_native_owned_database(connection)
             connection.set_authorizer(_application_authorizer)
             yield (
                 application,

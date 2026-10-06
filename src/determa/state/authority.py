@@ -1427,6 +1427,11 @@ class AuthoritySQLiteExecutionStore(SQLiteExecutionStore):
                 _native_checkpoints(connection, ledger)
             except (ValueError, TypeError, KeyError, sqlite3.Error) as error:
                 raise ExecutionStoreError("scope_fence_unproven") from error
+            # Checkpoint-only execution cannot enter a joint checkpoint/journal
+            # participant, including reads through this write transaction API.
+            # Refuse before core actions or an application callback can run.
+            if root_instance_id in native_effect_roots:
+                raise ExecutionStoreError("scope_fence_unproven")
             transaction = _SQLiteTransaction(connection, root_instance_id)
             previous = transaction.load()
             if previous is not None and previous.decode("utf-8", "strict") not in native_history:
@@ -1434,10 +1439,6 @@ class AuthoritySQLiteExecutionStore(SQLiteExecutionStore):
             yield transaction
             current = transaction.load()
             if current != previous:
-                # A native effects participant owns its checkpoint and journal
-                # together. Ordinary checkpoint-only writers cannot advance it.
-                if root_instance_id in native_effect_roots:
-                    raise ExecutionStoreError("scope_fence_unproven")
                 if current is None:
                     raise ExecutionStoreError("invalid_execution_checkpoint")
                 _, revision, digest = checkpoint_metadata(current)
